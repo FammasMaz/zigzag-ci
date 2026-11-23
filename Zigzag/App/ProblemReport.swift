@@ -1,0 +1,165 @@
+import AppKit
+
+/// Help › Report a Problem: a plain text report to go with an email, so a bug arrives with what's needed to find it.
+/// It holds which Zigzag, macOS and Mac, how much is open, a few settings, the extensions, what went wrong lately and
+/// on which sites (`Diagnostics`), and crash and freeze reports (`CrashReports`). Never a page's address, a tab, history
+/// or anything you typed. It's written to a file you can read first, and goes nowhere until you send it.
+@MainActor
+enum ProblemReport {
+    nonisolated static let file = CrashReports.folder.appendingPathComponent("Zigzag Problem Report.txt")
+
+    static func show(in controller: BrowserWindowController) {
+        ConfirmSheet.choose(in: controller.root.overlay, title: String(localized: "Report a Problem", comment: "Title of the Report a Problem sheet."),
+                            message: String(localized: "Zigzag writes a short report for your email: its version, your Mac, what went wrong lately and on which sites, and crash and freeze reports. Never the pages’ addresses, your tabs or history. Show Report lets you read it first.",
+                                            comment: "Message of the Report a Problem sheet. “Show Report” is the sheet's other button."),
+                            confirmTitle: String(localized: "Email Report", comment: "Button of the Report a Problem sheet."),
+                            alternateTitle: String(localized: "Show Report", comment: "Button of the Report a Problem sheet: shows the report in Finder.")) { choice in
+            guard choice != .cancel else { return }
+            Task { @MainActor in
+                // Written away from the window, so it never stops; anything slower than a moment says it's working.
+                let notice = Task { @MainActor in
+                    try? await Task.sleep(for: .milliseconds(250))
+                    if !Task.isCancelled { Toast.working(String(localized: "Writing report…", comment: "Toast while the problem report is written."), in: controller) }
+                }
+                let report = await write()
+                notice.cancel()
+                Toast.hide(in: controller)
+                guard let report else {
+                    Toast.show(String(localized: "Couldn’t write the report", comment: "Toast when the problem report can't be written."), symbol: "exclamationmark.triangle",
+                               duration: 3, in: controller)
+                    return
+                }
+                if choice == .confirm { email(report, in: controller) } else { NSWorkspace.shared.activateFileViewerSelecting([report]) }
+            }
+        }
+    }
+
+    /// A new message in your mail app with the report attached, and the crash reports' own files with it. Without a
+    /// mail app that takes attachments, a plain email opens and the report is shown in Finder, to drag in.
+    private static func email(_ report: URL, in controller: BrowserWindowController) {
+        let attachments = [report] + CrashReports.recent.prefix(5).map(\.json).filter { FileManager.default.fileExists(atPath: $0.path) }
+        // The question is for the person writing; the report itself stays in English, for the developer.
+        let body = String(localized: "What happened, and what were you doing just before?", comment: "First line of the problem report email, for the person to answer.")
+            + "\n\n\n" + Feedback.versions
+        if let mail = NSSharingService(named: .composeEmail) {
+            mail.recipients = [Feedback.address]
+            mail.subject = "Zigzag problem report"
+            let items: [Any] = [body] + attachments
+            if mail.canPerform(withItems: items) { mail.perform(withItems: items); return }
+        }
+        var parts = URLComponents()
+        parts.scheme = "mailto"
+        parts.path = Feedback.address
+        parts.queryItems = [URLQueryItem(name: "subject", value: "Zigzag problem report"), URLQueryItem(name: "body", value: body)]
+        if let url = parts.url { NSWorkspace.shared.open(url) }
+        NSWorkspace.shared.activateFileViewerSelecting([report])
+        Toast.show(String(localized: "Attach the report from Finder to your email", comment: "Toast after the problem report email opens; the report is shown in Finder."),
+                   symbol: "paperclip", duration: 6, in: controller)
+    }
+
+    /// Writes the report and returns where, or nil if it couldn't be saved. What's open is read here, the rest
+    /// (the crash reports on disk, the file itself) away from the main thread.
+    static func write() async -> URL? {
+        let summary = openNow
+        let destination = file
+        return await Task.detached(priority: .userInitiated) { () -> URL? in
+            try? FileManager.default.createDirectory(at: CrashReports.folder, withIntermediateDirectories: true)
+            let text = summary + recent + crashes + freezes + extensionLog + passwordsLog
+            return (try? Data(text.utf8).write(to: destination, options: .atomic)) == nil ? nil : destination
+        }.value
+    }
+
+    /// Everything but the crash reports: versions, the Mac, what's open and the settings that matter.
+    static var openNow: String {
+        var lines = ["Zigzag problem report", "Written \(Date().formatted(date: .abbreviated, time: .standard))", ""]
+        lines.append(Feedback.versions.trimmingCharacters(in: .whitespacesAndNewlines))
+        lines.append("Mac: \(systemValue("hw.model") ?? "unknown"), \(ProcessInfo.processInfo.physicalMemory / 1_073_741_824) GB memory, \(ProcessInfo.processInfo.activeProcessorCount) cores")
+        lines.append("Zigzag running for \(Duration.seconds(ProcessInfo.processInfo.systemUptime - launchUptime).formatted(.units(allowed: [.hours, .minutes], width: .wide)))")
+
+        let controllers = WindowManager.shared.controllers
+        let tabs = WindowManager.shared.openTabs
+        lines += ["", "Open now"]
+        func count(_ n: Int, _ one: String) -> String { "\(n) \(one)\(n == 1 ? "" : "s")" }
+        lines.append("\(count(controllers.count, "window")) (\(controllers.filter(\.tabManager.isPrivate).count) private), \(count(Library.shared.spaces.count, "space"))")
+        lines.append("\(count(tabs.count, "tab")), \(tabs.filter { !$0.isSuspended }.count) loaded")
+
+        lines += ["", "Settings"]
+        lines.append("Ad blocking \(ContentBlocker.isEnabled ? "on" : "off")")
+        let filters = AdEngine.shared.status
+        lines.append("Ad filter lists: " + (filters.ready ? "\(filters.filters) filters, checked \(AdEngine.shared.listsChecked?.formatted(date: .abbreviated, time: .shortened) ?? "never")" : "not downloaded yet"))
+        lines.append("Reduce motion \(Tokens.Motion.reduceMotion ? "on" : "off")")
+
+        lines += ["", "Extensions"]
+        let profile = Profiles.shared.default
+        let ids = profile.installs.installedIDs
+        if ids.isEmpty { lines.append("None") }
+        for id in ids {
+            let name = profile.extensions.context(for: id)?.webExtension.displayName ?? id
+            let version = ExtensionStore.package(id)?.version ?? "?"
+            lines.append("\(name) \(version), \(profile.installs.isEnabled(id) ? "on" : "off")")
+        }
+
+        return lines.joined(separator: "\n") + "\n"
+    }
+
+    /// What went wrong lately, newest last: the heart of the report.
+    nonisolated static var recent: String {
+        let lines = Diagnostics.lines()
+        return (["", "What happened recently"] + (lines.isEmpty ? ["Nothing went wrong that Zigzag noticed"] : lines))
+            .joined(separator: "\n") + "\n"
+    }
+
+    /// The latest errors in the extensions log, when there are any: an extension that stalls usually says why there.
+    nonisolated static var extensionLog: String {
+        let name = Bundle.main.bundleIdentifier?.hasSuffix(".dev") == true ? "Zigzag Dev" : "Zigzag"
+        let url = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Logs/\(name)/extensions.log")
+        guard let text = try? String(contentsOf: url, encoding: .utf8), !text.isEmpty else { return "" }
+        // Its errors only: the comings and goings of a password manager's connection are noise here.
+        let problems = text.split(separator: "\n").map(String.init).filter { line in
+            ["error", "rejection", "failed", "couldn", "crash", "http 4", "http 5", "invalid"].contains { line.localizedCaseInsensitiveContains($0) }
+        }
+        guard !problems.isEmpty else { return "" }
+        return (["", "Extension errors, latest"] + problems.suffix(20).map { Diagnostics.clean($0) }).joined(separator: "\n") + "\n"
+    }
+
+    /// The Mac's Passwords list steps, when it was used: facts only, never a login (#378).
+    nonisolated static var passwordsLog: String {
+        let lines = PasswordsLog.recent(80)
+        guard !lines.isEmpty else { return "" }
+        return (["", "Passwords list steps, latest last"] + lines).joined(separator: "\n") + "\n"
+    }
+
+    /// What the main thread was running in Zigzag's last few freezes, when there were any.
+    nonisolated static var freezes: String {
+        let text = Freezes.recentStacks.trimmingCharacters(in: .whitespacesAndNewlines)
+        return text.isEmpty ? "" : "\nWhat was running when Zigzag froze, latest last\n" + text + "\n"
+    }
+
+    /// The crash and freeze reports kept on this Mac, read from disk.
+    nonisolated static var crashes: String {
+        var lines = ["", "Crashes and freezes, last two weeks"]
+        let reports = CrashReports.recent
+        if reports.isEmpty { lines.append("None reported by macOS") }
+        for report in reports {
+            lines.append("\(report.date.formatted(date: .abbreviated, time: .shortened)): \(report.summary)")
+        }
+        return lines.joined(separator: "\n") + "\n"
+    }
+
+    /// When Zigzag started, as the system clock counts.
+    private static let launchUptime: TimeInterval = {
+        var info = kinfo_proc(), size = MemoryLayout<kinfo_proc>.stride
+        var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_PID, getpid()]
+        guard Darwin.sysctl(&mib, 4, &info, &size, nil, 0) == 0 else { return ProcessInfo.processInfo.systemUptime }
+        let started = Date(timeIntervalSince1970: TimeInterval(info.kp_proc.p_starttime.tv_sec))
+        return ProcessInfo.processInfo.systemUptime - Date().timeIntervalSince(started)
+    }()
+
+    private static func systemValue(_ name: String) -> String? {
+        var size = 0
+        guard sysctlbyname(name, nil, &size, nil, 0) == 0, size > 0 else { return nil }
+        var bytes = [CChar](repeating: 0, count: size)
+        guard sysctlbyname(name, &bytes, &size, nil, 0) == 0 else { return nil }
+        return String(decoding: bytes.prefix { $0 != 0 }.map(UInt8.init(bitPattern:)), as: UTF8.self)
+    }
+}

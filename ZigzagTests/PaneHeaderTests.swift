@@ -1,0 +1,148 @@
+import AppKit
+import Foundation
+import Testing
+@testable import Zigzag
+
+/// A split pane's strip gives its own buttons away before its address or its close button.
+@MainActor struct PaneHeaderTests {
+    typealias Fit = PaneHeaderView.Fit
+    let edge: CGFloat = 2
+    let address: CGFloat = 180
+
+    @Test func wideShowsEverything() {
+        #expect(PaneHeaderView.fit(width: 700, edge: edge, address: address) == .all)
+    }
+
+    @Test func swapAndLayoutGoBeforeTheAddressIsCut() {
+        // Swap and the layout go into ⋯ while the address would still be cut beside them.
+        let fit = PaneHeaderView.fit(width: 330, edge: edge, address: address)
+        #expect(fit == .splitInMore)
+        #expect(fit.showsForward && fit.showsReload && fit.showsSeparate && fit.showsMore && !fit.showsSplitButtons)
+    }
+
+    @Test func thenSeparateForwardAndReload() {
+        // Each step only to keep the address its least width.
+        #expect(PaneHeaderView.fit(width: 250, edge: edge, address: address) == .splitInMore)
+        #expect(PaneHeaderView.fit(width: 225, edge: edge, address: address) == .separateInMore)
+        #expect(PaneHeaderView.fit(width: 200, edge: edge, address: address) == .noForward)
+        #expect(PaneHeaderView.fit(width: 175, edge: edge, address: address) == .noReload)
+        #expect(PaneHeaderView.fit(width: 80, edge: edge, address: address) == .noReload)
+    }
+
+    @Test func aShortAddressNeedsLessRoom() {
+        #expect(PaneHeaderView.fit(width: 250, edge: edge, address: 30) == .all)
+    }
+
+    @Test func theResetButtonTakesItsOwnRoom() {
+        // A reset button shows only on a custom layout; where it fits, it keeps the address whole.
+        #expect(PaneHeaderView.fit(width: 370, edge: edge, address: address) == .all)
+        #expect(PaneHeaderView.fit(width: 370, edge: edge, address: address, resetLayout: true) != .all)
+        #expect(PaneHeaderView.fit(width: 700, edge: edge, address: address, resetLayout: true) == .all)
+        // A tile group has no swap or layout, so reset fits well before a split's strip would show it.
+        #expect(PaneHeaderView.fit(width: 335, edge: edge, address: address, splitButtons: false, resetLayout: true) == .splitInMore)
+        #expect(PaneHeaderView.fit(width: 350, edge: edge, address: address, splitButtons: false, resetLayout: true) == .all)
+    }
+
+    @Test func fewerButtonsAsItNarrows() {
+        var last = Fit.all
+        for width in stride(from: 700, through: 60, by: -10) {
+            let fit = PaneHeaderView.fit(width: CGFloat(width), edge: edge, address: address)
+            #expect(fit >= last)
+            last = fit
+        }
+    }
+
+    /// Up where a title bar would be, the window server starts moving the window on a press before the app sees it.
+    /// A strip on the page keeps its whole area out of that, after it moves too; a strip up in the bar, and the rest
+    /// of the band, still move the window (#160).
+    @Test func aStripOnThePageNeverMovesTheWindow() {
+        let window = BrowserWindow(contentRect: NSRect(x: 0, y: 0, width: 800, height: 500))
+        // Out of sight: unseen, and off every screen once it's in.
+        window.alphaValue = 0
+        let content = MovesWindowView(frame: NSRect(x: 0, y: 0, width: 800, height: 500))
+        window.contentView = content
+        let header = PaneHeaderView(frame: NSRect(x: 300, y: 500 - PaneHeaderView.height, width: 480, height: PaneHeaderView.height))
+        content.addSubview(header)
+        header.layoutSubtreeIfNeeded()
+        window.orderFrontRegardless()
+        window.setFrameOrigin(NSPoint(x: -6000, y: 200))
+        defer { window.orderOut(nil); window.close() }
+        func moves(_ x: CGFloat, _ y: CGFloat) -> Bool? {
+            RunLoop.current.run(until: Date().addingTimeInterval(0.2))
+            return DebugBridge.windowServerMoves(window, at: NSPoint(x: x, y: y))
+        }
+        // AppKit's own region, unpublished: where it can't be read, nothing to check.
+        guard moves(150, 490) != nil else { return }
+        let top = 500 - PaneHeaderView.height / 2
+        #expect(moves(150, top) == true)
+        for x: CGFloat in [304, 420, 540, 776] { #expect(moves(x, top) == false, "x \(x)") }
+        #expect(moves(540, 500 - PaneHeaderView.height + 0.5) == false)
+
+        header.frame.origin.x = 20
+        #expect(moves(100, top) == false)
+        #expect(moves(480, top) == false)
+        #expect(moves(700, top) == true)
+
+        header.isInBar = true
+        #expect(moves(100, top) == true)
+    }
+
+    /// Up in the bar on the window's frame the strip keeps the bar's ink; over its card's top, its page's.
+    @Test func inTheBarOverItsCardTheStripReadsOnItsPage() {
+        let header = PaneHeaderView()
+        header.ground = NSColor(srgbRed: 0.05, green: 0.07, blue: 0.09, alpha: 1)
+        header.isInBar = true
+        #expect(header.appearance == nil && !header.back.isOnPage)
+        header.isOnCard = true
+        #expect(header.appearance?.name == .darkAqua && header.back.isOnPage)
+        header.ground = .white
+        #expect(header.appearance?.name == .aqua)
+        header.isOnCard = false
+        #expect(header.appearance == nil)
+    }
+
+    /// Reload's ring would sit low centered by its box, as its arrowhead stands above it: it goes up by its ink's weight.
+    @Test func reloadIsCenteredByItsInksWeight() {
+        for size in [Tokens.Pane.glyph, Tokens.Sidebar.glyph] {
+            #expect(Tokens.Symbol.inkOffset("arrow.clockwise", size: size).height < -0.3)
+            #expect(abs(Tokens.Symbol.inkOffset("chevron.left", size: size).height) < 0.2)
+        }
+    }
+
+    /// The screen draws xmark half a point below its image's middle: measured as drawn, the button lifts it back.
+    @Test func closeIsCenteredByItsInkAsDrawn() {
+        #expect(abs(Tokens.Symbol.inkOffset("xmark", size: Tokens.Symbol.glyph).height + 0.5) < 0.2)
+        #expect(abs(Tokens.Symbol.inkOffset("chevron.up", size: Tokens.Symbol.glyph).height) < 0.2)
+    }
+
+    /// The row sits as far below the card's top as above the hairline, to the screen's pixel.
+    @Test func theRowIsCenteredAboveTheHairline() {
+        let header = PaneHeaderView(frame: NSRect(x: 0, y: 0, width: 700, height: PaneHeaderView.height))
+        header.layout()
+        let above = header.back.frame.minY
+        let below = header.bounds.height - Tokens.Metric.hairline - header.back.frame.maxY
+        #expect(abs(above - below) <= 0.5)
+        #expect(header.back.frame.midY == header.reload.frame.midY)
+    }
+
+    /// Like the sidebar's address, the strip's marks a page that isn't secure.
+    @Test func anHttpPageIsMarkedNotSecure() {
+        let tab = Tab(url: URL(string: "http://example.com")!, spaceID: UUID())
+        let header = PaneHeaderView()
+        header.show(tab)
+        #expect(header.address.notSecure)
+    }
+
+    /// A page with no site shows by its name, never a cut "file:"; a web page shows its address.
+    @Test func aFileShowsItsNameAndAWebPageItsAddress() {
+        #expect(PaneHeaderView.addressText(URL(fileURLWithPath: "/tmp/Notes.html")) == "Notes.html")
+        #expect(PaneHeaderView.addressText(URL(string: "https://www.example.com/a/b")!) == "example.com/a/b")
+        #expect(PaneHeaderView.addressText(URL(string: "http://127.0.0.1:8765/Alpha.html")!) == "127.0.0.1:8765/Alpha.html")
+        #expect(PaneHeaderView.addressText(HistoryPage.url) == "History")
+    }
+}
+
+/// The page area's ground, which moves the window wherever nothing on it takes the press.
+private final class MovesWindowView: NSView {
+    override var mouseDownCanMoveWindow: Bool { true }
+}

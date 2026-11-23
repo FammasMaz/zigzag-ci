@@ -1,0 +1,300 @@
+import AppKit
+import Testing
+import WebKit
+@testable import Zigzag
+
+/// A tab's page sits in a holder of its own (`PageHolder`), and that holder is what a card or the mini player shows.
+/// WebKit docks the Web Inspector beside the page, in the page's parent, as tall as that parent: so the inspector
+/// stays in the page's part of a card, and goes where its tab goes.
+@MainActor
+struct PageHolderTests {
+    /// Kept by each test for as long as it runs: a page only knows its tab weakly, and without the tab there's no
+    /// holder for a card to show.
+    private func tab() -> Tab { Tab(url: nil, spaceID: UUID(), configuration: WKWebViewConfiguration()) }
+
+    private func card(width: CGFloat = 800, height: CGFloat = 600) -> PageCardView {
+        PageCardView(frame: NSRect(x: 0, y: 0, width: width, height: height))
+    }
+
+    /// What WebKit does to dock the inspector at a side: a view beside the page, in the page's own parent and as tall
+    /// as it, the page made narrower for it.
+    private func dockInspector(beside page: WKWebView, width: CGFloat = 300, onLeft: Bool = false) throws -> NSView {
+        let parent = try #require(page.superview)
+        let rest = parent.bounds.width - width
+        let inspector = NSView(frame: NSRect(x: onLeft ? 0 : rest, y: 0, width: width, height: parent.bounds.height))
+        inspector.autoresizingMask = [.height, onLeft ? .maxXMargin : .minXMargin]
+        page.frame = NSRect(x: onLeft ? width : 0, y: 0, width: rest, height: page.frame.height)
+        parent.addSubview(inspector, positioned: .below, relativeTo: page)
+        return inspector
+    }
+
+    @Test func aDockedInspectorStartsBelowTheBarAboveThePage() throws {
+        let card = card(), tab = tab()
+        let page = tab.ensureWebView()
+        card.band = 44
+        card.show(page)
+        card.layoutSubtreeIfNeeded()
+        #expect(page.superview === tab.pageHolder)
+        let inspector = try dockInspector(beside: page)
+        // The card's top 44 points are the bar's: the inspector is as tall as the page under it, no taller.
+        #expect(card.convert(inspector.bounds, from: inspector) == NSRect(x: 500, y: 44, width: 300, height: 556))
+        #expect(card.convert(page.bounds, from: page) == NSRect(x: 0, y: 44, width: 500, height: 556))
+    }
+
+    @Test func aDockedInspectorStartsBelowAPanesHeader() throws {
+        let card = card(), tab = tab()
+        let page = tab.ensureWebView()
+        card.showsHeader = true
+        card.show(page)
+        card.layoutSubtreeIfNeeded()
+        #expect(page.superview === tab.pageHolder)
+        let inspector = try dockInspector(beside: page)
+        #expect(card.convert(inspector.bounds, from: inspector).minY == PaneHeaderView.height)
+    }
+
+    @Test func theInspectorLeavesWithItsTabAndComesBackWithIt() throws {
+        let card = card(), first = tab(), second = tab()
+        let page = first.ensureWebView()
+        card.show(page)
+        card.layoutSubtreeIfNeeded()
+        let inspector = try dockInspector(beside: page)
+        let place = card.convert(inspector.bounds, from: inspector)
+
+        card.show(second.ensureWebView())
+        card.layoutSubtreeIfNeeded()
+        // Nothing of the first tab is left in the card, and its inspector is still beside its page, in its holder.
+        #expect(!inspector.isDescendant(of: card))
+        #expect(!page.isDescendant(of: card))
+        #expect(page.superview === first.pageHolder)
+        #expect(inspector.superview === first.pageHolder)
+
+        card.show(page)
+        card.layoutSubtreeIfNeeded()
+        #expect(card.convert(inspector.bounds, from: inspector) == place)
+        #expect(page.frame.width == 500)
+    }
+
+    @Test func resizingTheCardKeepsTheInspectorsWidth() throws {
+        let card = card(), tab = tab()
+        let page = tab.ensureWebView()
+        card.show(page)
+        card.layoutSubtreeIfNeeded()
+        let inspector = try dockInspector(beside: page)
+        card.setFrameSize(NSSize(width: 1000, height: 700))
+        card.layoutSubtreeIfNeeded()
+        // The page takes the new room; the card never lays it over the inspector.
+        #expect(page.frame == NSRect(x: 0, y: 0, width: 700, height: 700))
+        #expect(inspector.frame == NSRect(x: 700, y: 0, width: 300, height: 700))
+    }
+
+    @Test func aTabsNewPageAppearsWhereItsOldOneWas() throws {
+        let card = card(), tab = tab()
+        let old = tab.ensureWebView()
+        card.show(old)
+        card.layoutSubtreeIfNeeded()
+        let holder = try #require(tab.pageHolder)
+        // The tab's page is made again (it woke, or changed profile) while it's shown.
+        old.removeFromSuperview()
+        let new = BrowserWebView(frame: .zero, configuration: WKWebViewConfiguration())
+        new.owner = tab
+        holder.hold(new)
+        card.show(new)
+        // Same holder, still in the card: the new page fills it.
+        #expect(new.superview === holder)
+        #expect(holder.isDescendant(of: card))
+        #expect(new.frame.size == NSSize(width: 800, height: 600))
+    }
+
+    @Test func swappingASplitsPanesLeavesBothShown() {
+        let leftCard = card(), rightCard = card()
+        let left = tab(), right = tab()
+        let leftPage = left.ensureWebView(), rightPage = right.ensureWebView()
+        leftCard.show(leftPage)
+        rightCard.show(rightPage)
+        leftCard.show(rightPage)
+        rightCard.show(leftPage)
+        // Each page came across in its tab's own holder.
+        #expect(leftPage.superview === left.pageHolder)
+        #expect(rightPage.superview === right.pageHolder)
+        // The second card doesn't take out the holder the first has just taken from it.
+        #expect(rightPage.isDescendant(of: leftCard))
+        #expect(leftPage.isDescendant(of: rightCard))
+    }
+
+    @Test func theMiniPlayerTakesThePageWithItsInspector() throws {
+        let card = card(), tab = tab()
+        let page = tab.ensureWebView()
+        card.show(page)
+        card.layoutSubtreeIfNeeded()
+        let inspector = try dockInspector(beside: page, onLeft: true)
+        let holder = try #require(tab.pageHolder)
+
+        let player = MiniPlayerView(frame: NSRect(x: 0, y: 0, width: 320, height: 180))
+        player.adopt(holder)
+        // Page and inspector keep their sizes, so the page never reflows.
+        #expect(page.frame.size == NSSize(width: 500, height: 600))
+        #expect(page.superview === holder)
+        #expect(inspector.superview === holder)
+        // The video's place in what's shown counts from the holder's corner: past the inspector on the page's left.
+        #expect(player.shown(NSRect(x: 20, y: 30, width: 160, height: 90), of: page) == NSRect(x: 320, y: 30, width: 160, height: 90))
+
+        // Minimized, the holder waits in the window at its size, then goes back to resizing with whatever shows it.
+        let parking = MiniPlayerParking()
+        parking.park(holder)
+        #expect(holder.frame.size == NSSize(width: 800, height: 600))
+        parking.release(holder)
+        #expect(holder.superview == nil)
+        #expect(holder.autoresizingMask == [.width, .height])
+    }
+
+    @Test func aPageThatLeftTheCardCountsAsOffScreen() {
+        let card = card(), first = tab(), second = tab()
+        let window = NSWindow(contentRect: card.frame, styleMask: [.borderless], backing: .buffered, defer: true)
+        window.contentView?.addSubview(card)
+        let page = first.ensureWebView()
+        card.show(page)
+        // Shown in a window: the tab overview has no picture to take out of sight.
+        #expect(!Tab.needsPictureOutOfSight(hasWebView: true, onScreen: page.window != nil, loaded: true, hasPicture: false))
+        card.show(second.ensureWebView())
+        // It still has a parent (its holder), so "on screen" asks for the window, not for a parent.
+        #expect(page.superview === first.pageHolder)
+        #expect(Tab.needsPictureOutOfSight(hasWebView: true, onScreen: page.window != nil, loaded: true, hasPicture: false))
+    }
+
+    /// Snapshots are checked against the page's appearance, not the window's; otherwise a private window (always dark) on a light Mac would retake every one.
+    @Test func aPictureTakenOutOfSightIsCurrentInAWindowOfAnotherLook() async throws {
+        let tab = tab()
+        let page = tab.ensureWebView()
+        page.loadHTMLString("<html><body style='background:#c33'><h1>Picture</h1></body></html>", baseURL: nil)
+        for _ in 0..<200 where !tab.hasLoadedOnce { try await Task.sleep(for: .milliseconds(50)) }
+        try #require(tab.hasLoadedOnce)
+        let appDark = NSApp.effectiveAppearance.isDark
+        let window = NSWindow(contentRect: NSRect(x: -4000, y: -4000, width: 400, height: 300), styleMask: [.borderless], backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        window.appearance = NSAppearance(named: appDark ? .aqua : .darkAqua)
+        let host = NSView(frame: NSRect(x: 0, y: 0, width: 400, height: 300))
+        window.contentView = host
+        window.orderFrontRegardless()
+        defer { window.orderOut(nil) }
+        await withCheckedContinuation { (done: CheckedContinuation<Void, Never>) in
+            tab.captureSnapshotOutOfSight(in: host, size: host.bounds.size) { done.resume() }
+        }
+        try #require(tab.snapshot != nil)
+        #expect(page.window == nil)
+        // Drawn in the page's appearance, and current when asked from that window.
+        #expect(tab.snapshotIsDark == page.effectiveAppearance.isDark)
+        #expect(!tab.snapshotIsStale(windowDark: !appDark))
+        #expect(!tab.snapshotIsStale(windowDark: appDark))
+    }
+
+    @Test func aClosedTabsHolderLeavesTheCard() throws {
+        let card = card(), tab = tab()
+        card.show(tab.ensureWebView())
+        card.layoutSubtreeIfNeeded()
+        let holder = try #require(tab.pageHolder)
+        #expect(holder.isDescendant(of: card))
+        tab.close()
+        // Nothing of the tab stays behind in the card, an inspector docked in its holder included.
+        #expect(holder.superview == nil)
+        #expect(!holder.isDescendant(of: card))
+        #expect(tab.pageHolder?.superview == nil)
+    }
+
+    @Test func theCardDoesNotResizeAHolderItNoLongerHosts() throws {
+        let card = card(), tab = tab()
+        card.show(tab.ensureWebView())
+        card.layoutSubtreeIfNeeded()
+        let holder = try #require(tab.pageHolder)
+        #expect(holder.frame.size == NSSize(width: 800, height: 600))
+        // The mini player takes the page while the card still has it as its shown one.
+        let player = MiniPlayerView(frame: NSRect(x: 0, y: 0, width: 320, height: 180))
+        player.adopt(holder)
+        #expect(!holder.isDescendant(of: card))
+        card.setFrameSize(NSSize(width: 1000, height: 700))
+        card.layoutSubtreeIfNeeded()
+        // Sized from the card, the page would reflow under the video.
+        #expect(holder.frame.size == NSSize(width: 800, height: 600))
+    }
+
+    /// What WebKit does at the end of an element's full screen (#204): the page comes back into its parent at the
+    /// frame WebKit kept for it, which may no longer fit the card.
+    private func comeBack(_ page: WKWebView, to holder: PageHolder, at frame: NSRect) {
+        page.removeFromSuperview()
+        page.frame = frame
+        page.autoresizingMask = []
+        holder.addSubview(page)
+    }
+
+    @Test func aPageBackFromFullScreenFillsItsCardAgain() throws {
+        let card = card(), tab = tab()
+        let page = tab.ensureWebView()
+        card.band = 44
+        card.show(page)
+        card.layoutSubtreeIfNeeded()
+        let holder = try #require(tab.pageHolder)
+        // Off in full screen, the card changed; WebKit brings the page back where it was, lower and wider than the
+        // card has room for now.
+        page.removeFromSuperview()
+        card.setFrameSize(NSSize(width: 700, height: 500))
+        card.layoutSubtreeIfNeeded()
+        comeBack(page, to: holder, at: NSRect(x: 0, y: 24, width: 800, height: 556))
+        card.layoutSubtreeIfNeeded()
+        #expect(page.frame == holder.bounds)
+        #expect(card.convert(page.bounds, from: page) == NSRect(x: 0, y: 44, width: 700, height: 456))
+        #expect(page.autoresizingMask == [.width, .height])
+        // And it goes on following the card.
+        card.setFrameSize(NSSize(width: 900, height: 640))
+        card.layoutSubtreeIfNeeded()
+        #expect(card.convert(page.bounds, from: page) == NSRect(x: 0, y: 44, width: 900, height: 596))
+    }
+
+    @Test func aPageBackFromFullScreenKeepsItsInspectorBesideIt() throws {
+        let card = card(), tab = tab()
+        let page = tab.ensureWebView()
+        card.show(page)
+        card.layoutSubtreeIfNeeded()
+        let holder = try #require(tab.pageHolder)
+        let inspector = try dockInspector(beside: page)
+        // Back where WebKit placed it beside the inspector: that's where it stays.
+        comeBack(page, to: holder, at: NSRect(x: 0, y: 0, width: 500, height: 600))
+        #expect(page.frame == NSRect(x: 0, y: 0, width: 500, height: 600))
+        #expect(inspector.frame == NSRect(x: 500, y: 0, width: 300, height: 600))
+    }
+
+    @Test func aTabsPageIsNotInsetForATitleBar() throws {
+        let tab = tab()
+        let page = tab.ensureWebView()
+        let key = "_automaticallyAdjustsContentInsets"
+        guard page.responds(to: NSSelectorFromString(key)) else { return }
+        // Zigzag places the page under its own bars: WebKit insetting it for a title bar left a band along its top.
+        #expect(page.value(forKey: key) as? Bool == false)
+    }
+
+    /// The views from the page up to its window. A scroll view among them would add a scroll bar of its own.
+    private func ancestors(of view: NSView) -> [NSView] {
+        Array(sequence(first: view, next: \.superview).dropFirst())
+    }
+
+    @Test func aPageInACardHasOnlyItsOwnScrollBars() throws {
+        let card = card(), tab = tab()
+        let page = tab.ensureWebView()
+        card.show(page)
+        card.layoutSubtreeIfNeeded()
+        let holder = try #require(tab.pageHolder)
+        #expect(!ancestors(of: page).contains { $0 is NSScrollView })
+        #expect(page.frame == holder.bounds)
+    }
+
+    @Test func aPageInZigzagMiniHasOnlyItsOwnScrollBars() throws {
+        let manager = TabManager(spaceID: Library.shared.spaces[0].id)
+        defer { manager.invalidate() }
+        let controller = BrowserWindowController(tabManager: manager, frame: NSRect(x: 0, y: 0, width: 900, height: 600))
+        defer { controller.window?.close() }
+        let mini = MiniWindowController.open(fromPage: nil, configuration: nil, opener: nil, in: controller)
+        defer { mini.window?.close() }
+        let page = try #require(mini.tab.webView)
+        let holder = try #require(mini.tab.pageHolder)
+        #expect(!ancestors(of: page).contains { $0 is NSScrollView })
+        #expect(page.frame == holder.bounds)
+    }
+}

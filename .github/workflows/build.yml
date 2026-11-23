@@ -1,0 +1,71 @@
+# Fork-only: builds and tests Zigzag on a macOS runner. Never part of a pull request to upstream (CONTRIBUTING.md).
+name: Build and test
+
+on:
+  push:
+    branches: ['ci/**']
+  workflow_dispatch:
+    inputs:
+      configuration:
+        description: Build configuration
+        default: Debug
+        type: choice
+        options: [Debug, Release]
+      extra:
+        description: Extra xcodebuild settings, e.g. SWIFT_ACTIVE_COMPILATION_CONDITIONS=DEBUG
+        default: ''
+        type: string
+
+jobs:
+  build:
+    runs-on: xcode-27
+    timeout-minutes: 90
+    env:
+      CONFIG: ${{ inputs.configuration || 'Debug' }}
+      EXTRA: ${{ inputs.extra || '' }}
+      # Unsigned: the runner has no Apple Development identity. The in-memory vault keeps tests out of the keychain.
+      SIGNING: CODE_SIGN_STYLE=Manual CODE_SIGN_IDENTITY= CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=NO DEVELOPMENT_TEAM= PROVISIONING_PROFILE_SPECIFIER=
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: |
+          sudo xcode-select -s /Applications/Xcode_27.2.app || sudo xcode-select -s /Applications/Xcode_27.1.app || ls /Applications | grep -i xcode
+          xcodebuild -version
+          sw_vers
+          brew install xcodegen
+      - name: Generate project
+        run: xcodegen generate
+      - name: Build
+        run: |
+          set -o pipefail
+          xcodebuild build -project Zigzag.xcodeproj -scheme Zigzag -configuration $CONFIG -derivedDataPath build/dev \
+            -skipPackagePluginValidation -skipMacroValidation $SIGNING $EXTRA | tee build.log | grep -E 'error:|warning: .*Zigzag/|BUILD ' || true
+          grep -q '\*\* BUILD SUCCEEDED \*\*' build.log
+      - name: Test
+        if: env.CONFIG == 'Debug' && env.EXTRA == ''
+        run: |
+          set -o pipefail
+          TEST_RUNNER_ZIGZAG_TEST_VAULT=memory xcodebuild test -project Zigzag.xcodeproj -scheme Zigzag -configuration Debug \
+            -derivedDataPath build/dev -resultBundlePath build/tests.xcresult -skipPackagePluginValidation -skipMacroValidation $SIGNING \
+            | tee test.log | grep -E 'error:|Test Suite|Test Case .* (passed|failed)|Executed|TEST ' || true
+          grep -q '\*\* TEST SUCCEEDED \*\*' test.log
+      - name: Package app
+        if: always()
+        run: |
+          app=$(find build/dev/Build/Products/$CONFIG -maxdepth 1 -name '*.app' | head -1)
+          [ -n "$app" ] && ditto -c -k --keepParent "$app" ZigzagDev.zip || echo 'no app built'
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: zigzag-dev-app
+          path: ZigzagDev.zip
+          if-no-files-found: ignore
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: logs
+          path: |
+            build.log
+            test.log
+            build/tests.xcresult
+          if-no-files-found: ignore

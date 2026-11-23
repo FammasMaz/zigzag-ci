@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Download Zigzag</title>
+<meta name="description" content="Download Zigzag, the free, lightweight web browser for Mac. Requires macOS 15.4 or later.">
+<link rel="canonical" href="https://zigzagbrowser.com/download/">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="Zigzag">
+<meta property="og:title" content="Download Zigzag">
+<meta property="og:description" content="The free, lightweight web browser for Mac.">
+<meta property="og:image" content="https://zigzagbrowser.com/assets/og.png">
+<meta property="og:url" content="https://zigzagbrowser.com/download/">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:image" content="https://zigzagbrowser.com/assets/og.png">
+<link rel="icon" type="image/png" href="/assets/favicon-64.png">
+<link rel="apple-touch-icon" href="/assets/icon-256.png">
+<link rel="stylesheet" href="/assets/site.css?v=1799600000">
+</head>
+<body>
+<header class="bar"><a class="bar-home" href="/" aria-label="Zigzag home"><img src="/assets/icon-64.png" width="28" height="28" alt=""><span class="wm" role="img" aria-label="Zigzag"></span></a><span class="bar-end"><a class="gh" href="https://github.com/ZigaoWang/zigzag" aria-label="Zigzag on GitHub" title="Zigzag on GitHub"><svg viewBox="0 0 16 16" aria-hidden="true"><path fill="currentColor" d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg></a></span></header>
+<main class="dl">
+  <h1><span class="wm" role="img" aria-label="Zigzag"></span> is downloading</h1>
+  <p class="lede">For Macs with macOS 15.4 or later. Didn’t start? <a href="/releases/latest" id="get">Download again</a>.</p>
+
+  <figure class="dl-move" aria-hidden="true">
+    <svg viewBox="0 0 520 220" role="presentation">
+      <path class="dl-arc" id="dl-arc" d="M128 128 C 200 18, 320 18, 392 120" />
+      <g class="dl-folder" transform="translate(342 92)">
+        <path class="back" d="M4 18 a10 10 0 0 1 10 -10 h26 l10 10 h40 a10 10 0 0 1 10 10 v52 a10 10 0 0 1 -10 10 h-76 a10 10 0 0 1 -10 -10z" />
+      </g>
+      <text class="dl-label" x="128" y="194">Zigzag</text>
+      <!-- Zigzag stays put, as in the disk image's window; a copy is what moves. -->
+      <image class="dl-rest" href="/assets/icon-256.png" x="86" y="86" width="84" height="84" />
+      <!-- The app glides along the arc into the folder, getting smaller as it goes in, then starts again. -->
+      <g class="dl-app">
+        <animateMotion dur="3.6s" repeatCount="indefinite" calcMode="spline" keyPoints="0;0;1;1;0;0" keyTimes="0;0.12;0.62;0.72;0.73;1"
+                       keySplines="0 0 1 1; .45 .05 .35 1; 0 0 1 1; 0 0 1 1; 0 0 1 1"><mpath href="#dl-arc" /></animateMotion>
+        <g>
+          <animateTransform attributeName="transform" type="scale" dur="3.6s" repeatCount="indefinite" values="1;1;.6;.5;.92;1" keyTimes="0;0.12;0.62;0.7;0.86;1" />
+          <animate attributeName="opacity" dur="3.6s" repeatCount="indefinite" values="1;1;1;0;0;1" keyTimes="0;0.12;0.62;0.7;0.86;1" />
+          <image href="/assets/icon-256.png" x="-42" y="-42" width="84" height="84" />
+        </g>
+      </g>
+      <!-- The folder's front goes over the app, so it drops in rather than across. -->
+      <g class="dl-folder" transform="translate(342 92)">
+        <path class="front" d="M0 36 a10 10 0 0 1 10 -10 h80 a10 10 0 0 1 10 10 v44 a10 10 0 0 1 -10 10 h-80 a10 10 0 0 1 -10 -10z" />
+        <text x="50" y="118">Applications</text>
+      </g>
+    </svg>
+  </figure>
+
+  <p class="dl-next">Open Zigzag.dmg and drag Zigzag into Applications.</p>
+</main>
+<footer class="end end-simple">
+  <nav class="foot-links">
+    <a href="/release-notes">Release Notes</a>
+    <a href="https://github.com/ZigaoWang/zigzag">GitHub</a>
+    <a href="https://github.com/ZigaoWang/zigzag/issues">Report a bug</a>
+    <a href="https://github.com/ZigaoWang/zigzag/blob/main/LICENSE">License</a>
+    <a href="mailto:a@zigao.wang">a@zigao.wang</a>
+  </nav>
+  <p class="fine">© 2026 Zigao Wang</p>
+</footer>
+<script>
+  // Start the download once, a beat after the page shows; the link is there if it doesn't.
+  setTimeout(function () { window.location.href = document.getElementById("get").href; }, 700);
+</script>
+</body>
+</html>

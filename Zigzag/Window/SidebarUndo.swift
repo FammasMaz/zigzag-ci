@@ -1,0 +1,405 @@
+import AppKit
+import WebKit
+
+/// ⌘Z for everything you do in the sidebar. Each action registers its own inverse, and the inverse registers the redo.
+extension BrowserWindowController {
+    /// Routes ⌘Z: text fields keep their own undo; the page keeps it when you worked in it after the sidebar's last
+    /// change. A web app's own undo (Figma, Docs) never shows in an undo manager, so the times alone decide.
+    func handleUndoKey(redo: Bool) -> Bool {
+        let responder = window?.firstResponder
+        if responder is NSText { return false }
+        guard redo ? sidebarUndo.canRedo : sidebarUndo.canUndo else { return false }
+        if responder is WKWebView, UndoClock.lastPageEdit > UndoClock.lastSidebarEdit { return false }
+        if let page = (responder as? NSView)?.undoManager, page !== sidebarUndo, redo ? page.canRedo : page.canUndo,
+           UndoClock.lastPageEdit > UndoClock.lastSidebarEdit {
+            return false
+        }
+        redo ? sidebarUndo.redo() : sidebarUndo.undo()
+        return true
+    }
+
+    /// The window whose ⌘Z takes changes made from elsewhere (settings, menus without a window).
+    static var undoTarget: BrowserWindowController? { WindowManager.shared.keyController ?? WindowManager.shared.controllers.first }
+
+    /// A change made from outside any browser window (Settings): undoable from the front one, made all the same
+    /// when there's none.
+    static func changeLibrary(_ name: String, _ change: () -> Void) {
+        if let undoTarget { undoTarget.libraryChange(name, change) } else { change() }
+    }
+
+    /// Runs a change to spaces, bookmarks or favorites; ⌘Z puts the library back exactly as it was.
+    func libraryChange(_ name: String, _ change: () -> Void) {
+        let before = Library.shared.snapshot
+        change()
+        registerLibraryUndo(name, restoring: before, redo: Library.shared.snapshot)
+    }
+
+    /// For changes made step by step (the space editor): one ⌘Z back to `before`.
+    func recordLibraryUndo(_ name: String, before: Library.Snapshot) {
+        registerLibraryUndo(name, restoring: before, redo: Library.shared.snapshot)
+    }
+
+    private func registerLibraryUndo(_ name: String, restoring before: Library.Snapshot, redo after: Library.Snapshot) {
+        sidebarUndo.registerUndo(withTarget: self) { controller in
+            // Changed since (an import, another window): putting back the old copy would undo those too.
+            guard controller.libraryUnchanged(since: after) else { return }
+            Self.closeTabs(inSpacesGoneFrom: before)
+            Library.shared.restore(before)
+            controller.registerLibraryUndo(name, restoring: after, redo: before)
+        }
+        sidebarUndo.setActionName(name)
+    }
+
+    /// Undoing New Space takes the space away: the tabs opened in it since close first, the way closing any tab
+    /// does, so ⇧⌘T still brings each one back.
+    static func closeTabs(inSpacesGoneFrom snapshot: Library.Snapshot) {
+        let gone = Set(Library.shared.spaces.map(\.id)).subtracting(snapshot.spaceIDs)
+        for window in WindowManager.shared.controllers {
+            for id in gone { window.tabManager.close(window.tabManager.tabs(in: id)) }
+        }
+    }
+
+    /// Whether the library is still as a change left it; if not, says why ⌘Z did nothing.
+    func libraryUnchanged(since snapshot: Library.Snapshot) -> Bool {
+        guard Library.shared.snapshot != snapshot else { return true }
+        Toast.show(String(localized: "Can’t undo: spaces or pinned tabs have changed since then", comment: "Toast when ⌘Z can't take back a change because the sidebar changed since."), symbol: "arrow.uturn.backward", duration: 2.5, in: self)
+        return false
+    }
+
+    /// Runs a change to tabs, pinned pages or favorites. ⌘Z puts the library and this window's tabs back exactly as
+    /// they were (the same pages, names and places, open or not); ⇧⌘Z does the change again.
+    func pageChange(_ name: String, _ change: @escaping () -> Void) {
+        // One step of a bigger change: the outer one records it all.
+        if isInPageChange { change(); return }
+        let before = (library: Library.shared.snapshot, tabs: tabManager.arrangement)
+        isInPageChange = true
+        change()
+        isInPageChange = false
+        let after = (library: Library.shared.snapshot, tabs: tabManager.arrangement)
+        guard before.library != after.library || !before.tabs.isSame(as: after.tabs) else { return }
+        sidebarUndo.registerUndo(withTarget: self) { controller in
+            guard controller.libraryUnchanged(since: after.library), controller.tabsUnchanged(since: after.tabs) else { return }
+            Library.shared.restore(before.library)
+            controller.tabManager.restore(before.tabs, undoing: after.tabs)
+            controller.sidebarUndo.registerUndo(withTarget: controller) { controller in
+                guard controller.libraryUnchanged(since: before.library), controller.tabsUnchanged(since: before.tabs) else { return }
+                controller.pageChange(name, change)
+            }
+            controller.sidebarUndo.setActionName(name)
+        }
+        sidebarUndo.setActionName(name)
+    }
+
+    /// Whether this window's tabs are still as a change left them; if not, says why ⌘Z did nothing.
+    private func tabsUnchanged(since arrangement: TabManager.Arrangement) -> Bool {
+        guard !tabManager.isUnchanged(since: arrangement) else { return true }
+        Toast.show(String(localized: "Can’t undo: tabs have changed since then", comment: "Toast when ⌘Z can't take back a change because the tabs changed since."), symbol: "arrow.uturn.backward", duration: 2.5, in: self)
+        return false
+    }
+
+    // MARK: Split view
+
+    func splitWithUndo(_ tab: Tab, with other: Tab, otherOnRight: Bool = true, vertical: Bool = false) {
+        guard tabManager.canSplit(tab, with: other) else { return }
+        pageChange(String(localized: "Split View", comment: "Undo action name, shown in the Edit menu as Undo Split View.")) { [tabManager] in
+            tabManager.makeSplit(tab, with: other, otherOnRight: otherOnRight, vertical: vertical)
+        }
+    }
+
+    /// Ends a split, showing `keep` (or the tab itself) on its own. A pinned split ends too: both pages stay pinned,
+    /// no longer a pair.
+    func unsplitWithUndo(_ tab: Tab, keep: Tab? = nil) {
+        guard tabManager.split(for: tab) != nil else { return }
+        pageChange(String(localized: "Separate Tabs", comment: "Undo action name, shown in the Edit menu as Undo Separate Tabs.")) { [tabManager] in
+            if let keep { tabManager.unsplit(tab, keep: keep) } else { tabManager.unsplit(tab) }
+            if let id = tab.bookmarkID { Library.shared.removePinnedSplit(containing: id) }
+        }
+    }
+
+    /// A pane dragged by its strip to another place in its group (#160). One ⌘Z puts every pane back where it was.
+    func rearrangeWithUndo(_ tab: Tab, _ move: PaneMove.Kind) {
+        guard let before = tabManager.split(for: tab), let after = before.moving(tab.id, move),
+              tabManager.rearrange(before, to: after) else { return }
+        registerRearrangeUndo(from: after, to: before)
+    }
+
+    private func registerRearrangeUndo(from now: TabManager.SplitPair, to target: TabManager.SplitPair) {
+        sidebarUndo.registerUndo(withTarget: self) { controller in
+            // The group changed since (a pane closed, another came in): nothing to put back.
+            guard controller.tabManager.rearrange(now, to: target) else {
+                Toast.show(String(localized: "Can’t undo: tabs have changed since then", comment: "Toast when ⌘Z can't take back a change because the tabs changed since."), symbol: "arrow.uturn.backward", duration: 2.5, in: controller)
+                return
+            }
+            controller.registerRearrangeUndo(from: target, to: now)
+        }
+        sidebarUndo.setActionName(Self.moveTabName)
+    }
+
+    static var moveTabName: String { String(localized: "Move Tab", comment: "Undo action name, shown in the Edit menu as Undo Move Tab.") }
+
+    /// A pane dragged by its strip onto a sidebar's tab list: it leaves its group, which closes up, and is a tab of
+    /// its own there, as a tab dragged into the list lands. Another window's list: it leaves the group here and moves
+    /// to that window as a tab moved there does (#167), whose ⌘Z sends it back; ⌘Z here then puts it back in the group.
+    /// A pinned page leaves its pinned split and lands as its own row would: pinned there, or a tab among the tabs.
+    func movePaneToList(_ tab: Tab, of target: BrowserWindowController, at place: (section: SidebarListView.Section, index: Int, folder: UUID?)) {
+        guard canMovePane(tab, toListOf: target) else { return }
+        if let id = tab.bookmarkID {
+            movePinnedPaneToList(tab, id, at: place)
+            return
+        }
+        let index = place.index
+        guard target !== self else {
+            let space = tabManager.currentSpaceID
+            pageChange(Self.moveTabName) { [tabManager] in
+                // The rest of the group stays on screen here.
+                if let rest = tabManager.leaveGroup(tab) { tabManager.select(rest) }
+                // A place counted with the tab still in the list, as the list draws it; a move counts without.
+                let at = tabManager.tabs(in: space).firstIndex { $0 === tab } ?? Int.max
+                if tab.spaceID == space { tabManager.move(tab, to: at < index ? index - 1 : index) } else { tabManager.move(tab, to: index, in: space) }
+            }
+            return
+        }
+        guard !tabManager.isPrivate, !target.tabManager.isPrivate else { return }
+        target.window?.makeKeyAndOrderFront(nil)
+        target.confirmProfileCrossing([tab], to: target.tabManager.currentSpaceID) { [weak self, weak target] in
+            guard let self, let target else { return }
+            self.leaveGroupWithUndo(tab)
+            self.move([tab], to: target, at: index)
+        }
+    }
+
+    /// A pinned pane out of its pinned split, the rest closing up as Remove from Split View leaves them, then onto the
+    /// list as its row dropped there: moved among the pinned pages, or unpinned into the tabs. One step to undo.
+    private func movePinnedPaneToList(_ tab: Tab, _ id: UUID, at place: (section: SidebarListView.Section, index: Int, folder: UUID?)) {
+        let space = tabManager.currentSpaceID
+        pageChange(Self.moveTabName) { [weak self] in
+            guard let self else { return }
+            // The list counted this page where it sat in its split; once out, the place after it is one less.
+            let was = Library.shared.bookmarks(in: space).firstIndex { $0.id == id }
+            // A pinned page split with a plain tab has no saved pinned split: it leaves the one on screen.
+            let saved = Library.shared.pinnedSplit(containing: id) != nil
+            if let rest = saved ? tabManager.leavePinnedGroup(id) : tabManager.leaveGroup(tab) { tabManager.select(rest) }
+            switch place.section {
+            case .bookmarks:
+                let index = was.map { place.index > $0 ? place.index - 1 : place.index } ?? place.index
+                listMoveBookmark(id, to: index, in: space, folder: place.folder)
+            case .tabs:
+                listUnbookmark(id, to: place.index)
+            }
+        }
+    }
+
+    /// A pane dragged by its strip out of every window: it leaves its group, which closes up here, into a new window
+    /// where it was let go.
+    func movePaneToNewWindow(_ tab: Tab, at screenPoint: NSPoint) {
+        guard canMovePaneOut(tab) else { return }
+        let target = WindowManager.shared.newWindow(spaceID: tab.spaceID, showCommandBar: false)
+        if let window = target.window {
+            var frame = window.frame
+            frame.origin = NSPoint(x: screenPoint.x - 120, y: screenPoint.y - frame.height + 40)
+            window.setFrame(frame, display: true)
+        }
+        leaveGroupWithUndo(tab)
+        move([tab], to: target, at: 0)
+    }
+
+    /// The pane out of its group, the rest of which stays on screen; ⌘Z here puts it back in its place once it's
+    /// back in this window.
+    func leaveGroupWithUndo(_ tab: Tab) {
+        pageChange(String(localized: "Separate Tabs", comment: "Undo action name, shown in the Edit menu as Undo Separate Tabs.")) { [tabManager] in
+            if let rest = tabManager.leaveGroup(tab) { tabManager.select(rest) }
+        }
+    }
+
+    /// A pinned page out of its pinned group of three or four, undoably; the rest stay one pinned group.
+    func leavePinnedGroupWithUndo(_ bookmarkID: UUID) {
+        guard !tabManager.isPrivate else { return }
+        pageChange(String(localized: "Separate Tabs", comment: "Undo action name, shown in Edit › Undo.")) { [tabManager] in
+            tabManager.leavePinnedGroup(bookmarkID)
+        }
+    }
+
+    /// A split favorite parted into two favorites, side by side in the grid; open, its pages part on screen too.
+    func separateFavoriteSplitWithUndo(_ favoriteID: UUID) {
+        guard let pair = Library.shared.pinnedSplit(containing: favoriteID) else { return }
+        pageChange(String(localized: "Separate Tabs", comment: "Undo action name, shown in the Edit menu as Undo Separate Tabs.")) { [tabManager] in
+            for id in pair.ids { if let live = tabManager.bookmarkTab(for: id) { tabManager.unsplit(live) } }
+            Library.shared.removePinnedSplit(containing: favoriteID)
+        }
+    }
+
+    // MARK: Icons
+
+    /// A tab's own icon (nil: its site's again). ⌘Z finds the tab by its id, so a tab closed since is left alone.
+    func setIconWithUndo(_ icon: String?, for tab: Tab) {
+        let before = tab.customIcon
+        guard before != icon else { return }
+        tab.customIcon = icon
+        // Save with the session now, not only on the next change.
+        onStateChange?()
+        let id = tab.id
+        sidebarUndo.registerUndo(withTarget: self) { controller in
+            guard let tab = controller.tabManager.tab(with: id) else { return }
+            controller.setIconWithUndo(before, for: tab)
+        }
+        sidebarUndo.setActionName(Self.changeIconName)
+    }
+
+    /// A pinned page's or favorite's icon (nil: its site's again).
+    func setIconWithUndo(_ icon: String?, forBookmark id: UUID) {
+        guard !tabManager.isPrivate, let bookmark = Library.shared.bookmark(id), bookmark.icon != icon else { return }
+        libraryChange(Self.changeIconName) { Library.shared.setIcon(icon, forBookmark: id) }
+    }
+
+    static var changeIconName: String { String(localized: "Change Icon", comment: "Undo action name, shown in the Edit menu as Undo Change Icon.") }
+
+    // MARK: Favorites
+
+    /// A tab (and a split's other half) into the favorites at a tile's place (nil: the end).
+    func favoriteWithUndo(_ tab: Tab, at index: Int? = nil) {
+        guard tabManager.canPin(tab, keepingGroup: false) else { return }
+        pageChange(String(localized: "Add to Favorites", comment: "Undo action name, shown in the Edit menu as Undo Add to Favorites.")) { [tabManager] in tabManager.favoriteTab(tab, at: index) }
+    }
+
+    /// A tab or pinned page dropped on a favorite's middle: the two become one favorite, side by side.
+    func joinFavoriteWithUndo(_ tab: Tab, onto favoriteID: UUID, onRight: Bool) {
+        guard tabManager.canPin(tab, keepingGroup: false) else { return }
+        pageChange(String(localized: "Split View", comment: "Undo action name, shown in the Edit menu as Undo Split View.")) { [tabManager] in tabManager.joinFavorite(tab, onto: favoriteID, onRight: onRight) }
+    }
+
+    /// A favorite back to a regular tab in a space's list (nil: the space you're in).
+    func unfavoriteWithUndo(_ id: UUID, to index: Int, in spaceID: UUID? = nil) {
+        pageChange(String(localized: "Move to Tabs", comment: "Undo action name, shown in the Edit menu as Undo Move to Tabs.")) { [tabManager] in tabManager.unbookmark(id, toIndex: index, in: spaceID) }
+    }
+
+    func removeFavoriteWithUndo(_ id: UUID) {
+        // A split favorite goes as one: both its pages.
+        let ids = Library.shared.pinnedSplit(containing: id).map(\.ids) ?? [id]
+        libraryChange(String(localized: "Remove from Favorites", comment: "Undo action name, shown in the Edit menu as Undo Remove from Favorites.")) {
+            for id in ids { if let live = tabManager.bookmarkTab(for: id) { tabManager.close(live) } }
+            Library.shared.removeBookmarks(ids)
+        }
+    }
+
+    // MARK: Tabs
+
+    /// Closes several tabs; ⌘Z reopens them all, each where it was, with the tab you were on selected again.
+    /// `leavingSpaceEmpty`: if no tabs are left, the space shows empty instead of a pinned page from earlier.
+    func closeManyWithUndo(_ tabs: [Tab], leavingSpaceEmpty: Bool = false) {
+        let selectedID = tabManager.selectedTab?.id
+        let ids = leavingSpaceEmpty ? tabManager.closeLeavingSpaceEmpty(tabs) : tabManager.close(tabs)
+        guard !ids.isEmpty else { return }
+        sidebarUndo.registerUndo(withTarget: self) { controller in
+            // By id, so a tab reopened meanwhile with ⇧⌘T doesn't make this bring back an unrelated one.
+            var reopened: [Tab] = []
+            var selected = selectedID.flatMap { controller.tabManager.tab(with: $0) }
+            controller.tabManager.together {
+                for id in ids.reversed() {
+                    guard let tab = controller.tabManager.reopenClosedTab(id, select: false) else { continue }
+                    reopened.append(tab)
+                    if id == selectedID { selected = tab }
+                }
+            }
+            if let selected { controller.tabManager.select(selected) }
+            controller.sidebarUndo.registerUndo(withTarget: controller) { $0.closeManyWithUndo(reopened) }
+            controller.sidebarUndo.setActionName(String(localized: "Close Tabs", comment: "Undo action name, shown in the Edit menu as Undo Close Tabs."))
+        }
+        sidebarUndo.setActionName(String(localized: "Close Tabs", comment: "Undo action name, shown in the Edit menu as Undo Close Tabs."))
+    }
+
+    // MARK: Spaces
+
+    /// Deletes a space; ⌘Z brings back the space, its bookmarks and its tabs, history and all.
+    func removeSpaceWithUndo(_ id: UUID) {
+        guard Library.shared.spaces.count > 1, let index = Library.shared.index(of: id), let space = Library.shared.space(id) else { return }
+        struct Closed {
+            weak var window: BrowserWindowController?
+            let isPrivate: Bool
+            let selected: UUID?
+            let tabs: [(id: UUID, url: URL?, title: String)]
+        }
+        // The space's tabs in every window close first, as closed tabs, so ⌘Z can reopen each where it was.
+        let closed = WindowManager.shared.controllers.map { window in
+            let list = window.tabManager.tabs(in: id)
+            let info = Dictionary(uniqueKeysWithValues: list.map { ($0.id, (url: $0.url, title: $0.displayTitle)) })
+            let selected = window.tabManager.selectedTab(in: id)?.id
+            let order = window.tabManager.close(list)
+            return Closed(window: window, isPrivate: window.tabManager.isPrivate, selected: selected,
+                          tabs: order.compactMap { tabID in info[tabID].map { (id: tabID, url: $0.url, title: $0.title) } })
+        }
+        let routes = Library.shared.siteRoutes.enumerated().filter { $0.element.spaceID == id }
+        Library.shared.removeSpace(id)
+        sidebarUndo.registerUndo(withTarget: self) { controller in
+            // Only this space comes back, so whatever changed since in the others stays.
+            Library.shared.insertSpace(space, at: index, routes: routes)
+            var shown: Tab?
+            for entry in closed {
+                // A window closed since: its tabs come back here, unless they were private.
+                let target: BrowserWindowController
+                if let window = entry.window, WindowManager.shared.controllers.contains(where: { $0 === window }) {
+                    target = window
+                } else if !entry.isPrivate {
+                    target = controller
+                } else {
+                    continue
+                }
+                for tab in entry.tabs.reversed() {
+                    // Too long ago to still be among the closed tabs: back as a fresh one.
+                    let reopened = target.tabManager.reopenClosedTab(tab.id, select: false)
+                        ?? target.tabManager.newTab(url: tab.url, spaceID: id, select: false, title: tab.title)
+                    if target === controller, tab.id == entry.selected { shown = reopened }
+                }
+            }
+            if let shown { controller.tabManager.select(shown) } else { controller.tabManager.switchToSpace(id) }
+            controller.sidebarUndo.registerUndo(withTarget: controller) { $0.removeSpaceWithUndo(id) }
+            controller.sidebarUndo.setActionName(String(localized: "Delete Space", comment: "Undo action name, shown in the Edit menu as Undo Delete Space."))
+        }
+        sidebarUndo.setActionName(String(localized: "Delete Space", comment: "Undo action name, shown in the Edit menu as Undo Delete Space."))
+    }
+}
+
+/// When the sidebar and the page last recorded something undoable, so ⌘Z undoes the newer one.
+@MainActor
+extension BrowserWindowController {
+    /// Takes pages out of History (`HistoryStore.remove`); ⌘Z puts back everything it took, ⇧⌘Z takes it out again.
+    /// Open History pages show each undo and redo; a History page making the change itself has already shown it,
+    /// so only a change from elsewhere (`refresh`) redraws them.
+    func historyChange(_ name: String, refresh: Bool = true, _ take: @escaping () -> HistoryRemoval) {
+        let removal = take()
+        if refresh { HistoryPage.refreshOpenPages() }
+        guard !removal.isEmpty else { return }
+        sidebarUndo.registerUndo(withTarget: self) { controller in
+            // Back into the profile it came from; one removed since has nowhere to put it.
+            guard Library.shared.directory.profile(removal.profile) != nil else { return }
+            Profiles.shared.profile(removal.profile).history.restore(removal)
+            HistoryPage.refreshOpenPages()
+            controller.sidebarUndo.registerUndo(withTarget: controller) { $0.historyChange(name, take) }
+            controller.sidebarUndo.setActionName(name)
+        }
+        sidebarUndo.setActionName(name)
+    }
+
+    /// The same, from outside a browser window (Settings): undoable from the front one, done all the same if none.
+    static func historyChange(_ name: String, _ take: @escaping () -> HistoryRemoval) {
+        if let undoTarget { undoTarget.historyChange(name, take) } else { _ = take(); HistoryPage.refreshOpenPages() }
+    }
+}
+
+enum UndoClock {
+    static var lastSidebarEdit = Date.distantPast
+    /// Set by typing into a page or clicking in one (see BrowserWindow.sendEvent).
+    static var lastPageEdit = Date.distantPast
+    /// The last click or key you gave a page yourself, which a page's script can't fake.
+    static var lastPageInput = Date.distantPast
+    private static var token: NSObjectProtocol?
+
+    static func start() {
+        guard token == nil else { return }
+        token = NotificationCenter.default.addObserver(forName: .NSUndoManagerDidCloseUndoGroup, object: nil, queue: .main) { note in
+            let source = (note.object as AnyObject?).map(ObjectIdentifier.init)
+            MainActor.assumeIsolated {
+                if WindowManager.shared.controllers.contains(where: { ObjectIdentifier($0.sidebarUndo) == source }) { lastSidebarEdit = Date() }
+            }
+        }
+    }
+}
