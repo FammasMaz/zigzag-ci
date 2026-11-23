@@ -1,0 +1,76 @@
+name: Bug report
+description: Something in Zigzag doesn't work, or a site breaks in it.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting. Issues are public: please leave out passwords, private URLs and anything personal.
+        For a security vulnerability, don't open an issue: see [SECURITY.md](https://github.com/ZigaoWang/zigzag/blob/main/SECURITY.md).
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: A short description of the problem.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: The smallest set of steps that shows the problem.
+      placeholder: |
+        1. Open …
+        2. Click …
+        3. See …
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected
+      description: What you expected to happen.
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual
+      description: What happened instead. Screenshots or a short recording help.
+    validations:
+      required: true
+  - type: input
+    id: site
+    attributes:
+      label: Site involved
+      description: The URL, if it happens on a particular site. Optional.
+      placeholder: https://example.com
+    validations:
+      required: false
+  - type: input
+    id: zigzag-version
+    attributes:
+      label: Zigzag version
+      description: The version and build from Zigzag › About Zigzag.
+      placeholder: 0.7.6 (70)
+    validations:
+      required: true
+  - type: input
+    id: macos-version
+    attributes:
+      label: macOS version
+      description: From the Apple menu › About This Mac.
+      placeholder: "26.0"
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Diagnostics
+      description: |
+        Optional. Help › Report a Problem… › Show Report writes a plain text report: Zigzag's version, your Mac, your
+        extensions, what went wrong lately and on which sites, and crash reports. It never holds the pages' addresses,
+        your tabs or history. Read it first, then paste the parts that help here.
+      render: text
+    validations:
+      required: false

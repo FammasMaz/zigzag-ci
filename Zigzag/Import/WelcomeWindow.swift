@@ -1,0 +1,49 @@
+import AppKit
+
+/// First launch, as its own moment: the onboarding in a clean window. The browser appears when it's done.
+final class WelcomeWindowController: NSWindowController, NSWindowDelegate {
+    static var shared: WelcomeWindowController?
+    private var onFinish: (() -> Void)?
+
+    static func show(onFinish: @escaping () -> Void) {
+        if let shared { shared.window?.makeKeyAndOrderFront(nil); return }
+        let size = NSSize(width: 1000, height: 660)
+        let window = NSWindow(contentRect: NSRect(origin: .zero, size: size), styleMask: [.titled, .closable, .fullSizeContentView],
+                              backing: .buffered, defer: true)
+        window.title = String(localized: "Welcome to Zigzag", comment: "Title of the welcome window shown on first launch.")
+        window.titleVisibility = .hidden
+        window.titlebarAppearsTransparent = true
+        window.isMovableByWindowBackground = true
+        window.isReleasedWhenClosed = false
+        window.backgroundColor = Tokens.Color.formBackground
+        let view = OnboardingView(frame: NSRect(origin: .zero, size: size))
+        view.autoresizingMask = [.width, .height]
+        window.contentView = view
+        let controller = WelcomeWindowController(window: window)
+        controller.onFinish = onFinish
+        view.onFinish = { [weak controller] in controller?.finish() }
+        window.delegate = controller
+        window.center()
+        shared = controller
+        controller.showWindow(nil)
+    }
+
+    /// Onboarding counts as done only when you finish it or close it yourself; quitting midway brings it back
+    /// next time, where you left the start.
+    private func finish() {
+        UserDefaults.standard.set(true, forKey: "ImportOfferDismissed")
+        window?.close()
+    }
+
+    func windowShouldClose(_ sender: NSWindow) -> Bool {
+        UserDefaults.standard.set(true, forKey: "ImportOfferDismissed")
+        return true
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        Self.shared = nil
+        let done = onFinish
+        onFinish = nil
+        done?()
+    }
+}
