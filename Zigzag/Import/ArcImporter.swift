@@ -1,0 +1,716 @@
+import AppKit
+import os
+
+/// One-click import from Arc: spaces (with names and colors), pinned tabs and Favorites as bookmarks, each space's
+/// open tabs, and history.
+/// Reads Arc's local files only; nothing leaves the Mac.
+enum ArcImporter {
+    struct Result {
+        var spaces = 0
+        var bookmarks = 0
+        /// Open tabs that came over, not loaded until they're clicked.
+        var tabs = 0
+        var historyEntries = 0
+        /// Arc profiles imported separately, by folder ("Profile 1"), mapped to the profile they went to; empty when
+        /// Arc used one profile. History and sign-ins follow.
+        var profiles: [String: UUID] = [:]
+        /// What stopped part of the import, said plainly; nothing is ever dropped silently.
+        var problems: [ImportProblem] = []
+    }
+
+    private static let log = Logger(subsystem: Bundle.main.bundleIdentifier ?? "Zigzag", category: "import")
+
+    /// What of Arc's couldn't be read.
+    private enum Part: String { case history, sidebar = "spaces and pinned tabs" }
+
+    /// Turns a file error into something to show: macOS refusing access gets the fix that opens its setting.
+    /// `retries`: the import choices trying again runs; for the sidebar, bookmarks (its Favorites), spaces and open
+    /// tabs (2, 8 and 64).
+    private static func problem(reading part: Part, _ error: Error, retries: Int = 2 | 8 | 64) -> ImportProblem {
+        let ns = error as NSError
+        log.error("Arc import: couldn't read \(part.rawValue, privacy: .public): \(ns.domain, privacy: .public) \(ns.code)")
+        let denied = (ns.domain == NSCocoaErrorDomain && ns.code == NSFileReadNoPermissionError)
+            || (ns.underlyingErrors.first as NSError?).map { $0.domain == NSPOSIXErrorDomain && ($0.code == Int(EPERM) || $0.code == Int(EACCES)) } ?? false
+        if denied {
+            let message = switch part {
+            case .history: String(localized: "macOS didn’t let Zigzag read Arc’s history. In System Settings › Privacy & Security › Files & Folders, find Zigzag and turn on Arc, then try again.",
+                                  comment: "Problem in the Import window. Arc is a browser's name; System Settings › Privacy & Security › Files & Folders is macOS's own wording.")
+            case .sidebar: String(localized: "macOS didn’t let Zigzag read Arc’s spaces and pinned tabs. In System Settings › Privacy & Security › Files & Folders, find Zigzag and turn on Arc, then try again.",
+                                  comment: "Problem in the Import window. Arc is a browser's name; System Settings › Privacy & Security › Files & Folders is macOS's own wording.")
+            }
+            return ImportProblem(message: message, fix: .fullDiskAccess)
+        }
+        let message = switch part {
+        case .history: String(localized: "Zigzag couldn’t read Arc’s history. Try again.", comment: "Problem in the Import window. Arc is a browser's name.")
+        case .sidebar: String(localized: "Zigzag couldn’t read Arc’s spaces and pinned tabs. Try again.", comment: "Problem in the Import window. Arc is a browser's name.")
+        }
+        return ImportProblem(message: message, fix: .retry, retries: retries)
+    }
+
+    nonisolated static var arcSupport: URL {
+        BrowserFolders.applicationSupport.appendingPathComponent("Arc", isDirectory: true)
+    }
+
+    static var isAvailable: Bool {
+        FileManager.default.fileExists(atPath: arcSupport.appendingPathComponent("StorableSidebar.json").path)
+    }
+
+    /// Everything: the sidebar, then history.
+    @discardableResult
+    static func importAll() -> (result: Result, firstSpace: UUID?) {
+        var (result, first) = importSidebar()
+        do {
+            let entries = try readHistory()
+            Profiles.shared.default.history.importVisits(entries)
+            result.historyEntries = entries.count
+        } catch { result.problems.append(historyProblem(error)) }
+        return (result, first)
+    }
+
+    /// Trying again reads history only (`Choice.history`), never the sidebar a second time.
+    static func historyProblem(_ error: Error) -> ImportProblem { problem(reading: .history, error, retries: 4) }
+
+    /// The parts of Arc's sidebar an import brings, each on its own.
+    struct Parts: OptionSet, Hashable {
+        let rawValue: Int
+        /// Its spaces, with their pinned tabs.
+        static let spaces = Parts(rawValue: 1)
+        /// Its Favorites, the pages at the top of the sidebar, as favorites here.
+        static let favorites = Parts(rawValue: 2)
+        /// Each space's open tabs.
+        static let openTabs = Parts(rawValue: 4)
+        static let all: Parts = [.spaces, .favorites, .openTabs]
+
+        /// What the Import window's choices bring from the sidebar: Spaces and Pinned Tabs, Bookmarks (Arc's
+        /// Favorites are its bookmarks) and Open Tabs, each only when chosen.
+        init(_ choice: ImportCoordinator.Choice) {
+            var parts: Parts = []
+            if choice.contains(.tabs) { parts.insert(.spaces) }
+            if choice.contains(.bookmarks) { parts.insert(.favorites) }
+            if choice.contains(.openTabs) { parts.insert(.openTabs) }
+            self = parts
+        }
+
+        init(rawValue: Int) { self.rawValue = rawValue }
+    }
+
+    /// What importing `parts` of a sidebar does, worked out before anything changes. `openTabs`: each of Arc's
+    /// spaces' open tabs and the space here they go in. With spaces brought over, that's the space made for it, or
+    /// the one already here with its name (importing again merges); without, the one here with its name, or nil for
+    /// the space you're in, so open tabs never bring a space you didn't ask for.
+    struct Plan {
+        var favorites: [Bookmark] = []
+        /// `favorites` grouped by Arc profile; nil is the default target profile (`Sidebar.favoriteGroups`).
+        var favoriteGroups: [(profile: String?, favorites: [Bookmark])] = []
+        var spaces: [SpaceInfo] = []
+        var openTabs: [(space: UUID?, tabs: [OpenTab])] = []
+    }
+
+    /// `wants`: the target profile for an Arc space or favorite, nil if any (one Arc profile, or its own wasn't
+    /// created). `profileOf`: a local space's profile.
+    static func plan(_ sidebar: Sidebar, parts: Parts, existing: [SpaceInfo], wants: (UUID) -> UUID? = { _ in nil },
+                     profileOf: (UUID) -> UUID = { _ in Profile.defaultID }) -> Plan {
+        var plan = Plan()
+        if parts.contains(.favorites) { plan.favorites = sidebar.favorites; plan.favoriteGroups = sidebar.favoriteGroups }
+        if parts.contains(.spaces) { plan.spaces = sidebar.spaces }
+        if parts.contains(.openTabs) {
+            plan.openTabs = sidebar.spaces.compactMap { space in
+                guard let tabs = sidebar.openTabs[space.id], !tabs.isEmpty else { return nil }
+                let here = match(space, in: existing, wants: wants(space.id), profileOf: profileOf)?.id
+                return (here ?? (parts.contains(.spaces) ? space.id : nil), tabs)
+            }
+        }
+        return plan
+    }
+
+    /// The local space an Arc space merges into on reimport: same name on its target profile, else same name on any
+    /// (older imports put everything on one).
+    static func match(_ incoming: SpaceInfo, in existing: [SpaceInfo], wants: UUID?, profileOf: (UUID) -> UUID) -> SpaceInfo? {
+        let named = existing.filter { $0.name == incoming.name }
+        if let wants, let same = named.first(where: { profileOf($0.id) == wants }) { return same }
+        return named.first
+    }
+
+    /// Arc's display name from Local State (`names`, by folder), else the folder.
+    static func profileName(_ folder: String, names: [String: String]) -> String {
+        names[folder].flatMap { $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : $0 } ?? folder
+    }
+
+    /// A local profile with this name, case-insensitive.
+    static func profile(named name: String, in profiles: [ProfileInfo]) -> ProfileInfo? {
+        let wanted = name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return profiles.first { $0.displayName.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == wanted }
+    }
+
+    /// Each Arc profile in use (`Sidebar.profilesInUse`) mapped to the local profile with its name, or with `create`, a
+    /// new one; without `create`, unmatched ones are left out. Empty when Arc used one profile.
+    static func profiles(for sidebar: Sidebar, create: Bool) -> [String: UUID] {
+        let inUse = sidebar.profilesInUse
+        guard !inUse.isEmpty else { return [:] }
+        let arc = ChromiumImporter.browsers.first { $0.name == "Arc" }
+        let names = arc.map { Dictionary(ChromiumImporter.profileNames(of: $0).map { ($0.folder, $0.name) }, uniquingKeysWith: { a, _ in a }) } ?? [:]
+        var targets: [String: UUID] = [:]
+        for folder in inUse {
+            let name = profileName(folder, names: names)
+            if let here = profile(named: name, in: Library.shared.profiles) {
+                targets[folder] = here.id
+            } else if create {
+                let library = Library.shared
+                targets[folder] = library.addProfile(name: name, color: SpaceColor.legacyNext(unused: library.profiles.map { library.color(of: $0) })).id
+            }
+        }
+        return targets
+    }
+
+    /// Local profiles earlier imports made for Arc's, by folder, for history and sign-ins imported without the sidebar.
+    /// Empty with one profile or an unreadable sidebar.
+    static func knownProfiles() -> [String: UUID] {
+        guard let sidebar = try? readSidebar() else { return [:] }
+        return profiles(for: sidebar, create: false)
+    }
+
+    /// Imports the chosen `parts` of Arc's sidebar into `into`. When Arc's spaces span several profiles, each goes to
+    /// the local profile with its name (created if needed); Arc's default goes to `into`. Existing spaces stay on their
+    /// own profile.
+    @discardableResult
+    static func importSidebar(into profile: UUID = Profile.defaultID, parts: Parts = .all) -> (result: Result, firstSpace: UUID?) {
+        var result = Result()
+        let sidebar: Sidebar
+        do {
+            sidebar = try readSidebar()
+        } catch {
+            result.problems.append(problem(reading: .sidebar, error))
+            sidebar = Sidebar()
+        }
+        // Only create profiles for spaces or favorites, not open tabs alone.
+        let targets = profiles(for: sidebar, create: parts.contains(.spaces) || parts.contains(.favorites))
+        result.profiles = targets
+        let inUse = sidebar.profilesInUse
+        func wants(_ id: UUID) -> UUID? {
+            guard !inUse.isEmpty else { return nil }
+            guard let folder = sidebar.profile(of: id, inUse: inUse) else { return profile }
+            return targets[folder]
+        }
+        let library = Library.shared
+        let plan = plan(sidebar, parts: parts, existing: library.spaces, wants: wants, profileOf: library.profileID(ofSpace:))
+        var newSpaces = plan.spaces
+        var addedFavorites = 0
+        for group in plan.favoriteGroups {
+            addedFavorites += library.appendFavorites(group.favorites, in: group.profile.flatMap { targets[$0] } ?? profile)
+        }
+        for favorite in plan.favorites { FaviconStore.shared.prefetch(for: favorite.url) }
+
+        // Importing again merges: spaces with the same name gain only the bookmarks they don't have yet, in their Arc
+        // folders, and pages already there but in no folder move into theirs (an earlier merge left them loose).
+        var merged = 0
+        newSpaces = newSpaces.filter { incoming in
+            guard let existing = match(incoming, in: library.spaces, wants: wants(incoming.id), profileOf: library.profileID(ofSpace:)) else { return true }
+            merged += merge(incoming, into: existing.id)
+            return false
+        }
+        result.spaces = newSpaces.count
+        result.bookmarks = newSpaces.map(\.bookmarks.count).reduce(0, +) + merged + addedFavorites
+        if !newSpaces.isEmpty {
+            // A fresh install's one empty space gives way to the imported ones. Spaces you made yourself stay, even empty.
+            let before = Library.shared.spaces
+            let pristine = before.count == 1 ? before.filter { space in
+                space.bookmarks.isEmpty && WindowManager.shared.controllers.allSatisfy { $0.tabManager.tabs(in: space.id).isEmpty }
+            } : []
+            Library.shared.appendSpaces(newSpaces)
+            for space in newSpaces { Library.shared.setProfile(wants(space.id) ?? profile, forSpace: space.id) }
+            for space in pristine where Library.shared.spaces.count > 1 { Library.shared.removeSpace(space.id) }
+            for bookmark in newSpaces.flatMap(\.bookmarks) { FaviconStore.shared.prefetch(for: bookmark.url) }
+        }
+        result.tabs = openInWindow(plan.openTabs)
+        log.notice("Arc import: \(result.spaces) spaces, \(result.bookmarks) bookmarks, \(result.tabs) open tabs, \(result.problems.count) problems")
+        return (result, newSpaces.first?.id)
+    }
+
+    /// Importing an Arc space again into `existingID`: only the pages it doesn't have yet are added, in their Arc
+    /// folders; pages there but in no folder move into theirs; split views whose pages are all there, side by side in
+    /// one folder and in no split, are pinned as splits. Returns how many pages were added.
+    @discardableResult
+    static func merge(_ incoming: SpaceInfo, into existingID: UUID) -> Int {
+        guard let existing = Library.shared.space(existingID) else { return 0 }
+        let folders = incoming.folders ?? []
+        func path(of id: UUID) -> [String] {
+            var names: [String] = []
+            var folder = folders.first { $0.bookmarkIDs.contains(id) }
+            while let current = folder, names.count < Library.folderDepthLimit {
+                names.insert(current.name, at: 0)
+                folder = current.parentID.flatMap { parent in folders.first { $0.id == parent } }
+            }
+            return names
+        }
+        var known: [String: Bookmark] = [:]
+        for bookmark in existing.bookmarks { known[TabManager.normalize(bookmark.url)] = known[TabManager.normalize(bookmark.url)] ?? bookmark }
+        let filedAlready = Set((existing.folders ?? []).flatMap(\.bookmarkIDs))
+        var new: [(url: URL, title: String)] = [], newPaths: [[String]] = []
+        var loose: [UUID] = [], loosePaths: [[String]] = []
+        for bookmark in incoming.bookmarks {
+            if let mine = known[TabManager.normalize(bookmark.url)] {
+                if !filedAlready.contains(mine.id), !loose.contains(mine.id), case let p = path(of: bookmark.id), !p.isEmpty {
+                    loose.append(mine.id); loosePaths.append(p)
+                }
+            } else {
+                new.append((bookmark.url, bookmark.title)); newPaths.append(path(of: bookmark.id))
+                known[TabManager.normalize(bookmark.url)] = bookmark
+            }
+        }
+        Library.shared.fileBookmarks(loose, paths: loosePaths, in: existing.id)
+        let added = Library.shared.appendBookmarks(new, to: existing.id, folders: newPaths).count
+        if let splits = incoming.pinnedSplits, !splits.isEmpty, let now = Library.shared.space(existing.id) {
+            var local: [String: UUID] = [:]
+            for bookmark in now.bookmarks { local[TabManager.normalize(bookmark.url)] = local[TabManager.normalize(bookmark.url)] ?? bookmark.id }
+            let urls = Dictionary(incoming.bookmarks.map { ($0.id, TabManager.normalize($0.url)) }, uniquingKeysWith: { a, _ in a })
+            var paired = Set((now.pinnedSplits ?? []).flatMap(\.ids))
+            let order = Dictionary(now.bookmarks.enumerated().map { ($1.id, $0) }, uniquingKeysWith: { a, _ in a })
+            func folder(of id: UUID) -> UUID? { now.folders?.first { $0.bookmarkIDs.contains(id) }?.id }
+            var gained: [PinnedSplit] = []
+            for split in splits {
+                let ids = split.ids.compactMap { urls[$0].flatMap { local[$0] } }
+                // Only pages next to each other in one folder, so none is moved.
+                let places = ids.compactMap { order[$0] }
+                guard ids.count == split.ids.count, Set(ids).count == ids.count, paired.isDisjoint(with: ids),
+                      places.count == ids.count, zip(places, places.dropFirst()).allSatisfy({ $1 == $0 + 1 }),
+                      Set(ids.map(folder(of:))).count == 1, let layout = split.pair(of: ids) else { continue }
+                paired.formUnion(ids)
+                gained.append(PinnedSplit(layout: layout))
+            }
+            Library.shared.addPinnedSplits(gained, in: existing.id)
+        }
+        return added
+    }
+
+    // MARK: Sidebar
+
+    struct FormatError: LocalizedError {
+        var errorDescription: String? { "its sidebar file is in a format Zigzag doesn’t know yet" }
+    }
+
+    /// A page open in one of Arc's spaces. `customTitle`: the name it was given there, if it was renamed.
+    struct OpenPage: Equatable {
+        var url: URL
+        var title: String
+        var customTitle: String? = nil
+    }
+
+    /// One row of a space's open tabs, top to bottom: a page, or a split view's two to four pages.
+    struct OpenTab: Equatable {
+        var pages: [OpenPage]
+    }
+
+    /// What Arc's sidebar holds. `openTabs`: each space's open tabs (those under Today, not pinned), by the
+    /// `SpaceInfo` id in `spaces`.
+    struct Sidebar {
+        var spaces: [SpaceInfo] = []
+        var favorites: [Bookmark] = []
+        var openTabs: [UUID: [OpenTab]] = [:]
+        /// Arc profile folder per local id, for spaces and favorites not on Arc's default profile.
+        var profiles: [UUID: String] = [:]
+
+        /// Folders of Arc profiles with spaces, in first-space order, when spaces span several; empty otherwise.
+        var profilesInUse: [String] {
+            guard Set(spaces.map { profiles[$0.id] }).count > 1 else { return [] }
+            var folders: [String] = []
+            for space in spaces { if let folder = profiles[space.id], !folders.contains(folder) { folders.append(folder) } }
+            return folders
+        }
+
+        /// The Arc profile folder an item is imported apart on, or nil for the default target (Arc's default, a profile
+        /// without spaces, or everything when only one is in use).
+        func profile(of id: UUID, inUse: [String]? = nil) -> String? {
+            guard let folder = profiles[id] else { return nil }
+            return (inUse ?? profilesInUse).contains(folder) ? folder : nil
+        }
+
+        /// Favorites grouped by profile in Arc's order, nil (the default target) first.
+        var favoriteGroups: [(profile: String?, favorites: [Bookmark])] {
+            let inUse = profilesInUse
+            return ([nil] + inUse.map(Optional.some)).compactMap { folder in
+                let mine = favorites.filter { profile(of: $0.id, inUse: inUse) == folder }
+                return mine.isEmpty ? nil : (folder, mine)
+            }
+        }
+    }
+
+    private static func readSidebar() throws -> Sidebar {
+        try readSidebar(Data(contentsOf: arcSupport.appendingPathComponent("StorableSidebar.json")))
+    }
+
+    static func parseSidebar(_ data: Data) throws -> (spaces: [SpaceInfo], favorites: [Bookmark]) {
+        let sidebar = try readSidebar(data)
+        return (sidebar.spaces, sidebar.favorites)
+    }
+
+    static func readSidebar(_ data: Data) throws -> Sidebar {
+        guard let root = try JSONSerialization.jsonObject(with: data) as? [String: Any] else { throw FormatError() }
+        // Arc keeps more than one copy of the sidebar: one or more classic containers, and, for sync, sidebarSyncState
+        // (or firebaseSyncState in older versions). Which one is current varies: with sync on, the synced copy holds
+        // everything and a classic one may be stale; with sync off, the synced copy is a small leftover (one person's
+        // held only Arc Basics while their pins sat in the fourth classic container). Read them all, and where they
+        // disagree, the fullest copy wins.
+        struct Copy { var items: [Any] = []; var spaces: [Any] = []; var order: [String] = []; var top: [Any] = []; var synced = false }
+        var copies: [Copy] = []
+        for container in (root["sidebar"] as? [String: Any])?["containers"] as? [[String: Any]] ?? [] where container["items"] != nil || container["spaces"] != nil {
+            copies.append(Copy(items: container["items"] as? [Any] ?? [], spaces: container["spaces"] as? [Any] ?? [],
+                               top: container["topAppsContainerIDs"] as? [Any] ?? []))
+        }
+        for synced in [(root["firebaseSyncState"] as? [String: Any])?["syncData"] as? [String: Any], root["sidebarSyncState"] as? [String: Any]] {
+            guard let synced else { continue }
+            let container = (synced["container"] as? [String: Any]).flatMap { ($0["value"] as? [String: Any]) ?? $0 }
+            let order = (container?["orderedSpaceIDs"] ?? synced["orderedSpaceIDs"]) as? [Any] ?? []
+            copies.append(Copy(items: synced["items"] as? [Any] ?? [], spaces: synced["spaceModels"] as? [Any] ?? [],
+                               order: order.compactMap { $0 as? String }, top: container?["topAppsContainerIDs"] as? [Any] ?? [], synced: true))
+        }
+        guard !copies.isEmpty else { throw FormatError() }
+        // Smallest first, so the fullest copy is read last and wins.
+        copies.sort { $0.items.count < $1.items.count }
+
+        // Arc stores lists as [key, value, key, value…] or as plain arrays, and newer versions (and Arc Sync) wrap each
+        // value as {"value": …}; collect the dictionaries either way.
+        func unwrapped(_ any: Any) -> [String: Any]? {
+            guard let dict = any as? [String: Any] else { return nil }
+            if dict["id"] == nil, let inner = dict["value"] as? [String: Any] { return inner }
+            return dict
+        }
+        var items: [String: [String: Any]] = [:]
+        var spaceByID: [String: [String: Any]] = [:]
+        var classicOrder: [String] = []
+        for copy in copies {
+            for item in copy.items.compactMap(unwrapped) {
+                guard let id = item["id"] as? String else { continue }
+                items[id] = item
+            }
+            for space in copy.spaces.compactMap(unwrapped) where space["containerIDs"] != nil || space["title"] != nil {
+                guard let id = space["id"] as? String else { continue }
+                if !copy.synced, !classicOrder.contains(id) { classicOrder.append(id) }
+                spaceByID[id] = space
+            }
+        }
+        // The spaces in the order Arc shows them: the synced order when the synced copy is the current one, which also
+        // leaves out spaces Arc no longer shows; otherwise the classic order.
+        let fullest = copies[copies.count - 1]
+        let shownOrder = fullest.synced ? fullest.order.filter { spaceByID[$0] != nil } : []
+        let spaceList = (shownOrder.isEmpty ? (classicOrder.isEmpty ? Array(spaceByID.keys).sorted() : classicOrder) : shownOrder)
+            .compactMap { spaceByID[$0] }
+        /// A container's kind as Arc writes it: the word ("pinned"), or, in newer files, an object keyed by it
+        /// ({"pinned": {…}}).
+        func kind(_ any: Any) -> String? {
+            if let word = any as? String { return word }
+            return (any as? [String: Any]).flatMap { $0.count == 1 ? $0.keys.first : nil }
+        }
+
+        /// A pinned tab's page, if it's a web page.
+        func tabPage(_ node: [String: Any]) -> [Bookmark] {
+            guard let data = node["data"] as? [String: Any], let tab = data["tab"] as? [String: Any],
+                  let urlString = tab["savedURL"] as? String, let url = URL(string: urlString), url.scheme == "http" || url.scheme == "https" else { return [] }
+            let title = (node["title"] as? String) ?? (tab["savedTitle"] as? String) ?? url.host() ?? urlString
+            return [Bookmark(url: url, title: TabManager.bookmarkTitle(title, url: url))]
+        }
+
+        func bookmarks(under id: String, depth: Int = 0) -> [Bookmark] {
+            guard depth < 8, let item = items[id] else { return [] }
+            var result: [Bookmark] = []
+            for child in item["childrenIds"] as? [String] ?? [] {
+                guard let node = items[child], let data = node["data"] as? [String: Any] else { continue }
+                if let tab = data["tab"] as? [String: Any], let urlString = tab["savedURL"] as? String, let url = URL(string: urlString),
+                   url.scheme == "http" || url.scheme == "https" {
+                    let title = (node["title"] as? String) ?? (tab["savedTitle"] as? String) ?? url.host() ?? urlString
+                    result.append(Bookmark(url: url, title: TabManager.bookmarkTitle(title, url: url)))
+                } else {
+                    // Folders flatten into the list, keeping their order.
+                    result += bookmarks(under: child, depth: depth + 1)
+                }
+            }
+            return result
+        }
+
+        /// The open tabs under a space's unpinned container, in Arc's order: only those its list holds, as the fullest
+        /// copy has it. An item that names the container as its parent but isn't in its list is a tab closed since,
+        /// left behind in an older copy, so it never comes back. A split view is one row of its pages; anything else
+        /// that holds pages gives each its own row. Archived tabs live in another file and never come over.
+        func openTabs(in containerID: String) -> [OpenTab] {
+            var seen = Set<String>()
+            let children = (items[containerID]?["childrenIds"] as? [String] ?? []).filter { seen.insert($0).inserted }
+            func page(_ node: [String: Any]) -> OpenPage? {
+                guard let data = node["data"] as? [String: Any], let tab = data["tab"] as? [String: Any],
+                      let urlString = tab["savedURL"] as? String, let url = URL(string: urlString), url.scheme == "http" || url.scheme == "https" else { return nil }
+                let saved = (tab["savedTitle"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+                let named = (node["title"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+                return OpenPage(url: url, title: saved ?? named ?? url.host() ?? urlString, customTitle: named == saved ? nil : named)
+            }
+            func pages(under id: String, depth: Int) -> [OpenPage] {
+                guard depth < 8, let node = items[id] else { return [] }
+                if let one = page(node) { return [one] }
+                return (node["childrenIds"] as? [String] ?? []).flatMap { pages(under: $0, depth: depth + 1) }
+            }
+            var rows: [OpenTab] = []
+            for child in children {
+                guard let node = items[child], let data = node["data"] as? [String: Any] else { continue }
+                if let one = page(node) {
+                    rows.append(OpenTab(pages: [one]))
+                } else if data["splitView"] != nil {
+                    let inside = pages(under: child, depth: 0)
+                    // Side by side as in Arc, up to the four a group holds; any more get a row each.
+                    if inside.count > 1 { rows.append(OpenTab(pages: Array(inside.prefix(TileShape.maxPanes)))) }
+                    rows += inside.dropFirst(inside.count > 1 ? TileShape.maxPanes : 0).map { OpenTab(pages: [$0]) }
+                } else {
+                    rows += pages(under: child, depth: 0).map { OpenTab(pages: [$0]) }
+                }
+            }
+            return rows
+        }
+
+        var spaces: [SpaceInfo] = []
+        var open: [UUID: [OpenTab]] = [:]
+        var profiles: [UUID: String] = [:]
+        for space in spaceList {
+            let name = (space["title"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? String(localized: "Space \(spaces.count + 1)", comment: "Name of an imported space that had none in Arc: Space 1, Space 2…")
+            let containerIDs = space["containerIDs"] as? [Any] ?? []
+            var pinnedID: String?, unpinnedID: String?
+            for (i, value) in containerIDs.enumerated() where i + 1 < containerIDs.count {
+                switch kind(value) {
+                case "pinned": pinnedID = containerIDs[i + 1] as? String
+                case "unpinned": unpinnedID = containerIDs[i + 1] as? String
+                default: break
+                }
+            }
+            var info = SpaceInfo(name: name, color: color(of: space))
+            if let unpinnedID, case let rows = openTabs(in: unpinnedID), !rows.isEmpty { open[info.id] = rows }
+            if let pinnedID, let pinned = items[pinnedID] {
+                // Arc's pinned folders come over as folders, nested as they were.
+                var folders: [BookmarkFolder] = []
+                var splits: [PinnedSplit] = []
+                /// A split view's pages, pinned side by side as in Arc, up to the four a split holds.
+                func splitPages(_ id: String) -> [Bookmark] {
+                    let pages = bookmarks(under: id)
+                    if pages.count > 1, let pair = splitPair(pages.prefix(TileShape.maxPanes).map(\.id)) { splits.append(PinnedSplit(layout: pair)) }
+                    return pages
+                }
+                func addFolder(_ id: String, parent: UUID?, depth: Int) {
+                    guard depth < Library.folderDepthLimit, let node = items[id] else { return }
+                    var folder = BookmarkFolder(name: (node["title"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+                                                ?? String(localized: "Folder", comment: "Name of an imported folder that had none."))
+                    folder.parentID = parent
+                    // Shut, as other imports' folders come (#343).
+                    folder.isOpen = false
+                    let at = folders.count
+                    folders.append(folder)
+                    for child in node["childrenIds"] as? [String] ?? [] {
+                        guard let inner = items[child], let data = inner["data"] as? [String: Any] else { continue }
+                        if data["tab"] != nil || data["splitView"] != nil || depth + 1 >= Library.folderDepthLimit {
+                            // A page, a split view, or a folder past the depth kept: its pages go in this folder.
+                            let pages = data["tab"] != nil ? tabPage(inner) : data["splitView"] != nil ? splitPages(child) : bookmarks(under: child)
+                            info.bookmarks += pages
+                            folders[at].bookmarkIDs += pages.map(\.id)
+                        } else {
+                            addFolder(child, parent: folder.id, depth: depth + 1)
+                        }
+                    }
+                }
+                for child in pinned["childrenIds"] as? [String] ?? [] {
+                    guard let node = items[child] else { continue }
+                    let data = node["data"] as? [String: Any]
+                    if data?["tab"] != nil {
+                        info.bookmarks += tabPage(node)
+                    } else if data?["splitView"] != nil {
+                        // A split view isn't a folder: its pages are pinned side by side.
+                        info.bookmarks += splitPages(child)
+                    } else if !bookmarks(under: child).isEmpty {
+                        addFolder(child, parent: nil, depth: 0)
+                    }
+                }
+                // A folder with no pages anywhere inside it doesn't come over.
+                folders = folders.filter { !folders.pages(in: $0.id).isEmpty }
+                if !folders.isEmpty { info.folders = folders }
+                if !splits.isEmpty { info.pinnedSplits = splits }
+            }
+            if let folder = arcProfile(space["profile"]) { profiles[info.id] = folder }
+            spaces.append(info)
+        }
+
+        var favorites: [Bookmark] = []
+        var topIDs: [String] = []
+        var topProfile: [String: String] = [:]
+        // Arc Sync keeps Favorites for profiles on other Macs, even when none of the displayed spaces uses them.
+        // A folder name alone isn't an identity: each Mac can have an unrelated "Profile 1".
+        let activeProfiles = Set(spaceList.map { sidebarProfile($0["profile"]) ?? SidebarProfile() })
+        var readProfiles = Set<SidebarProfile>()
+        // A marker matches a displayed space's profile exactly, or by folder where either side names no Mac.
+        func shown(_ profile: SidebarProfile) -> SidebarProfile? {
+            if activeProfiles.contains(profile) { return profile }
+            return activeProfiles.first { $0.folder == profile.folder && ($0.machineID == nil || profile.machineID == nil) }
+        }
+        for copy in copies.reversed() {
+            // Each profile's marker, then the ID of its Favorites container; only IDs name an item.
+            var current: SidebarProfile?, marked = false
+            var copiedProfiles = Set<SidebarProfile>()
+            for value in copy.top {
+                if let id = value as? String, items[id] != nil {
+                    guard !topIDs.contains(id) else { continue }
+                    if marked {
+                        guard let current = current.flatMap(shown), !readProfiles.contains(current) else { continue }
+                        copiedProfiles.insert(current)
+                    }
+                    topIDs.append(id)
+                    if let folder = current?.folder { topProfile[id] = folder }
+                } else if !(value is String) {
+                    current = sidebarProfile(value)
+                    marked = true
+                }
+            }
+            // The fullest copy's container wins, including an empty list after favorites were removed in Arc.
+            // Older formats without profile markers keep their existing import behavior.
+            readProfiles.formUnion(copiedProfiles)
+        }
+        for id in topIDs {
+            let inside = bookmarks(under: id)
+            favorites += inside
+            if let folder = topProfile[id] { for favorite in inside { profiles[favorite.id] = folder } }
+        }
+        return Sidebar(spaces: spaces, favorites: favorites, openTabs: open, profiles: profiles)
+    }
+
+    /// The identity Arc uses in the sidebar. Its default profile has neither a folder nor a machine ID.
+    private struct SidebarProfile: Hashable {
+        var folder: String? = nil
+        var machineID: String? = nil
+    }
+
+    private static func sidebarProfile(_ marker: Any?, depth: Int = 0) -> SidebarProfile? {
+        guard depth < 6, let dict = marker as? [String: Any] else { return nil }
+        if let folder = dict["directoryBasename"] as? String {
+            return folder.isEmpty || folder == "Default" ? SidebarProfile()
+                : SidebarProfile(folder: folder, machineID: dict["machineID"] as? String)
+        }
+        if dict["default"] != nil { return SidebarProfile() }
+        for value in dict.values {
+            if let profile = sidebarProfile(value, depth: depth + 1) { return profile }
+        }
+        return nil
+    }
+
+    /// The local profile folder a space uses, for history and sign-ins. Arc wraps it as {"custom": {"_0":
+    /// {"directoryBasename": "Profile 1", "machineID": "…"}}}, sometimes nested once more.
+    static func arcProfile(_ marker: Any?, depth: Int = 0) -> String? {
+        sidebarProfile(marker, depth: depth)?.folder
+    }
+
+    // MARK: Open tabs
+
+    /// Puts each space's open tabs in the front browser window, after the tabs it has, in Arc's order, split views
+    /// side by side. None loads: each waits, as after a relaunch, until it's clicked, so hundreds don't load at once
+    /// (its hover card says it isn't loaded yet; not that Zigzag reopened, as `isRestored` would).
+    /// A page already open in that space isn't opened twice, so importing again adds only what's new. Returns how
+    /// many came over.
+    /// A space of nil is the window's own, the one you're in.
+    static func openInWindow(_ bySpace: [(space: UUID?, tabs: [OpenTab])]) -> Int {
+        guard bySpace.contains(where: { !$0.tabs.isEmpty }) else { return 0 }
+        let windows = WindowManager.shared
+        let key = windows.keyController.flatMap { $0.tabManager.isPrivate ? nil : $0 }
+        guard let manager = (key ?? windows.controllers.last { !$0.tabManager.isPrivate } ?? windows.restoreIfNoWindows())?.tabManager else { return 0 }
+        return open(bySpace.map { ($0.space ?? manager.currentSpaceID, $0.tabs) }, in: manager)
+    }
+
+    /// `openInWindow`'s work, in one window's tabs.
+    static func open(_ bySpace: [(space: UUID, tabs: [OpenTab])], in manager: TabManager) -> Int {
+        var count = 0
+        for (spaceID, rows) in bySpace where Library.shared.space(spaceID) != nil && !rows.isEmpty {
+            var known = Set(manager.tabs(in: spaceID).compactMap { $0.url.map(TabManager.normalize) })
+            var tabs: [Tab] = [], groups: [[Tab]] = []
+            for row in rows {
+                let pages = row.pages.filter { !known.contains(TabManager.normalize($0.url)) }
+                let made = pages.map { page in
+                    let tab = Tab(url: page.url, title: page.title, spaceID: spaceID)
+                    tab.customTitle = page.customTitle
+                    return tab
+                }
+                known.formUnion(pages.map { TabManager.normalize($0.url) })
+                tabs += made
+                if made.count > 1 { groups.append(made) }
+            }
+            guard !tabs.isEmpty else { continue }
+            manager.adopt(tabs, in: spaceID)
+            for group in groups { if let pair = splitPair(group.map(\.id)) { manager.restoreSplit(pair) } }
+            for tab in tabs { if let url = tab.url { FaviconStore.shared.prefetch(for: url) } }
+            count += tabs.count
+        }
+        if count > 0 {
+            manager.changed.send(.structure)
+            WindowManager.shared.scheduleSave()
+        }
+        return count
+    }
+
+    /// Two to four pages side by side, as Arc's split view had them: two halves, a half and two quarters, or four.
+    static func splitPair(_ ids: [UUID]) -> TabManager.SplitPair? {
+        let regions: [TileRegion] = switch ids.count {
+        case 2: [.left, .right]
+        case 3: [.left, .topRight, .bottomRight]
+        default: [.topLeft, .topRight, .bottomLeft, .bottomRight]
+        }
+        return TabManager.SplitPair(ids: Array(ids.prefix(TileShape.maxPanes)), shape: TileShape(regions: regions))
+    }
+
+    /// Maps an Arc space's theme to the nearest of our tints.
+    private static func color(of space: [String: Any]) -> SpaceColor {
+        guard let info = space["customInfo"] as? [String: Any], let theme = info["windowTheme"] as? [String: Any],
+              let palette = theme["primaryColorPalette"] as? [String: Any],
+              let mid = palette["midTone"] as? [String: Any],
+              let r = mid["red"] as? Double, let g = mid["green"] as? Double, let b = mid["blue"] as? Double else { return .sky }
+        let color = NSColor(srgbRed: r, green: g, blue: b, alpha: 1)
+        if color.saturationComponent < 0.15 { return .graphite }
+        let hue = color.hueComponent
+        let candidates = SpaceColor.legacy
+        return candidates.min { a, b in
+            hueDistance(hue, (a.swatch.usingColorSpace(.sRGB)?.hueComponent ?? 0)) < hueDistance(hue, (b.swatch.usingColorSpace(.sRGB)?.hueComponent ?? 0))
+        } ?? .sky
+    }
+
+    private static func hueDistance(_ a: CGFloat, _ b: CGFloat) -> CGFloat {
+        let d = abs(a - b)
+        return min(d, 1 - d)
+    }
+
+    // MARK: History
+
+    /// Reads Arc's Chromium history, off the main thread: the file can be hundreds of megabytes. Every profile's, as
+    /// Arc's spaces can live in any of them ("Default", "Profile 1"…); the newest visit of a page wins.
+    nonisolated static func readHistory() throws -> [(URL, String, Int, Date)] {
+        try readHistory(apart: [:])[nil] ?? []
+    }
+
+    /// Arc history per target profile: profiles in `apart` (by folder) to their own, the rest to nil (the importing
+    /// profile). Newest visit per page wins.
+    nonisolated static func readHistory(apart: [String: UUID]) throws -> [UUID?: [(URL, String, Int, Date)]] {
+        let userData = arcSupport.appendingPathComponent("User Data", isDirectory: true)
+        let profiles = ((try? FileManager.default.contentsOfDirectory(atPath: userData.path)) ?? [])
+            .filter { $0 == "Default" || $0.hasPrefix("Profile ") }.sorted()
+        var newest: [UUID?: [URL: (URL, String, Int, Date)]] = [:]
+        for profile in profiles {
+            let source = userData.appendingPathComponent(profile).appendingPathComponent("History")
+            guard FileManager.default.fileExists(atPath: source.path) else { continue }
+            let target: UUID? = apart[profile]
+            for entry in readHistory(at: source) where newest[target]?[entry.0].map({ $0.3 < entry.3 }) ?? true {
+                newest[target, default: [:]][entry.0] = entry
+            }
+        }
+        return newest.mapValues { $0.values.sorted { $0.3 > $1.3 } }
+    }
+
+    /// One profile's history, through a private copy with its write-ahead log (Arc keeps the file locked while
+    /// running, and the latest visits may be only in the log).
+    nonisolated private static func readHistory(at source: URL) -> [(URL, String, Int, Date)] {
+        guard let reader = SQLiteReader(source) else { return [] }
+        var entries: [(URL, String, Int, Date)] = []
+        // Chromium time: microseconds since 1601-01-01.
+        let epochOffset: Double = 11_644_473_600
+        reader.rows("SELECT url, title, visit_count, last_visit_time FROM urls WHERE hidden = 0 ORDER BY last_visit_time DESC LIMIT 50000") { row in
+            guard let url = URL(string: row.string(0)), HistoryStore.shouldRecord(url) else { return }
+            let date = Date(timeIntervalSince1970: Double(row.int(3)) / 1_000_000 - epochOffset)
+            entries.append((url, row.string(1), Int(row.int(2)), date))
+        }
+        return entries
+    }
+}
