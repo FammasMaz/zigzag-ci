@@ -1,0 +1,1199 @@
+import AppKit
+import WebKit
+
+/// A floating text field we draw ourselves: no bezel, our font, our colors.
+class PlainTextField: NSTextField {
+    var onCancel: (() -> Void)?
+    /// Room at the sides for a selection and the first letter to draw whole (the address). Zero for fields lined up
+    /// with a label they replace, like renaming.
+    var textInset: CGFloat = 0
+    /// Text centered top to bottom in a field taller than its line (the address). Off, the text sits where AppKit
+    /// puts it, as every other field always has.
+    var centersText = false
+    /// Items to offer right after Paste in the field's right-click menu (the address's Paste and Go).
+    var pasteMenuItems: (() -> [NSMenuItem])?
+
+    /// The field editor asks its delegate, this field, for the menu it shows on a right-click.
+    @objc(textView:menu:forEvent:atIndex:)
+    func textView(_ textView: NSTextView, menu: NSMenu, for event: NSEvent, at charIndex: Int) -> NSMenu? {
+        guard let items = pasteMenuItems?(), !items.isEmpty else { return menu }
+        let paste = menu.items.firstIndex { $0.action == #selector(NSText.paste(_:)) }
+        var index = paste.map { $0 + 1 } ?? 0
+        for item in items { menu.insertItem(item, at: index); index += 1 }
+        return menu
+    }
+
+    init(font: NSFont, placeholder: String) {
+        super.init(frame: .zero)
+        // A new cell starts out read-only; a text field you type in needs it editable again.
+        cell = PaddedTextFieldCell(textCell: "")
+        isEditable = true
+        isSelectable = true
+        self.font = font
+        isBordered = false
+        isBezeled = false
+        drawsBackground = false
+        focusRingType = .none
+        textColor = Tokens.Color.textPrimary
+        usesSingleLineMode = true
+        lineBreakMode = .byTruncatingTail
+        cell?.isScrollable = true
+        cell?.wraps = false
+        placeholderAttributedString = NSAttributedString(string: placeholder, attributes: [
+            .font: font, .foregroundColor: Tokens.Color.textTertiary,
+        ])
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    /// `centeredY` depends on backing scale; re-place on scale change (as `Label` does).
+    override func viewDidChangeBackingProperties() {
+        super.viewDidChangeBackingProperties()
+        superview?.needsLayout = true
+    }
+}
+
+/// Draws and edits the text a little in from the sides, and centered in its height if the field asks, so a selection
+/// that runs to the edge, or the first letter of a long address, isn't cut off.
+private final class PaddedTextFieldCell: NSTextFieldCell {
+    private func textRect(in rect: NSRect) -> NSRect {
+        let field = controlView as? PlainTextField
+        var r = rect.insetBy(dx: field?.textInset ?? 0, dy: 0)
+        guard field?.centersText == true else { return r }
+        let height = ceil(cellSize(forBounds: r).height)
+        if height < r.height { r.origin.y += floor((r.height - height) / 2); r.size.height = height }
+        return r
+    }
+
+    override func drawingRect(forBounds rect: NSRect) -> NSRect { super.drawingRect(forBounds: textRect(in: rect)) }
+
+    override func edit(withFrame rect: NSRect, in controlView: NSView, editor: NSText, delegate: Any?, event: NSEvent?) {
+        super.edit(withFrame: textRect(in: rect), in: controlView, editor: editor, delegate: delegate, event: event)
+    }
+
+    override func select(withFrame rect: NSRect, in controlView: NSView, editor: NSText, delegate: Any?, start: Int, length: Int) {
+        super.select(withFrame: textRect(in: rect), in: controlView, editor: editor, delegate: delegate, start: start, length: length)
+    }
+
+}
+
+/// A window the find bar can search: a browser window or Zigzag Mini (#246).
+protocol FindBarHost: AnyObject {
+    var window: NSWindow? { get }
+    /// The searched page's frame; the bar sits at its top right.
+    var focusedPaneFrame: NSRect { get }
+    /// Height of a split pane header above the page; the bar sits below it.
+    var findBarHeaderHeight: CGFloat { get }
+    /// View the bar is added to.
+    var findBarOverlay: NSView { get }
+    /// Something over the page (the command bar) gets Esc first.
+    var findBarIsCovered: Bool { get }
+    var findableWebView: WKWebView? { get }
+    /// Zigzag's PDF viewer, which searches the PDF itself.
+    var findablePDF: PDFViewerView? { get }
+}
+
+extension BrowserWindowController: FindBarHost {
+    var findBarHeaderHeight: CGFloat { root.card.showsHeader ? PaneHeaderView.height : 0 }
+    var findBarOverlay: NSView { root.overlay }
+    var findBarIsCovered: Bool { commandBar.isVisible }
+    var findablePDF: PDFViewerView? { selectedTab?.pdfViewer }
+}
+
+/// Find in page: a floating capsule at the top right of the page card holding a magnifying glass, the field, the count,
+/// and round buttons whose circles run with the capsule's end.
+final class FindBarController: NSObject, NSTextFieldDelegate {
+    private weak var window: (any FindBarHost)?
+    private let panel = FloatingPanelView()
+    private let glass = NSImageView(image: Tokens.Symbol.image("magnifyingglass", size: Tokens.TypeSize.body))
+    private let field = PlainTextField(font: Tokens.Font.body(), placeholder: String(localized: "Find on page", comment: "Placeholder of the find bar's field."))
+    private let countLabel = Label("", font: Tokens.Font.small(), color: Tokens.Color.textSecondary)
+    private let previousButton = IconButton(symbol: "chevron.up", toolTip: String(localized: "Previous", comment: "Tooltip of the find bar's button that goes to the previous match."))
+    private let nextButton = IconButton(symbol: "chevron.down", toolTip: String(localized: "Next", comment: "Tooltip of the find bar's button that goes to the next match."))
+    private let doneButton = IconButton(symbol: "xmark", toolTip: String(localized: "Done", comment: "Tooltip of the find bar's close button."))
+    private(set) var isVisible = false
+    private var query = ""
+    var hasQuery: Bool { !query.isEmpty }
+
+    init(window: any FindBarHost) {
+        self.window = window
+        super.init()
+        field.delegate = self
+        panel.radius = Tokens.Metric.findBarHeight / 2
+        // It drops down from the top of the page it searches, as the notices do, and goes back up the same way as it
+        // leaves, however fast you press ⌘F.
+        panel.slidesFromTop = true
+        glass.contentTintColor = Tokens.Color.textTertiary
+        glass.imageScaling = .scaleNone
+        panel.addSubview(glass)
+        panel.addSubview(field)
+        panel.addSubview(countLabel)
+        panel.addSubview(previousButton)
+        panel.addSubview(nextButton)
+        panel.addSubview(doneButton)
+        previousButton.onClick = { [weak self] _ in self?.next(backwards: true) }
+        nextButton.onClick = { [weak self] _ in self?.next(backwards: false) }
+        doneButton.onClick = { [weak self] _ in self?.hide() }
+        panel.onLayout = { [weak self] in self?.layoutPanel() }
+        ticks.onPick = { [weak self] index in self?.search(backwards: false, toMatch: index) }
+        NotificationCenter.default.addObserver(self, selector: #selector(keyChanged(_:)), name: NSWindow.didBecomeKeyNotification, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(keyChanged(_:)), name: NSWindow.didResignKeyNotification, object: nil)
+    }
+
+    /// Stop updating match marks while another window is key: busy pages change constantly.
+    @objc private func keyChanged(_ note: Notification) {
+        guard let changed = note.object as? NSWindow, changed === window?.window, isVisible, let searched, searchedPDF == nil,
+              FindMarks.isAvailable else { return }
+        FindMarks.pause(!changed.isKeyWindow, in: searched)
+    }
+
+    /// Match ticks along the page's right edge (`FindMarks`).
+    private let ticks = FindMarksView()
+
+    /// The page the last search ran in, so its highlight goes when you move to the other pane.
+    private weak var searched: WKWebView?
+    /// The PDF the last search ran in, for the same reason.
+    private weak var searchedPDF: PDFViewerView?
+    /// A PDF is searched a moment after you stop typing: a long one takes a while, and each letter shouldn't wait.
+    private var pdfSearch: DispatchWorkItem?
+
+    /// Over the page it searches: in split view, the pane you're working in.
+    private var frame: NSRect {
+        guard let window else { return .zero }
+        let card = window.focusedPaneFrame
+        let height = Tokens.Metric.findBarHeight
+        let width = Tokens.Metric.findBarWidth
+        // Below a split pane's header, as far into the page as without one, clear of the header's buttons.
+        let header = window.findBarHeaderHeight
+        return NSRect(x: card.maxX - width - Tokens.Space.x3, y: card.minY + header + Tokens.Space.x3, width: width, height: height)
+    }
+
+    private func layoutPanel() {
+        let b = panel.bounds
+        let button = Tokens.Metric.findBarButton
+        // As far in from the end as from the top and bottom, so Done's circle runs with the capsule's.
+        let inset = (b.height - button) / 2
+        doneButton.frame = NSRect(x: b.width - inset - button, y: inset, width: button, height: button)
+        nextButton.frame = NSRect(x: doneButton.frame.minX - button, y: inset, width: button, height: button)
+        previousButton.frame = NSRect(x: nextButton.frame.minX - button, y: inset, width: button, height: button)
+        [previousButton, nextButton, doneButton].forEach { $0.radius = button / 2 }
+        let countWidth = countLabel.textWidth
+        let countHeight = countLabel.lineHeight
+        countLabel.frame = NSRect(x: previousButton.frame.minX - Tokens.Space.x1 - countWidth, y: countLabel.centeredY(in: b.height), width: countWidth, height: countHeight)
+        let side = Tokens.Metric.favicon
+        glass.frame = NSRect(x: Tokens.Space.x3 + 2, y: (b.height - side) / 2, width: side, height: side)
+        let fieldHeight = ceil(field.intrinsicContentSize.height)
+        let x = glass.frame.maxX + Tokens.Space.x1 + 2
+        field.frame = NSRect(x: x, y: field.centeredY(in: b.height), width: max(0, countLabel.frame.minX - x - Tokens.Space.x2), height: fieldHeight)
+    }
+
+    /// ⌘F: opens the bar, or puts you back in it; pressed again while you're typing in it, closes it.
+    func toggle() {
+        if isVisible, field.currentEditor() != nil { hide() } else { show() }
+    }
+
+    /// `animated` off: it comes back with the tab it belongs to, as part of that page, not as something new.
+    /// `searches` off: the caller runs the search itself.
+    func show(query newQuery: String? = nil, focus: Bool = true, animated: Bool = true, searches: Bool = true) {
+        guard let window else { return }
+        if let newQuery { query = newQuery; field.stringValue = newQuery }
+        // With their shortcuts, as the sidebar's buttons say theirs; read each time, since shortcuts can be changed.
+        previousButton.toolTip = Shortcuts.tooltip(String(localized: "Previous", comment: "Tooltip of the find bar's button that goes to the previous match."),
+                                                   for: #selector(BrowserWindowController.findPreviousMatch(_:)))
+        nextButton.toolTip = Shortcuts.tooltip(String(localized: "Next", comment: "Tooltip of the find bar's button that goes to the next match."),
+                                               for: #selector(BrowserWindowController.findNextMatch(_:)))
+        if !isVisible {
+            isVisible = true
+            panel.frame = frame
+            window.findBarOverlay.addSubview(panel)
+            panel.present(arrival: animated ? .pop : .instant)
+            watchEscape()
+        } else {
+            panel.frame = frame
+        }
+        if focus {
+            window.window?.makeFirstResponder(field)
+            field.currentEditor()?.selectAll(nil)
+        }
+        if searches, !query.isEmpty { search(backwards: false, fromStart: !focus) }
+    }
+
+    /// Esc closes the bar from the page too, not only from its field, so you never need the mouse for it.
+    private var escapeMonitor: Any?
+    private func watchEscape() {
+        guard escapeMonitor == nil else { return }
+        escapeMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard let self, event.keyCode == 53, self.isVisible, event.window === self.window?.window,
+                  event.modifierFlags.intersection(.deviceIndependentFlagsMask).isEmpty,
+                  // Something else in front (the address bar) takes its own Esc first.
+                  self.window?.findBarIsCovered != true else { return event }
+            self.hide()
+            return nil
+        }
+    }
+
+    /// What you were finding in each tab: switching away puts the bar away, and coming back brings it back.
+    private let remembered = NSMapTable<WKWebView, NSString>.weakToStrongObjects()
+
+    func reposition() {
+        guard isVisible else { return }
+        panel.frame = frame
+    }
+
+    /// Another page came to the front. The other pane of a split: the bar moves over it and searches there. Another
+    /// tab: the bar goes with the tab it was opened in, and comes back when you return to a tab you were finding in.
+    func pageChanged() {
+        let current = window?.findableWebView
+        guard isVisible else {
+            if let current, let saved = remembered.object(forKey: current) as String? { show(query: saved, focus: false, animated: false) }
+            return
+        }
+        guard current !== searched else { return }
+        // Still on screen (the other half of a split): follow over to the pane you're in. Otherwise it was another tab.
+        let stillShown = searched.map { $0.window != nil && !$0.isHiddenOrHasHiddenAncestor } ?? false
+        if !stillShown {
+            if let searched, !query.isEmpty { remembered.setObject(query as NSString, forKey: searched) }
+            hide(keepingMemory: true, focusPage: false, animated: false)
+            if let current, let saved = remembered.object(forKey: current) as String? { show(query: saved, focus: false, animated: false) }
+            return
+        }
+        clearHighlights()
+        let target = frame
+        Tokens.Motion.animate(Tokens.Motion.snappy, moves: true) { [panel] in panel.animator().frame = target }
+        if query.isEmpty { countLabel.stringValue = ""; layoutPanel() } else { search(backwards: false, fromStart: true) }
+    }
+
+    func hide() { hide(keepingMemory: false, focusPage: true) }
+
+    private func hide(keepingMemory: Bool, focusPage: Bool, animated: Bool = true) {
+        guard isVisible else { return }
+        isVisible = false
+        if let escapeMonitor { NSEvent.removeMonitor(escapeMonitor) }
+        escapeMonitor = nil
+        // Closed on purpose: that tab's search is done.
+        if !keepingMemory, let webView = searched ?? window?.findableWebView { remembered.removeObject(forKey: webView) }
+        panel.dismiss(instantly: !animated)
+        clearHighlights()
+        if focusPage, let webView = window?.findableWebView { window?.window?.makeFirstResponder(webView) }
+    }
+
+    func next(backwards: Bool) {
+        if !isVisible { show(searches: false) }
+        search(backwards: backwards)
+    }
+
+    func controlTextDidChange(_ obj: Notification) {
+        query = field.stringValue
+        if query.isEmpty { countLabel.stringValue = ""; clearHighlights(); layoutPanel(); return }
+        search(backwards: false, fromStart: true)
+    }
+
+    func control(_ control: NSControl, textView: NSTextView, doCommandBy selector: Selector) -> Bool {
+        switch selector {
+        case #selector(NSResponder.insertNewline(_:)):
+            let shift = NSApp.currentEvent?.modifierFlags.contains(.shift) ?? false
+            search(backwards: shift)
+            return true
+        case #selector(NSResponder.cancelOperation(_:)):
+            hide()
+            return true
+        default:
+            return false
+        }
+    }
+
+    /// `toMatch`: the match of a clicked tick.
+    private func search(backwards: Bool, fromStart: Bool = false, toMatch: Int? = nil) {
+        // A PDF is searched in its own viewer, which knows its pages and counts the matches itself.
+        if let pdf = window?.findablePDF {
+            searched = window?.findableWebView
+            searchedPDF = pdf
+            pdfSearch?.cancel()
+            let query = query
+            let work = DispatchWorkItem { [weak self, weak pdf] in
+                // The helper has the PDF's text: the count comes once it's answered, unless you've typed on since.
+                Task { @MainActor [weak self, weak pdf] in
+                    guard let pdf, let found = await pdf.find(query, backwards: backwards, fromStart: fromStart),
+                          let self, self.query == query, self.searchedPDF === pdf else { return }
+                    self.showCount(query.isEmpty ? "" : found.count == 0 ? Self.noMatches
+                        : found.count == 1 ? Self.matches(found.count) : Self.place(found.place, of: found.count))
+                    self.countLabel.textColor = found.count > 0 ? Tokens.Color.textSecondary : Tokens.Color.textTertiary
+                    self.layoutPanel()
+                }
+            }
+            pdfSearch = work
+            // Typing waits; Return and the arrows move at once.
+            if fromStart { DispatchQueue.main.asyncAfter(deadline: .now() + 0.15, execute: work) } else { work.perform() }
+            return
+        }
+        guard let webView = window?.findableWebView, !query.isEmpty else { return }
+        watch(webView)
+        if fromStart { webView.runOwnScript("window.getSelection().removeAllRanges()") }
+        // WebKit's own find, which counts the same matches it goes through (`PageFind`).
+        guard PageFind.isAvailable else {
+            let config = WKFindConfiguration()
+            config.backwards = backwards
+            config.caseSensitive = false
+            config.wraps = true
+            webView.find(query, configuration: config) { [weak self] result in
+                self?.show(result.matchFound ? nil : PageFind.Result(count: 0))
+            }
+            return
+        }
+        let asked = query
+        // Zigzag marks every match and the current one in a stronger color instead of WebKit's highlight.
+        let marks = FindMarks.isAvailable
+        Task { @MainActor [weak self, weak webView] in
+            guard let webView else { return }
+            if marks, let toMatch {
+                await FindMarks.moveCaret(toMatch: toMatch, in: webView)
+            } else if marks, !fromStart {
+                await FindMarks.prepare(in: webView)
+            }
+            guard let result = await PageFind.find(asked, in: webView, backwards: backwards, showsIndicator: !marks) else { return }
+            // Typed on since: the newer search says it.
+            guard let self, self.query == asked, self.searched === webView else { return }
+            self.show(result)
+            guard marks else { return }
+            // WebKit's yellow highlight would cover the current match color.
+            if webView.responds(to: Self.hideFindUI) { webView.perform(Self.hideFindUI) }
+            await self.refreshMarks(in: webView, found: result.count)
+        }
+    }
+
+    /// Marks all matches and adds edge ticks. `found`: WebKit's count; zero means nothing is marked.
+    private func refreshMarks(in webView: WKWebView, found: Int) async {
+        guard found > 0 else { clearMarks(in: webView); return }
+        let asked = query
+        // Refresh requested while another window is key (a page finished loading): wait until it's key again.
+        let away = window?.window?.isKeyWindow == false
+        guard let snapshot = await FindMarks.mark(asked, in: webView, paused: away), isVisible, query == asked, searched === webView else { return }
+        ticks.attach(to: webView)
+        ticks.snapshot = snapshot
+        // WebKit counts from its last found match, so after a tick or page click its index can be wrong. When both
+        // counts agree, use the marks' index.
+        if let current = snapshot.current, snapshot.count == found, found <= PageFind.maxCount, current != place {
+            show(PageFind.Result(count: found, index: current))
+        }
+        FindMarks.listen(to: webView) { [weak self, weak webView] snapshot in
+            guard let self, let webView, self.isVisible, self.searched === webView, self.query == asked else { return }
+            self.ticks.snapshot = snapshot
+            // The page changed: recount.
+            self.recount(in: webView, marking: false)
+        }
+    }
+
+    private func clearMarks(in webView: WKWebView?) {
+        if let webView { FindMarks.clear(in: webView) }
+        ticks.snapshot = .empty
+        ticks.removeFromSuperview()
+    }
+
+    /// The match you're on, from 0, so a recount can keep saying where you are.
+    private(set) var place: Int?
+
+    /// The page being searched: once it finishes loading something new, its count is read again, so it never
+    /// says what an earlier page had.
+    private func watch(_ webView: WKWebView) {
+        guard searched !== webView || loadingWatch == nil else { return }
+        searched = webView
+        place = nil
+        loadingWatch = webView.observe(\.isLoading, options: [.new]) { [weak self] webView, change in
+            MainActor.assumeIsolated {
+                // Navigating away: clear the old page's ticks.
+                if change.newValue == true { self?.ticks.snapshot = .empty } else { self?.recount(in: webView) }
+            }
+        }
+    }
+    private var loadingWatch: NSKeyValueObservation?
+
+    /// `marking`: re-mark the matches too, as after a load.
+    private func recount(in webView: WKWebView, marking: Bool = true) {
+        guard isVisible, searched === webView, !query.isEmpty, PageFind.isAvailable else { return }
+        let asked = query
+        Task { @MainActor [weak self, weak webView] in
+            guard let webView, let count = await PageFind.count(asked, in: webView) else { return }
+            guard let self, self.query == asked, self.searched === webView else { return }
+            let place = self.place.flatMap { $0 < count ? $0 : nil }
+            self.show(PageFind.Result(count: count, index: place))
+            if marking, FindMarks.isAvailable { await self.refreshMarks(in: webView, found: count) }
+        }
+    }
+
+    /// The count for what was found: "3 of 12", "1 match", "No matches". Nil: found, how many unknown.
+    private func show(_ result: PageFind.Result?) {
+        place = result?.index
+        let text: String
+        switch result {
+        case nil: text = ""
+        case let result? where result.count == 0: text = Self.noMatches
+        case let result? where result.isOverMax: text = Self.moreThanMax
+        case let result? where result.count == 1: text = Self.matches(1)
+        case let result?: text = result.index.map { Self.place($0 + 1, of: result.count) } ?? Self.matches(result.count)
+        }
+        showCount(text)
+        countLabel.textColor = result?.count == 0 ? Tokens.Color.textTertiary : Tokens.Color.textSecondary
+        layoutPanel()
+    }
+
+    /// Past what's counted: "More than 1,000 matches".
+    private static var moreThanMax: String {
+        String(localized: "More than \(PageFind.maxCount) matches", comment: "Find bar count when the page has more matches than are counted. The number is 1,000.")
+    }
+
+    private static var noMatches: String { String(localized: "No matches", comment: "Find bar count when the page has nothing that matches.") }
+
+    /// "12 matches", or "1 match".
+    private static func matches(_ count: Int) -> String { String(localized: "\(count) matches", comment: "Find bar count: how many matches the page has.") }
+
+    /// "3 of 12": the match you're on, and how many there are.
+    private static func place(_ place: Int, of count: Int) -> String {
+        String(localized: "\(place) of \(count)", comment: "Find bar count: the match you're on, and how many there are, like 3 of 12.")
+    }
+
+    /// Shows the match count, and has VoiceOver say it when it changes.
+    private func showCount(_ text: String) {
+        if text != countLabel.stringValue { Announcement.post(text) }
+        countLabel.stringValue = text
+    }
+
+    private func clearHighlights() {
+        pdfSearch?.cancel()
+        (searchedPDF ?? window?.findablePDF)?.clearFind()
+        searchedPDF = nil
+        let webView = searched ?? window?.findableWebView
+        clearMarks(in: webView)
+        if let webView {
+            webView.runOwnScript("window.getSelection().removeAllRanges()")
+            // WebKit draws its own highlight over the match, apart from the selection; it stays until told to go.
+            if webView.responds(to: Self.hideFindUI) { webView.perform(Self.hideFindUI) }
+        }
+        searched = nil
+    }
+
+    private static let hideFindUI = NSSelectorFromString("_hideFindUI")
+
+    #if DEBUG
+    /// Writes the bar, ticks and page script state as JSON to `path` (`findstate`).
+    func debugState(to path: String) {
+        let webView = searched ?? window?.findableWebView
+        var state: [String: Any] = [
+            "visible": isVisible, "query": query, "count": countLabel.stringValue, "marksAvailable": FindMarks.isAvailable,
+            "ticks": ticks.snapshot.marks.count, "current": ticks.snapshot.current ?? -1, "dark": ticks.snapshot.dark,
+            "ticksShown": ticks.superview != nil && !ticks.isHidden,
+            "ticksFrame": ticks.superview == nil ? "" : NSStringFromRect(ticks.convert(ticks.bounds, to: nil)),
+            "webViewFrame": webView.map { NSStringFromRect($0.convert($0.bounds, to: nil)) } ?? "",
+        ]
+        Task { @MainActor in
+            if let webView, let page = try? await webView.runOwnScript("return globalThis.__zigzagFind ? globalThis.__zigzagFind.state() : null", asFunction: true) {
+                state["page"] = page
+            }
+            if let data = try? JSONSerialization.data(withJSONObject: state, options: [.prettyPrinted, .sortedKeys]) {
+                try? data.write(to: URL(fileURLWithPath: path))
+            }
+        }
+    }
+
+    /// Where the bar is, and which PDF it last searched (`panestate`).
+    var debugFrame: String { isVisible ? "\(NSStringFromRect(panel.frame)) pdf=\(searchedPDF?.url.lastPathComponent ?? "-")" : "hidden" }
+
+    /// Same as clicking a tick (`findtick`).
+    func debugPickTick(_ index: Int) { search(backwards: false, toMatch: index) }
+    #endif
+}
+
+/// A floating surface (the design's top layer, see Design/DESIGN.md): an opaque surface leaning toward the window's
+/// space (`Brand.Theme.panel`), a crisp hairline edge, one soft small shadow, `Tokens.Radius.panel` corners, and an
+/// eased arrival out of what opened it. Panels that belong to the sidebar (`liftedFrom`) or are tinted (`surfaceTint`)
+/// take that color instead.
+class FloatingPanelView: NSView {
+    private let surface = ColorView(color: Tokens.Color.panelBackground)
+    /// The Mac's own popover material under the surface: a panel reads as part of macOS, softly showing what's
+    /// behind it, with the space's color washed thinly over it.
+    private let material: NSVisualEffectView = {
+        let view = NSVisualEffectView()
+        view.material = .popover
+        view.blendingMode = .withinWindow
+        view.state = .followsWindowActiveState
+        view.wantsLayer = true
+        view.layer?.cornerCurve = .continuous
+        view.layer?.masksToBounds = true
+        view.layer?.zPosition = -1
+        return view
+    }()
+    var onLayout: (() -> Void)?
+    var radius: CGFloat = Tokens.Radius.panel { didSet { needsLayout = true } }
+    /// In a window of its own with nothing else in it (Zigzag Mini's quick open), the material shows the desktop
+    /// behind, as it shows the page behind in a browser window.
+    var showsDesktop = false { didSet { material.blendingMode = showsDesktop ? .behindWindow : .withinWindow } }
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        wantsLayer = true
+        layer?.masksToBounds = false
+        surface.wantsLayer = true
+        surface.layer?.cornerCurve = .continuous
+        surface.layer?.masksToBounds = true
+        surface.layer?.borderWidth = Tokens.Metric.hairline
+        surface.layer?.zPosition = 1
+        super.addSubview(material)
+        addSubview(surface)
+        refreshColors()
+        themeToken = Brand.themeChanged.observe { [weak self] in self?.refreshColors() }
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    private var themeToken: SignalToken?
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        refreshColors()
+    }
+
+    override var isFlipped: Bool { true }
+    /// A panel is never a handle for the window (#216).
+    override var mouseDownCanMoveWindow: Bool { false }
+
+    /// Whether a view a press landed on is a panel's own surface rather than one of its controls: a gap, a label, a
+    /// box of rows. Only the panel takes such a press; it never moves the window or reaches what's behind (#216).
+    ///
+    /// Walking up from the hit view, anything that handles a press itself ends the walk as not bare: a control, a text
+    /// view, a field's own padding or bezel (the view around it that focuses it on a press), anything that takes first
+    /// responder or has a mouseDown of its own. Words that are only words (a label) are surface.
+    static func isBareSurface(_ hit: NSView?) -> Bool { bareSurfacePanel(hit) != nil }
+
+    /// The panel whose bare surface was hit, or nil for a hit on its controls (`isBareSurface`).
+    static func bareSurfacePanel(_ hit: NSView?) -> FloatingPanelView? {
+        var view = hit
+        while let current = view {
+            if let panel = current as? FloatingPanelView { return panel }
+            if handlesPress(current) { return nil }
+            view = current.superview
+        }
+        return nil
+    }
+
+    /// Left presses on the panel's bare surface, which the window otherwise swallows (used to drag the command bar).
+    var onBarePress: ((NSEvent) -> Void)?
+
+    private static func handlesPress(_ view: NSView) -> Bool {
+        if let field = view as? NSTextField, isLabel(field) { return false }
+        if view is NSControl || view is NSText || view is NSScroller || view is WKWebView { return true }
+        if let scroll = view as? NSScrollView, scroll.documentView is NSText { return true }
+        if !view.mouseDownCanMoveWindow || view.acceptsFirstResponder { return true }
+        return overridesMouseDown(type(of: view))
+    }
+
+    /// Plain words: not typed in, not selected from, no bezel. Its mouseDown (NSControl's) only hands the press on.
+    private static func isLabel(_ field: NSTextField) -> Bool {
+        !field.isEditable && !field.isSelectable && !field.isBezeled
+            && !(field is NSSearchField) && !(field is NSTokenField) && !(field is NSSecureTextField)
+    }
+
+    /// Whether a class answers a press itself rather than leaving it to NSView's, which only hands it on.
+    private static func overridesMouseDown(_ cls: AnyClass) -> Bool {
+        let selector = #selector(NSView.mouseDown(with:))
+        return class_getMethodImplementation(cls, selector) != class_getMethodImplementation(NSView.self, selector)
+    }
+
+    /// Content goes in the surface so it is clipped to the rounded shape.
+    override func addSubview(_ view: NSView) {
+        if view === surface { super.addSubview(view) } else { surface.addSubview(view) }
+    }
+
+    /// An arrow on the top edge pointing up at what the panel is about, at this x; the panel's top `arrowHeight` is
+    /// the arrow's.
+    var arrowX: CGFloat? { didSet { needsLayout = true } }
+    static let arrowHeight: CGFloat = 8
+    private static let arrowWidth: CGFloat = 20
+    /// The arrow's outline: the edge drawn along it, since a layer border can't follow it.
+    private let outline = CAShapeLayer()
+
+    /// The rounded body with the arrow on top, in the panel's own (flipped) coordinates.
+    private func arrowPath(at x: CGFloat) -> CGPath {
+        let h = Self.arrowHeight, half = Self.arrowWidth / 2
+        let r = CALayer.cornerRadius(radius, size: CGSize(width: bounds.width, height: bounds.height - h))
+        let body = NSRect(x: 0, y: h, width: bounds.width, height: bounds.height - h)
+        let tipX = min(max(x, r + half), body.maxX - r - half)
+        let path = CGMutablePath()
+        path.move(to: CGPoint(x: body.minX + r, y: body.minY))
+        path.addLine(to: CGPoint(x: tipX - half, y: body.minY))
+        path.addArc(tangent1End: CGPoint(x: tipX, y: 0), tangent2End: CGPoint(x: tipX + half, y: body.minY), radius: 3)
+        path.addLine(to: CGPoint(x: tipX + half, y: body.minY))
+        path.addArc(tangent1End: CGPoint(x: body.maxX, y: body.minY), tangent2End: CGPoint(x: body.maxX, y: body.maxY), radius: r)
+        path.addArc(tangent1End: CGPoint(x: body.maxX, y: body.maxY), tangent2End: CGPoint(x: body.minX, y: body.maxY), radius: r)
+        path.addArc(tangent1End: CGPoint(x: body.minX, y: body.maxY), tangent2End: CGPoint(x: body.minX, y: body.minY), radius: r)
+        path.addArc(tangent1End: CGPoint(x: body.minX, y: body.minY), tangent2End: CGPoint(x: body.maxX, y: body.minY), radius: r)
+        path.closeSubpath()
+        return path
+    }
+
+    override func layout() {
+        super.layout()
+        surface.frame = bounds
+        material.frame = bounds
+        if let arrowX {
+            let path = arrowPath(at: arrowX)
+            surface.layer?.cornerRadius = 0
+            let mask = (surface.layer?.mask as? CAShapeLayer) ?? CAShapeLayer()
+            mask.frame = surface.bounds
+            mask.path = path
+            surface.layer?.mask = mask
+            // The material takes a mask image, not a layer mask.
+            material.layer?.cornerRadius = 0
+            material.maskImage = NSImage(size: bounds.size, flipped: true) { _ in
+                guard let context = NSGraphicsContext.current?.cgContext else { return false }
+                context.addPath(path)
+                context.setFillColor(NSColor.black.cgColor)
+                context.fillPath()
+                return true
+            }
+            surface.layer?.borderWidth = 0
+            Tokens.Motion.withoutAnimation {
+                outline.frame = bounds
+                outline.path = path
+                outline.fillColor = nil
+                outline.lineWidth = Tokens.Metric.hairline
+                outline.zPosition = 2
+                if outline.superlayer == nil { layer?.addSublayer(outline) }
+            }
+            layer?.shadowPath = path
+        }
+        onLayout?()
+        // After `onLayout`, which may set the radius for this layout.
+        if arrowX == nil { roundCorners() }
+        matchCorners()
+    }
+
+    private func roundCorners() {
+        let r = CALayer.cornerRadius(radius, size: bounds.size)
+        surface.layer?.round(r, size: bounds.size)
+        material.layer?.round(r, size: bounds.size)
+        layer?.shadowPath = CGPath(roundedRect: bounds, cornerWidth: r, cornerHeight: r, transform: nil)
+    }
+
+    /// A button tucked into one of the panel's rounded corners follows that corner: its own radius is the panel's
+    /// less the gap between them, so the two curves run side by side instead of a square-ish fill in a round shape.
+    private func matchCorners() {
+        let radius = CALayer.cornerRadius(radius, size: bounds.size)
+        for view in surface.subviews {
+            guard view is IconButton || view is TextButton, !view.isHidden, let layer = view.layer else { continue }
+            let f = view.frame
+            let dx = min(f.minX, bounds.width - f.maxX), dy = min(f.minY, bounds.height - f.maxY)
+            guard dx >= 0, dy >= 0, dx < radius, dy < radius else { continue }
+            let fitted = min(max(radius - max(dx, dy), Tokens.Radius.control), min(f.width, f.height) / 2)
+            if let button = view as? IconButton { button.radius = fitted } else { layer.cornerRadius = fitted }
+            layer.cornerCurve = .continuous
+        }
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        refreshColors()
+    }
+
+    /// A color mixed into the panel's surface, like the space's own, so the panel belongs to it. Nil is plain.
+    var surfaceTint: NSColor? { didSet { refreshColors() } }
+    /// How much of the tint goes in: more makes the panel read as part of what it's tinted from.
+    var tintStrength: CGFloat? { didSet { refreshColors() } }
+    /// Off for a panel that stands in for something in place (the address being edited): no shadow, no lift.
+    var isElevated = true { didSet { refreshColors() } }
+    /// The edge, if not the usual hairline (an edited field's soft accent outline).
+    var edgeColor: NSColor? { didSet { refreshColors() } }
+    /// Set for a panel that's part of the sidebar: the sidebar's color, which the panel takes lifted the way a
+    /// selected tab is, so it reads as the sidebar's own and stands out clearly from it.
+    var liftedFrom: NSColor? { didSet { refreshColors() } }
+    /// What the panel sits over (the sidebar's tabs): faded back while it's open, so nothing peeks around it.
+    var recedes: [NSView] = []
+
+    private func refreshColors() {
+        Tokens.Motion.withoutAnimation {
+            material.isHidden = liftedFrom != nil || surfaceTint != nil
+            if let base = liftedFrom {
+                effectiveAppearance.performAsCurrentDrawingAppearance {
+                    let under = base.usingColorSpace(.sRGB) ?? base
+                    let lift = Tokens.Color.selectedFill.usingColorSpace(.sRGB) ?? Tokens.Color.selectedFill
+                    surface.color = under.blended(withFraction: lift.alphaComponent, of: lift.withAlphaComponent(1)) ?? under
+                }
+            } else if let tint = surfaceTint {
+                effectiveAppearance.performAsCurrentDrawingAppearance {
+                    let base = Tokens.Color.panelBackground.usingColorSpace(.sRGB) ?? Tokens.Color.panelBackground
+                    let mixed = base.blended(withFraction: tintStrength ?? (effectiveAppearance.isDark ? 0.55 : 0.6), of: tint.usingColorSpace(.sRGB) ?? tint) ?? base
+                    surface.color = mixed
+                }
+            } else {
+                // The Mac's popover material with the space's panel color thinly over it: native, calm, and opaque
+                // enough that text never fights the page behind. Solid with Reduce Transparency or Increase Contrast.
+                surface.color = Brand.Theme.for(self).panel.withAlphaComponent(Tokens.Contrast.isOpaque ? 1 : 0.88)
+            }
+            surface.layer?.borderColor = cgColor(edgeColor ?? Tokens.Color.panelEdge)
+            surface.layer?.borderWidth = arrowX != nil ? 0 : edgeColor == nil ? Tokens.Metric.hairline : 1.5
+            outline.strokeColor = cgColor(edgeColor ?? Tokens.Color.panelEdge)
+            layer?.shadowColor = cgColor(Tokens.Color.panelShadow)
+            layer?.shadowOpacity = isElevated ? 1 : 0
+            layer?.shadowRadius = Tokens.Shadow.panelRadius / 2
+            layer?.shadowOffset = Tokens.Shadow.panelOffset(flipped: isFlipped)
+        }
+    }
+
+    /// How a panel arrives. Where it lives decides how it moves (`Tokens.Motion.present`), whether a key or the
+    /// pointer asked for it:
+    /// - opened from a button: it grows out of that button (`growsFrom`), from 96%, eased out in 180ms (`.pop`);
+    ///   `.burst` starts a touch smaller, for a panel something just landed in (a download hitting its button);
+    /// - attached to an edge (`attachedEdge`, the find bar): it slides those few points in from it;
+    /// - living at the page's top edge (`slidesFromTop`): it comes down from above the window and leaves back up;
+    /// - `.fade`: it fades where it is, standing in for what's under it (the address being edited);
+    /// - `.instant`: it's simply there, for what you summon to type in or flick through many times an hour (the
+    ///   command bar, the switchers), and for anything shown while ⌘T is handled.
+    enum Arrival { case fade, instant, pop, burst }
+
+    /// Where a panel grows from, in its own bounds from the top-left: (0, 0) its top-left corner, (0.5, 0) its top
+    /// middle. Set it to the side nearest what opened it.
+    var growsFrom = CGPoint(x: 0.5, y: 0)
+
+    /// Grows out of `anchor` (superview coordinates, after its frame is set): from the top when opened below (a field's
+    /// menu), from the bottom when opened above, starting at the anchor's edge.
+    func grow(from anchor: NSRect) {
+        guard frame.width > 0, frame.height > 0 else { return }
+        let flipped = superview?.isFlipped ?? true
+        let below = flipped ? anchor.midY <= frame.minY : anchor.midY >= frame.maxY
+        let x = (anchor.minX + min(anchor.width, frame.width) / 2 - frame.minX) / frame.width
+        growsFrom = CGPoint(x: min(max(x, 0), 1), y: below ? 0 : 1)
+    }
+
+    /// For a bar that hangs from an edge rather than a button (the find bar, from the page's top): it slides in from
+    /// that edge and back toward it. `.minY` is the top as you look at it.
+    var attachedEdge: NSRectEdge?
+
+    private func recede(_ on: Bool) {
+        for view in recedes {
+            // Another panel still open over the same tabs keeps them back.
+            let held = superview?.subviews.contains { other in
+                guard let other = other as? FloatingPanelView, other !== self, !other.dismissing else { return false }
+                return other.recedes.contains { $0 === view }
+            } ?? false
+            if !on && held { continue }
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = (on ? Tokens.Motion.enter : Tokens.Motion.exit) * Tokens.Motion.debugSlowdown
+                context.timingFunction = Tokens.Motion.easeOut
+                view.animator().alphaValue = on ? Tokens.Opacity.receded : 1
+            }
+        }
+    }
+
+    override func viewWillMove(toSuperview newSuperview: NSView?) {
+        if newSuperview == nil { recede(false) }
+        super.viewWillMove(toSuperview: newSuperview)
+    }
+
+    /// For things that live at the top edge of the page (offers, prompts): they slide down from above the window's
+    /// edge into place and leave back up the same way, instead of growing out of nothing. Where a thing lives decides
+    /// how it moves: from its edge, or out of the button that opened it (`growsFrom`).
+    var slidesFromTop = false
+    /// Above the window's top edge: where a top-edge panel comes from and goes back to.
+    private var offstage: CGFloat { frame.maxY + 12 }
+
+    /// For notes on the sidebar's side (a background tab opened while hidden): slides in and out past that edge,
+    /// `.minX` or `.maxX`.
+    var slidesFromSide: NSRectEdge?
+
+    /// Where it comes from and goes back to.
+    private func origin(_ arrival: Arrival) -> Tokens.Motion.Origin {
+        if slidesFromTop { return .offstage(.minY, offstage) }
+        if let side = slidesFromSide {
+            let width = superview?.bounds.width ?? frame.maxX
+            return .offstage(side, (side == .maxX ? width - frame.minX : frame.maxX) + 12)
+        }
+        if let attachedEdge { return .edge(attachedEdge) }
+        // What came without moving leaves without moving.
+        return arrival == .fade || arrival == .instant ? .inPlace : .point(growsFrom)
+    }
+
+    /// How it last arrived, so it leaves back the same way.
+    private var arrival: Arrival = .pop
+
+    /// A panel you open in Zigzag (site controls, a menu, Downloads) takes the place of an extension's popup, which
+    /// would otherwise stay open beside it. Notes and toasts leave it be.
+    var replacesExtensionPopup: Bool { false }
+
+    func present(arrival: Arrival = .pop) {
+        if replacesExtensionPopup, #available(macOS 15.4, *) { ExtensionCenter.closePopups(in: window) }
+        layoutSubtreeIfNeeded()
+        recede(true)
+        alphaValue = 1
+        dismissing = false
+        self.arrival = arrival
+        // Something you summon to type in, many times a day, should never make you wait for it
+        // (https://emilkowal.ski/ui/you-dont-need-animations): it's simply there. Anything else arrives with a short
+        // movement out of where it came from, and shown again while it was leaving, turns around from where it is.
+        guard arrival != .instant, !Tokens.Motion.isKeyboardDriven else { Tokens.Motion.settle(self); return }
+        let turning = layer?.animation(forKey: "presence.opacity") != nil
+        Tokens.Motion.present(self, from: origin(arrival), entering: true)
+        guard arrival == .burst, !turning, !Tokens.Motion.reduceMotion, let layer else { return }
+        // A download just landed in it: a touch smaller than a menu, so you see it come out of the button.
+        let grow = CABasicAnimation(keyPath: "transform")
+        grow.fromValue = NSValue(caTransform3D: Tokens.Motion.scale(0.94, of: layer, around: growsFrom, flipped: superview?.isFlipped ?? true))
+        grow.toValue = NSValue(caTransform3D: CATransform3DIdentity)
+        grow.duration = Tokens.Motion.enter * Tokens.Motion.debugSlowdown
+        grow.timingFunction = Tokens.Motion.easeOut
+        layer.add(grow, forKey: "presence.transform")
+    }
+
+    /// Dismissing: ignores clicks so they reach what's below (`MenuPanel` sets it).
+    var dismissing = false
+    override func hitTest(_ point: NSPoint) -> NSView? { dismissing ? nil : super.hitTest(point) }
+    /// Counts the times it's been sent off, so only the latest going takes it away.
+    private var exits = 0
+
+    /// The one way a panel leaves: back the way it came, quicker and quieter, from wherever it is on screen.
+    /// `instantly`: gone at once, for what arrived at once (the command bar from a key, the switchers).
+    func dismiss(instantly: Bool = false, completion: (() -> Void)? = nil) {
+        guard !instantly, !Tokens.Motion.isKeyboardDriven, superview != nil else {
+            dismissing = false
+            recede(false)
+            removeFromSuperview()
+            Tokens.Motion.settle(self)
+            completion?()
+            return
+        }
+        dismissing = true
+        recede(false)
+        exits += 1
+        let exit = exits
+        Tokens.Motion.present(self, from: origin(arrival), entering: false) { [weak self] in
+            // Shown again while leaving (a repeat toast, ⌘F twice), or sent off again, which finishes the going: it
+            // stays for now.
+            guard let self, self.dismissing, self.exits == exit else { completion?(); return }
+            self.dismissing = false
+            self.removeFromSuperview()
+            Tokens.Motion.settle(self)
+            completion?()
+        }
+    }
+}
+
+/// A brief confirmation pill at the top of the page ("Link Copied", "90%"). Shown at once, gone in a moment;
+/// pressing the same shortcut again updates it in place instead of stacking another.
+final class ToastView: FloatingPanelView {
+    let icon = NSImageView()
+    let label = Label("", font: Tokens.Font.body(.medium), color: Tokens.Color.textPrimary)
+    let actionButton = PillButton(style: .plain)
+    /// Puts an offer away before it goes on its own ("This page is in French"), as the other offers at the top of
+    /// the page are put away.
+    let closeButton = IconButton(symbol: "xmark", size: .compact, toolTip: String(localized: "Not Now", comment: "Tooltip of the close button on a toast that offers something, like translating the page."))
+    /// More choices for an offer, in a menu: the translate offer's Always and Never.
+    let optionsButton = IconButton(symbol: "ellipsis", size: .compact, toolTip: String(localized: "More", comment: "Tooltip of the … button in the site panel."))
+    /// Something under way ("Writing report…"): the ribbon turns where the icon goes.
+    let spinner = Spinner()
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        icon.imageScaling = .scaleNone
+        icon.contentTintColor = Tokens.Color.icon
+        addSubview(icon)
+        addSubview(spinner)
+        addSubview(label)
+        addSubview(actionButton)
+        addSubview(optionsButton)
+        addSubview(closeButton)
+        actionButton.isHidden = true
+        optionsButton.isHidden = true
+        closeButton.isHidden = true
+        onLayout = { [weak self] in self?.layoutContent() }
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    static let height = Tokens.Metric.toastHeight
+
+    var fittingWidth: CGFloat {
+        (icon.image == nil ? Tokens.Space.x4 : Tokens.Space.x3 + Tokens.Metric.favicon + Tokens.Space.x2) + label.inkWidth + trailingWidth
+    }
+
+    /// The right end: padding, or the action and the close button, the last one inset as evenly as it sits.
+    private var trailingWidth: CGFloat {
+        // With an icon, the words end as far from the edge as the symbol's ink starts.
+        guard !actionButton.isHidden || !closeButton.isHidden else {
+            return icon.image == nil ? Tokens.Space.x4 : Tokens.Space.x3 + (Tokens.Metric.favicon - Tokens.Symbol.row) / 2
+        }
+        var width = actionButton.isHidden ? 0 : Tokens.Space.x3 + actionButton.fittingWidth
+        if !optionsButton.isHidden { width += Tokens.Space.x1 + optionsButton.frame.width }
+        if !closeButton.isHidden { width += (actionButton.isHidden ? Tokens.Space.x3 : Tokens.Space.x1) + closeButton.frame.width }
+        return width + (Self.height - (closeButton.isHidden ? Tokens.Metric.toastButtonHeight : closeButton.frame.height)) / 2
+    }
+
+    /// The space around the text: the icon on the left, the action (or padding) on the right.
+    private var chromeWidth: CGFloat { fittingWidth - label.inkWidth }
+
+    /// One line if it fits, else two wrapped lines, never wider than the page.
+    func size(maxWidth: CGFloat) -> NSSize {
+        let width = min(ceil(fittingWidth), maxWidth)
+        let textWidth = width - chromeWidth
+        let wraps = label.inkWidth > textWidth + 0.5
+        label.usesSingleLineMode = !wraps
+        label.maximumNumberOfLines = wraps ? 2 : 1
+        label.lineBreakMode = wraps ? .byWordWrapping : .byTruncatingTail
+        label.cell?.wraps = wraps
+        label.cell?.truncatesLastVisibleLine = true
+        let textHeight = wraps ? ceil(label.cell?.cellSize(forBounds: NSRect(x: 0, y: 0, width: textWidth + Label.inset * 2, height: 200)).height ?? label.lineHeight * 2) : label.lineHeight
+        radius = wraps ? Tokens.Radius.panel : Self.height / 2
+        return NSSize(width: width, height: max(Self.height, textHeight + Tokens.Space.x4))
+    }
+
+    private func layoutContent() {
+        var x = icon.image == nil ? Tokens.Space.x4 : Tokens.Space.x3
+        if icon.image != nil {
+            icon.frame = NSRect(x: x, y: (bounds.height - Tokens.Metric.favicon) / 2, width: Tokens.Metric.favicon, height: Tokens.Metric.favicon)
+            spinner.frame = icon.frame
+            x = icon.frame.maxX + Tokens.Space.x2
+        }
+        let actionWidth = actionButton.isHidden ? 0 : actionButton.fittingWidth
+        var right = bounds.width
+        if !closeButton.isHidden {
+            let side = closeButton.frame.width
+            closeButton.frame.origin = NSPoint(x: bounds.width - (Self.height - side) / 2 - side, y: (bounds.height - side) / 2)
+            right = closeButton.frame.minX - Tokens.Space.x1
+        }
+        if !optionsButton.isHidden {
+            let side = optionsButton.frame.width
+            optionsButton.frame.origin = NSPoint(x: right - side, y: (bounds.height - side) / 2)
+            right = optionsButton.frame.minX - Tokens.Space.x1
+        }
+        if !actionButton.isHidden {
+            // Inset evenly from the toast's edge, top, bottom and right alike, so the pill runs with the capsule. The
+            // right inset is a one-line toast's, the room `fittingWidth` keeps, so wrapped text never runs under it.
+            let h = Tokens.Metric.toastButtonHeight
+            let end = closeButton.isHidden ? bounds.width - (Self.height - h) / 2 : right
+            actionButton.frame = NSRect(x: end - actionWidth, y: (bounds.height - h) / 2, width: actionWidth, height: h)
+        }
+        let textWidth = bounds.width - chromeWidth
+        let h = label.usesSingleLineMode ? label.lineHeight : bounds.height - Tokens.Space.x4
+        // The text field draws its text Label.inset in from its edges: set it that much wider, so the ink sits
+        // exactly where the padding ends, the same both ends.
+        label.frame = NSRect(x: x - Label.inset, y: label.usesSingleLineMode ? label.centeredY(in: bounds.height) : (bounds.height - h) / 2,
+                             width: textWidth + Label.inset * 2, height: h)
+    }
+}
+
+enum Toast {
+    /// Each window's toast and its timer, so a toast in one window never cancels another window's.
+    private final class Showing {
+        weak var toast: ToastView?
+        var hideWork: DispatchWorkItem?
+        /// The object the toast is about, for toasts that should go with it (an offer for a tab's page).
+        weak var owner: AnyObject?
+    }
+    private static var showing: [ObjectIdentifier: Showing] = [:]
+
+    /// Duration for Undo toasts (tabs closed, pins removed, History cleared); longer while hovered.
+    static let undoDuration: TimeInterval = 7
+    /// Duration for prompt confirmations ("Password saved"), which appear as the prompt slides away.
+    static let confirmationDuration: TimeInterval = 3
+
+    /// Whether an action shown at `shownAt` takes a click yet.
+    static func acceptsAction(shownAt: Date, now: Date = Date()) -> Bool { now.timeIntervalSince(shownAt) > 0.5 }
+
+    private static func state(for host: NSView) -> Showing {
+        showing = showing.filter { $0.value.toast?.superview != nil }
+        if let state = showing[ObjectIdentifier(host)] { return state }
+        let state = Showing()
+        showing[ObjectIdentifier(host)] = state
+        return state
+    }
+
+    /// Takes down the toast showing in this window, if any.
+    static func hide(in controller: BrowserWindowController) { hide(over: controller.root.overlay) }
+
+    /// Takes down the toast showing over `host`, if any.
+    static func hide(over host: NSView) {
+        let state = state(for: host)
+        guard let toast = state.toast, toast.superview === host else { return }
+        state.hideWork?.cancel()
+        toast.dismiss()
+        state.toast = nil
+    }
+
+    /// Hides this window's toast only if it's still the one for `owner`.
+    static func hide(for owner: AnyObject, in controller: BrowserWindowController) {
+        let state = state(for: controller.root.overlay)
+        guard state.owner === owner, state.toast?.dismissing == false else { return }
+        hide(in: controller)
+    }
+
+    /// The owner of this window's current toast, if any.
+    static func owner(in controller: BrowserWindowController) -> AnyObject? {
+        let state = state(for: controller.root.overlay)
+        guard let toast = state.toast, toast.superview === controller.root.overlay, !toast.dismissing else { return nil }
+        return state.owner
+    }
+
+    /// `closes` adds a close button, for offers. `owner`: for `hide(for:in:)`. `onClose`: runs when closed by its
+    /// button.
+    static func show(_ text: String, symbol: String? = nil, action: (title: String, run: () -> Void)? = nil,
+                     actionMenu: (() -> NSMenu?)? = nil, options: (() -> [MenuPanel.Entry])? = nil,
+                     duration: TimeInterval = 1.3, closes: Bool = false, owner: AnyObject? = nil, announces: Bool = true,
+                     onClose: (() -> Void)? = nil, in controller: BrowserWindowController) {
+        show(text, symbol: symbol, action: action, actionMenu: actionMenu, options: options, duration: duration, closes: closes, over: controller.root.overlay, area: area(in: controller),
+             announces: announces, onClose: onClose)
+        state(for: controller.root.overlay).owner = owner
+    }
+
+    /// Over the page, or with the desk open, over the desk, clear of its search field.
+    static func area(in controller: BrowserWindowController) -> NSRect {
+        if let desk = controller.desk.toastArea { return desk }
+        // Under the bar of an AI app using the page, if there is one.
+        var page = controller.root.cardFrame
+        let reserved = AgentControl.shared.reservedHeight(in: controller)
+        // Under a split's pane strips, clear of their buttons, as the find bar is.
+        let strip = controller.root.card.showsHeader && !controller.root.card.liftsHeader ? PaneHeaderView.height : 0
+        page.origin.y += reserved + strip
+        page.size.height -= reserved + strip
+        // Below any page question or top update note, never over them.
+        return PageQuestions.area(page, below: PageQuestions.occupied(in: controller.root.overlay))
+    }
+
+    /// Something that takes a moment: the spinner and what's happening, up until the next toast or `hide` replaces it.
+    static func working(_ text: String, in controller: BrowserWindowController) {
+        show(text, duration: .greatestFiniteMagnitude, over: controller.root.overlay, area: area(in: controller), busy: true)
+    }
+
+    /// Top center of the page: where your eyes already are, clear of the content you're reading.
+    private static func place(_ toast: ToastView, in area: NSRect) {
+        let size = toast.size(maxWidth: max(160, area.width - Tokens.Space.x12))
+        toast.frame = NSRect(x: round(area.midX - size.width / 2), y: area.minY + Tokens.Space.x3, width: size.width, height: size.height)
+        toast.needsLayout = true
+    }
+
+    /// Keeps the window's toast over the middle of the page when the page moves under it: the sidebar shown or
+    /// hidden, full screen, a resize. Riding a sidebar slide (`slide` is its duration, `timing` its curve) it moves with the page, on the
+    /// same curve.
+    static func reposition(in controller: BrowserWindowController, slide: TimeInterval? = nil, timing: CAMediaTimingFunction = Tokens.Motion.drawer) {
+        let host = controller.root.overlay
+        guard let toast = showing[ObjectIdentifier(host)]?.toast, toast.superview === host, !toast.dismissing else { return }
+        let old = toast.frame
+        place(toast, in: area(in: controller))
+        let dx = old.minX - toast.frame.minX, dy = old.minY - toast.frame.minY
+        // Dragging the window's edge, it simply stays with the page; gliding there would trail behind.
+        guard abs(dx) > 0.5 || abs(dy) > 0.5, !Tokens.Motion.reduceMotion, controller.window?.inLiveResize != true,
+              let layer = toast.layer else { return }
+        let move = CABasicAnimation(keyPath: "transform")
+        move.fromValue = NSValue(caTransform3D: CATransform3DMakeTranslation(dx, dy, 0))
+        move.toValue = NSValue(caTransform3D: CATransform3DIdentity)
+        move.duration = slide ?? Tokens.Motion.standard
+        move.timingFunction = slide == nil ? Tokens.Motion.drawer : timing
+        move.fillMode = .backwards
+        layer.add(move, forKey: "follow")
+    }
+
+    /// Moves a notice below a question that just appeared in a window without browser chrome (Zigzag Mini, an installed
+    /// app), using its toast area.
+    static func reposition(in host: PromptHost) {
+        let spot = host.promptToastPlace
+        guard let state = showing[ObjectIdentifier(spot.over)], let toast = state.toast,
+              toast.superview === spot.over, !toast.dismissing else { return }
+        place(toast, in: spot.area)
+    }
+
+    /// Shows a toast at the top center of `area` in any flipped view (also used by Passwords).
+    static func show(_ text: String, symbol: String? = nil, action: (title: String, run: () -> Void)? = nil,
+                     actionMenu: (() -> NSMenu?)? = nil, options: (() -> [MenuPanel.Entry])? = nil,
+                     duration: TimeInterval = 1.3, closes: Bool = false, over host: NSView, area: NSRect, busy: Bool = false,
+                     announces: Bool = true, onClose: (() -> Void)? = nil) {
+        let state = state(for: host)
+        let toast: ToastView
+        let isNew: Bool
+        if let existing = state.toast, existing.superview === host {
+            toast = existing
+            isNew = false
+            // Something opened over it since (the desk): it comes back on top.
+            if host.subviews.last !== existing { host.addSubview(existing, positioned: .above, relativeTo: nil) }
+        } else {
+            toast = ToastView()
+            isNew = true
+        }
+        toast.label.stringValue = text
+        // A progress update to a toast already up isn't read out again.
+        if announces { Announcement.post(text, priority: action == nil ? .medium : .high) }
+        // Busy: an empty picture keeps the icon's place for the spinner.
+        toast.icon.image = busy ? NSImage(size: NSSize(width: Tokens.Metric.favicon, height: Tokens.Metric.favicon)) : symbol.map { Tokens.Symbol.image($0) }
+        busy ? toast.spinner.startAnimation(nil) : toast.spinner.stopAnimation(nil)
+        toast.actionButton.isHidden = action == nil && actionMenu == nil
+        if let actionMenu {
+            // A saved toast says where the page went and offers the places it could go instead (#326): a lone
+            // chevron, for someone who never learnt that ⇧ asks first.
+            toast.actionButton.title = ""
+            toast.actionButton.symbol = "chevron.down"
+            toast.actionButton.setAccessibilityLabel(String(localized: "Where It’s Pinned", comment: "Accessibility name of the chevron on the toast that says a page is pinned: opens the places it can be moved to."))
+            toast.actionButton.onClick = { [weak toast] _ in
+                guard let toast, let menu = actionMenu() else { return }
+                // The toast stays until a place is chosen or the menu is put away; the menu is over the page, where
+                // the toast is.
+                // Under the chevron, in the toast's own coordinates.
+                let anchor = toast.actionButton.frame
+                menu.popUp(positioning: nil, at: NSPoint(x: anchor.minX, y: (toast.isFlipped ? anchor.maxY : anchor.minY) + (toast.isFlipped ? 2 : -2)), in: toast)
+            }
+        } else if let action {
+            toast.actionButton.symbol = nil
+            toast.actionButton.title = action.title
+            // No click for the first half second, as on a site's permission question: a toast a page can bring up
+            // ("Pop-up blocked") never catches a click meant for the page on its action.
+            let shownAt = Date()
+            toast.actionButton.onClick = { [weak toast] _ in
+                guard Toast.acceptsAction(shownAt: shownAt) else { return }
+                action.run()
+                toast?.dismiss()
+            }
+        }
+        toast.optionsButton.isHidden = options == nil
+        toast.optionsButton.onClick = { [weak toast] _ in
+            guard let toast, let options else { return }
+            MenuPanel.show(options(), from: toast.optionsButton, placement: .below)
+        }
+        // A toast with something to do (Undo, Pin This Page) can be put away at once, as a notification can.
+        toast.closeButton.isHidden = !(closes || action != nil || actionMenu != nil)
+        toast.closeButton.onClick = { [weak toast] _ in
+            state.hideWork?.cancel()
+            toast?.dismiss()
+            state.toast = nil
+            onClose?()
+        }
+        place(toast, in: area)
+        if isNew {
+            host.addSubview(toast)
+            // A confirmation of something you just did, often from a key: it drops the few points from the top of the
+            // page it sits under, and lifts back as it goes. Quieter than a notice coming in from outside the window.
+            toast.attachedEdge = .minY
+            toast.present()
+        } else if toast.dismissing {
+            // Caught on its way out: it turns around from where it is rather than finishing the exit and vanishing.
+            toast.present()
+        }
+        // A repeat that's still up (zoom 90% → 80%) only changes the number: it comes from a key, so nothing moves.
+        state.toast = toast
+        state.owner = nil
+        state.hideWork?.cancel()
+        // Toasts with an action wait for the pointer to leave before going, however long it stays, so Undo never
+        // slips away from under it.
+        @MainActor func hideWhenClear(_ toast: ToastView?) {
+            // Shown again since (a repeat toast): that showing decides when it goes.
+            guard let toast, toast.superview != nil, state.hideWork == nil else { return }
+            let menuOpen = MenuPanel.current?.anchor?.isDescendant(of: toast) == true
+            if action != nil || actionMenu != nil, menuOpen || toast.bounds.contains(toast.convert(toast.window?.mouseLocationOutsideOfEventStream ?? .zero, from: nil)) {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak toast] in hideWhenClear(toast) }
+                return
+            }
+            toast.dismiss()
+        }
+        // A busy toast stays until what replaces it.
+        guard duration < .greatestFiniteMagnitude else { return }
+        let work = DispatchWorkItem { [weak toast] in
+            MainActor.assumeIsolated {
+                state.hideWork = nil
+                hideWhenClear(toast)
+            }
+        }
+        state.hideWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + duration, execute: work)
+    }
+}

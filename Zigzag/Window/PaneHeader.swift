@@ -1,0 +1,610 @@
+import AppKit
+
+/// The slim strip on top of each pane in split view, on the page card's own surface: back, forward and reload at the
+/// leading end, the page's address centered in a quiet pill, and the split's own buttons at the trailing end. A
+/// hairline under it keeps it apart from the page. The pane you're not in dims it (`PageCardView`).
+///
+/// Everything in it belongs to its own pane's page (`show(_:)`), never the selected tab: its buttons act on that page,
+/// and its address and loading state are that page's.
+final class PaneHeaderView: NSView {
+    let back = PaneHeaderView.button("chevron.left", toolTip: String(localized: "Back", comment: "Tooltip of a button in the strip on top of each page of a split view: goes back."))
+    let forward = PaneHeaderView.button("chevron.right", toolTip: String(localized: "Forward", comment: "Tooltip of a button in the strip on top of each page of a split view: goes forward."))
+    let reload = PaneHeaderView.button("arrow.clockwise", toolTip: String(localized: "Reload", comment: "Tooltip of a button in the strip on top of each page of a split view: reloads the page."))
+    let orientation = PaneHeaderView.button("rectangle.split.1x2", toolTip: String(localized: "Stack Vertically", comment: "Tooltip of a button in the strip on top of each page of a split view: stacks the two pages one above the other."))
+    let swap = PaneHeaderView.button("arrow.left.arrow.right", toolTip: String(localized: "Swap Sides", comment: "Tooltip of a button in the strip on top of each page of a split view: swaps the two pages."))
+    /// Puts every line between the tiles back in the middle, the standard even grid. Shown only while a grid's line is
+    /// parted, beside the split's own buttons (#316).
+    let resetLayout = PaneHeaderView.button("square.grid.2x2", toolTip: String(localized: "Reset Tile Layout", comment: "Tooltip of a button in the strip on top of a tiled page: puts every line between the tiles back in the middle, making the standard even grid."))
+    /// Enlarges this pane over the others for a moment, and puts it back (#160).
+    let zoom = PaneHeaderView.button("arrow.up.left.and.arrow.down.right", toolTip: PaneHeaderView.zoomTitle(false))
+    /// This pane is the one enlarged over the others: its zoom button puts it back.
+    var isZoomed = false {
+        didSet {
+            guard isZoomed != oldValue else { return }
+            zoom.symbol = isZoomed ? "arrow.down.right.and.arrow.up.left" : "arrow.up.left.and.arrow.down.right"
+            zoom.toolTip = Self.zoomTitle(isZoomed)
+        }
+    }
+
+    /// Zoom Pane, or Return Pane while it's zoomed: the button's, the menu bar's and ⋯'s name for it.
+    static func zoomTitle(_ zoomed: Bool) -> String {
+        zoomed ? String(localized: "Return Pane", comment: "Tooltip and menu item: puts the enlarged page of a split view back in its place among the others.")
+               : String(localized: "Zoom Pane", comment: "Tooltip and menu item: enlarges one page of a split view over the others for a moment, without changing where it is.")
+    }
+    let close = PaneHeaderView.button("rectangle.split.2x1.slash", toolTip: String(localized: "Separate Tabs", comment: "Tooltip of a button in the strip on top of each page of a split view: ends the split view, keeping both tabs."))
+    /// Closes this pane's page, as closing it from the sidebar does: in a split of two the other page fills the
+    /// window, and in a group of three or four the rest stay tiled.
+    let closeTab = PaneHeaderView.button("xmark", toolTip: String(localized: "Close Tab", comment: "Tooltip of a button in the strip on top of each page of a split view: closes that page's tab, leaving the other page."))
+    /// Shows the hidden sidebar while a finger is in use (`TouchSidebarGrabber`): in the top pane's strip on the
+    /// sidebar's side, before Back on the left, after the close button on the right.
+    let sidebarButton = PaneHeaderView.button(SidebarView.toggleSymbol(onRight: false),
+                                              toolTip: String(localized: "Show Sidebar", comment: "Tooltip of the sidebar button while the sidebar is hidden."))
+    var showsSidebarButton = false { didSet { if showsSidebarButton != oldValue { needsLayout = true } } }
+    var sidebarOnRight = false {
+        didSet {
+            guard sidebarOnRight != oldValue else { return }
+            sidebarButton.symbol = SidebarView.toggleSymbol(onRight: sidebarOnRight)
+            needsLayout = true
+        }
+    }
+    /// Where the split's own buttons go when the pane is too narrow for them beside its address.
+    let more = PaneHeaderView.button("ellipsis", toolTip: String(localized: "More", comment: "Tooltip of a button in the strip on top of each page of a narrow split view: opens a menu with the split's buttons that don't fit."))
+    /// The page's address: click it to edit it, as the sidebar's address does for the page you're in.
+    let address = PaneAddressView()
+    private let line = ColorView(color: Tokens.Color.separator)
+    /// Keeps the window still under the strip on the page, in the title bar's band too (`TitleBandGuard`).
+    let windowGuard = TitleBandGuard()
+    private(set) weak var tab: Tab?
+    private var token: SignalToken?
+    static let height = Tokens.Pane.height
+    static let siteControlsTitle = String(localized: "Site Controls", comment: "Name of the button by the address that opens the site panel: its tooltip and VoiceOver name.")
+    /// Clicked the address: edit this pane's page's address (the window focuses the pane first).
+    var onEditAddress: ((Tab) -> Void)?
+    /// Site Controls asked for, from the button at the address's end or ⋯: for this pane's page, under this view (#160).
+    var onSiteControls: ((Tab, NSView) -> Void)?
+    /// A split of two has swap and the layout; a tile group's pages keep the places they were dropped in (#160).
+    var arrangesSplit = true { didSet { if arrangesSplit != oldValue { needsLayout = true } } }
+    /// A grid's line is parted: show the reset button that makes the grid even again.
+    var resetsLayout = false { didSet { if resetsLayout != oldValue { needsLayout = true } } }
+    /// Up in the bar above the page (`TopBarView.strips`) instead of on the pane's card: the bar's height, on the
+    /// window's frame, no hairline, and like the bar it moves the window and zooms it on a double-click.
+    var isInBar = false {
+        didSet {
+            guard isInBar != oldValue else { return }
+            line.isHidden = isInBar
+            windowGuard.isHidden = isInBar
+            refreshInk()
+            needsLayout = true
+        }
+    }
+    /// Up in the bar with its pane's card reaching up behind it (framed, `BrowserRootView.joinsBar`): its ink reads
+    /// on the card's ground, its page's color, as on the card, rather than on the window's frame.
+    var isOnCard = false { didSet { if isOnCard != oldValue { refreshInk(); needsLayout = true } } }
+    /// In the bar, where the address centers, from the strip's leading edge: over the middle of its pane, which can
+    /// start under the traffic lights. Nil centers it on the strip.
+    var addressCenter: CGFloat? { didSet { if addressCenter != oldValue { needsLayout = true } } }
+
+    static func button(_ symbol: String, toolTip: String) -> IconButton {
+        IconButton(symbol: symbol, size: Tokens.Pane.button, symbolSize: Tokens.Pane.glyph, toolTip: toolTip)
+    }
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        [windowGuard, sidebarButton, back, forward, reload, address, zoom, swap, orientation, resetLayout, close, more, closeTab, line].forEach { addSubview($0) }
+        sidebarButton.isHidden = true
+        more.onClick = { [weak self] _ in self?.showMore() }
+        back.onClick = { [weak self] _ in self?.tab?.goBack() }
+        forward.onClick = { [weak self] _ in self?.tab?.goForward() }
+        reload.onClick = { [weak self] _ in
+            guard let tab = self?.tab else { return }
+            tab.isLoading ? tab.stopLoading() : tab.reload()
+        }
+        address.onClick = { [weak self] _ in
+            guard let self, let tab = self.tab else { return }
+            self.onEditAddress?(tab)
+        }
+        address.drop.onDrop = { [weak self] destination in
+            guard let tab = self?.tab else { return false }
+            tab.load(destination.url, httpFallback: destination.httpFallback)
+            return true
+        }
+        address.siteControls.onClick = { [weak self] _ in self?.openSiteControls() }
+        address.siteControls.onRightClick = { [weak self] _ in self?.openSiteControls(); return nil }
+        addTouchDrag()
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    /// Site Controls for this pane's page: under the address, or under ⋯ while the address has no room for its button.
+    private func openSiteControls() {
+        guard let tab else { return }
+        onSiteControls?(tab, address.isHidden ? more : address)
+    }
+
+    override var isFlipped: Bool { true }
+    override var mouseDownCanMoveWindow: Bool { isInBar }
+
+    /// Pressed on the strip (not its buttons or address) and moved past `dragThreshold`: the pane is picked up, to be
+    /// put somewhere else in its group (#160). Called with the press and the move that got past it.
+    /// Returns whether it was picked up.
+    var onDrag: ((Tab, _ press: NSEvent, _ moved: NSEvent) -> Bool)?
+    /// How far the pointer goes before a press is a drag, so a click stays a click.
+    static let dragThreshold: CGFloat = 4
+
+    override func mouseDown(with event: NSEvent) {
+        // Up in the bar, the strip is the bar's: it moves the window, as the rest of the bar does.
+        if isInBar { window?.titleBarMouseDown(event); return }
+        guard let window, let tab, let onDrag else { super.mouseDown(with: event); return }
+        let start = event.locationInWindow
+        var moved: NSEvent?
+        window.trackEvents(matching: [.leftMouseDragged, .leftMouseUp], timeout: .infinity, mode: .eventTracking) { next, stop in
+            guard let next else { return }
+            if next.type == .leftMouseUp { stop.pointee = true; return }
+            if hypot(next.locationInWindow.x - start.x, next.locationInWindow.y - start.y) >= Self.dragThreshold {
+                moved = next
+                stop.pointee = true
+            }
+        }
+        if let moved { _ = onDrag(tab, event, moved) }
+    }
+
+    // MARK: Touch
+
+    /// A finger dragging the strip, off its buttons and address, picks the pane up as the mouse does: the same
+    /// hint, the same drop. `touchCarry` is that finger's drag once it's picked up.
+    private(set) var touchDrag: TouchPanRecognizer?
+    private var touchCarry: TouchCarry?
+
+    private func addTouchDrag() {
+        guard TouchGestures.isAvailable else { return }
+        let pan = TouchPanRecognizer { [weak self] pan in self?.touchDragChanged(pan) }
+        pan.touchOnly.accepts = { [weak self] point in self?.takesTouchDrag(at: point) ?? false }
+        addGestureRecognizer(pan)
+        touchDrag = pan
+    }
+
+    /// Whether a finger at `point` (own coordinates) drags the pane: on the strip itself, not a button or the address,
+    /// and not while the strip is the window's bar.
+    func takesTouchDrag(at point: NSPoint) -> Bool {
+        guard !isInBar, tab != nil, onDrag != nil, bounds.contains(point), !fingerTakesSidebarButton(at: point), let superview else { return false }
+        var view = hitTest(convert(point, to: superview))
+        while let current = view, current !== self {
+            if current is InteractiveView { return false }
+            view = current.superview
+        }
+        return true
+    }
+
+    /// Whether a finger at `point` (own coordinates) is on the sidebar toggle: within `TouchSidebarGrabber.target`
+    /// around it, and not on another of the strip's buttons.
+    func fingerTakesSidebarButton(at point: NSPoint) -> Bool {
+        guard showsSidebarButton, !sidebarButton.isHidden, TouchSidebarGrabber.target(around: sidebarButton.frame).contains(point) else { return false }
+        return ![back, forward, reload, zoom, swap, orientation, resetLayout, close, more, closeTab].contains { !$0.isHidden && $0.frame.contains(point) }
+    }
+
+    private func touchDragChanged(_ pan: NSPanGestureRecognizer) {
+        let now = convert(pan.location(in: self), to: nil)
+        switch pan.state {
+        case .began:
+            let moved = pan.translation(in: self), here = pan.location(in: self)
+            touchDragBegan(at: convert(NSPoint(x: here.x - moved.x, y: here.y - moved.y), to: nil), now: now)
+        case .changed:
+            touchCarry?.move(to: now)
+        case .ended:
+            touchCarry?.release(at: now)
+            touchCarry = nil
+        case .cancelled, .failed:
+            touchCarry?.cancel()
+            touchCarry = nil
+        default:
+            break
+        }
+    }
+
+    /// A finger pressed at `start` and moved to `now` (window points): the pane is picked up and follows it.
+    @discardableResult
+    func touchDragBegan(at start: NSPoint, now: NSPoint) -> TouchCarry? {
+        guard let window, let tab, let onDrag, let press = TouchPress.mouseDown(at: start, in: window),
+              let moved = NSEvent.mouseEvent(with: .leftMouseDragged, location: now, modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime,
+                                             windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1) else { return nil }
+        let carry = TouchCarry()
+        TouchCarry.starting = carry
+        let started = onDrag(tab, press, moved)
+        TouchCarry.starting = nil
+        guard started, carry.isAttached else { return nil }
+        touchCarry = carry
+        carry.move(to: now)
+        return carry
+    }
+
+    // MARK: Ink
+
+    /// The color under the strip, its pane's page color on the card (nil: the card's plain ground). Its icons and text
+    /// turn light or dark, whichever reads more clearly on it, as the bar above the page does (`TopBarView.pageColor`):
+    /// on a dark page they'd be dark on dark otherwise.
+    var ground: NSColor? {
+        didSet {
+            guard ground != oldValue else { return }
+            refreshInk()
+        }
+    }
+
+    private func refreshInk() {
+        // Up in the bar on the window's frame, the bar's own appearance is the strip's; over its card, its card's.
+        appearance = overCard ? PageBar.inkAppearance(on: ground).flatMap(NSAppearance.init(named:)) : nil
+        let onPage = overCard && ground != nil
+        [sidebarButton, back, forward, reload, zoom, swap, orientation, resetLayout, close, more, closeTab, address.siteControls].forEach { $0.isOnPage = onPage; $0.ground = ground }
+    }
+
+    func setVertical(_ vertical: Bool) {
+        orientation.symbol = vertical ? "rectangle.split.2x1" : "rectangle.split.1x2"
+        orientation.toolTip = vertical ? String(localized: "Side by Side", comment: "Tooltip of a button in the strip on top of each page of a split view: lays the two pages side by side.")
+                                     : String(localized: "Stack Vertically", comment: "Tooltip of a button in the strip on top of each page of a split view: stacks the two pages one above the other.")
+        swap.symbol = vertical ? "arrow.up.arrow.down" : "arrow.left.arrow.right"
+        swap.toolTip = vertical ? String(localized: "Swap Top and Bottom", comment: "Tooltip of a button in the strip on top of each page of a split view: swaps the two stacked pages.")
+                              : String(localized: "Swap Sides", comment: "Tooltip of a button in the strip on top of each page of a split view: swaps the two pages.")
+        // The whole split's, not this page's: with its shortcut, as the window's own buttons say theirs.
+        close.toolTip = Shortcuts.tooltip(String(localized: "Separate Tabs", comment: "Tooltip of a button in the strip on top of each page of a split view: ends the split view, keeping both tabs."),
+                                          for: #selector(BrowserWindowController.closeSplitView(_:)))
+    }
+
+    func show(_ tab: Tab?) {
+        if tab !== self.tab || token == nil {
+            self.tab = tab
+            token = tab?.changed.observe { [weak self, weak tab] change in
+                // Only this pane's own page: a change from a page the header no longer shows is old news.
+                guard let self, let tab, tab === self.tab else { return }
+                if change == .url || change == .navigation || change == .loading { self.refresh() }
+            }
+        }
+        refresh()
+    }
+
+    private func refresh() {
+        back.isEnabled = tab?.canGoBackOrReturn ?? false
+        forward.isEnabled = tab?.canGoForward ?? false
+        let loading = tab?.isLoading ?? false
+        reload.symbol = loading ? "xmark" : "arrow.clockwise"
+        reload.toolTip = loading ? String(localized: "Stop", comment: "Tooltip of a button in the strip on top of each page of a split view: stops the page loading.") : String(localized: "Reload", comment: "Tooltip of a button in the strip on top of each page of a split view: reloads the page.")
+        address.text = tab?.url.map(Self.addressText) ?? ""
+        address.notSecure = tab?.isNotSecure ?? false
+        needsLayout = true
+    }
+
+    /// A web page's address; a file or Zigzag page by its sidebar name, never a cut "file:".
+    static func addressText(_ url: URL) -> String {
+        let name = AddressView.name(of: url)
+        guard let host = url.host(), !url.isFileURL, name == AddressView.site(host, port: url.port, scheme: url.scheme) else { return name }
+        return CommandRanker.displayURL(url)
+    }
+
+    /// What the strip shows at a width, most first: its buttons give way one step at a time so the address keeps
+    /// `Pane.addressMinWidth` and the close button is never cut. Zoom, swap, the layout and Reset go into ⋯ first, then
+    /// Separate, then Forward, then Reload; Back and close stay.
+    enum Fit: Int, CaseIterable, Comparable {
+        case all, splitInMore, separateInMore, noForward, noReload
+        static func < (a: Fit, b: Fit) -> Bool { a.rawValue < b.rawValue }
+        var showsForward: Bool { self < .noForward }
+        var showsReload: Bool { self < .noReload }
+        var showsSplitButtons: Bool { self == .all }
+        var showsSeparate: Bool { self < .separateInMore }
+        var showsMore: Bool { self > .all }
+        /// Buttons at the leading end, and at the trailing end before the close button.
+        var leading: Int { 1 + (showsForward ? 1 : 0) + (showsReload ? 1 : 0) }
+        /// Zoom, swap and the layout go together.
+        var trailing: Int { (showsSplitButtons ? 3 : 0) + (showsSeparate ? 1 : 0) + (showsMore ? 1 : 0) }
+    }
+
+    /// The first fit, most buttons first, that leaves the address its room. Zoom, swap, the layout and reset stay out
+    /// only while the address shows whole, up to twice `Pane.addressMinWidth`; the rest give way only to keep it that
+    /// minimum. Too narrow for any, the fewest buttons.
+    /// Without swap and the layout (`arrangesSplit` off), they take no room in any fit; zoom does. The sidebar toggle
+    /// (`toggle`) takes `toggleRoom` in every fit.
+    static func fit(width: CGFloat, edge: CGFloat, address: CGFloat, splitButtons: Bool = true, resetLayout: Bool = false,
+                    toggle: Bool = false) -> Fit {
+        let b = Tokens.Pane.button, gap = Tokens.Space.x2
+        for fit in Fit.allCases {
+            let need = min(address, Tokens.Pane.addressMinWidth * (fit == .all ? 2 : 1))
+            let lo = edge + CGFloat(fit.leading) * b + gap + (toggle ? toggleRoom : 0)
+            let trailing = fit.trailing - (!splitButtons && fit.showsSplitButtons ? 2 : 0) + (resetLayout && fit.showsSplitButtons ? 1 : 0)
+            let hi = width - edge - b - gap - CGFloat(trailing) * b - gap
+            if hi - lo >= need { return fit }
+        }
+        return .noReload
+    }
+
+    /// The sidebar toggle's room: a button, and the gap that keeps it apart from the close button on the right.
+    static var toggleRoom: CGFloat { Tokens.Pane.button + Tokens.Space.x2 }
+
+    /// The address pill in a button row: centered on `center` (the page's middle), as wide as its address (`fitting`),
+    /// within the `room` the buttons leave and shifted to avoid clipping. Over the card it widens to a comfortable
+    /// width (`addressMaxWidth`), like an address field. Used by split pane strips and the top bar (#275).
+    static func pillFrame(center: CGFloat, room: ClosedRange<CGFloat>, fitting: CGFloat, overCard: Bool, midY: CGFloat) -> NSRect {
+        let h = Tokens.Pane.addressHeight
+        let width = max(0, min(room.upperBound - room.lowerBound, overCard ? addressMaxWidth : fitting))
+        let x = min(max(center - width / 2, room.lowerBound), room.upperBound - width)
+        return NSRect(x: round(x), y: midY - h / 2, width: width, height: h)
+    }
+
+    /// Hidden when too narrow to read.
+    static func pillFits(_ frame: NSRect) -> Bool { frame.width >= PaneAddressView.padding * 3 }
+
+    private var currentFit = Fit.all
+    /// Where the address may sit, between the strip's buttons: the room it grows into while edited.
+    private(set) var addressRoom: ClosedRange<CGFloat> = 0...0
+    /// The widest the address grows over its card.
+    static let addressMaxWidth: CGFloat = 560
+    /// On its card's top, on the card or up in the bar with the card behind it, rather than on the window's frame.
+    private var overCard: Bool { !isInBar || isOnCard }
+
+    /// The buttons the strip has no room for, in its own menu under ⋯.
+    private func showMore() {
+        if let open = MenuPanel.current, open.anchor === more { open.close(); return }
+        func item(_ button: IconButton, title: String? = nil, shortcut: String = "") -> MenuPanel.Entry {
+            .item(.init(title: title ?? button.toolTip ?? "", symbol: button.symbol, isEnabled: button.isEnabled, shortcut: shortcut) { [weak button] in
+                if let button, let event = NSApp.currentEvent { button.onClick?(event) }
+            })
+        }
+        var entries: [MenuPanel.Entry] = []
+        // The address too narrow for its own button: Site Controls comes here, first, as it's about the page.
+        if !address.showsSiteControls, tab != nil {
+            entries.append(.item(.init(title: Self.siteControlsTitle, symbol: address.siteControls.symbol) { [weak self] in self?.openSiteControls() }))
+            entries.append(.separator)
+        }
+        if !currentFit.showsForward { entries.append(item(forward)) }
+        if !currentFit.showsReload { entries.append(item(reload)) }
+        if !entries.isEmpty { entries.append(.separator) }
+        entries.append(item(zoom))
+        if resetsLayout { entries.append(item(resetLayout)) }
+        if arrangesSplit { entries += [item(swap), item(orientation)] }
+        if !currentFit.showsSeparate {
+            // The whole split's, with its keys, as the button's tooltip says them.
+            entries.append(item(close, title: String(localized: "Separate Tabs", comment: "Tooltip of a button in the strip on top of each page of a split view: ends the split view, keeping both tabs."),
+                                shortcut: Shortcuts.keys(for: #selector(BrowserWindowController.closeSplitView(_:)))))
+        }
+        more.isSelected = true
+        MenuPanel.show(entries, from: more) { [weak self] in self?.more.isSelected = false }
+    }
+
+    override func layout() {
+        super.layout()
+        let b = Tokens.Pane.button
+        // In the bar on the window's frame, the buttons start and end at the strip's edges (the bar sets them where its
+        // own would be), on its middle line, the traffic lights' line. Over its card's top, in the bar or on the card,
+        // they keep the card's radius in from its edges, so the first and last clear its rounded corners and sit as far
+        // in from one edge as from the other: every pane's strip in a window alike.
+        let edge = overCard ? Tokens.Radius.card : 0
+        // Rounded to pixels, not down, so the row is as far from the top as from the hairline.
+        let scale = window?.backingScaleFactor ?? 2
+        let y = isInBar ? round((bounds.height - b) / 2) : round((bounds.height - Tokens.Metric.hairline - b) / 2 * scale) / scale
+        let fit = Self.fit(width: bounds.width, edge: edge, address: address.text.isEmpty ? 0 : address.fittingWidth,
+                           splitButtons: arrangesSplit, resetLayout: resetsLayout, toggle: showsSidebarButton)
+        currentFit = fit
+        sidebarButton.isHidden = !showsSidebarButton
+        forward.isHidden = !fit.showsForward
+        reload.isHidden = !fit.showsReload
+        swap.isHidden = !fit.showsSplitButtons || !arrangesSplit
+        orientation.isHidden = !fit.showsSplitButtons || !arrangesSplit
+        resetLayout.isHidden = !resetsLayout || !fit.showsSplitButtons
+        zoom.isHidden = !fit.showsSplitButtons
+        close.isHidden = !fit.showsSeparate
+        more.isHidden = !fit.showsMore
+        var x = edge
+        let leadingToggle = showsSidebarButton && !sidebarOnRight, trailingToggle = showsSidebarButton && sidebarOnRight
+        for button in (leadingToggle ? [sidebarButton] : []) + [back, forward, reload] where !button.isHidden {
+            button.frame = NSRect(x: x, y: y, width: b, height: b)
+            x += b
+        }
+        if trailingToggle { sidebarButton.frame = NSRect(x: bounds.width - edge - b, y: y, width: b, height: b) }
+        // On the right, the toggle comes last, apart from the close button as the split's buttons are.
+        let closeMaxX = trailingToggle ? sidebarButton.frame.minX - Tokens.Space.x2 : bounds.width - edge
+        closeTab.frame = NSRect(x: closeMaxX - b, y: y, width: b, height: b)
+        // A little room between the split's own buttons and the one that closes the page, so it isn't hit by mistake.
+        var trailing = closeTab.frame.minX - Tokens.Space.x2
+        for button in [more, close, orientation, swap, zoom, resetLayout] where !button.isHidden {
+            button.frame = NSRect(x: trailing - b, y: y, width: b, height: b)
+            trailing -= b
+        }
+        [sidebarButton, back, forward, reload, zoom, swap, orientation, resetLayout, close, more, closeTab].forEach { $0.radius = Tokens.Radius.control }
+        // The address pill is centered over its pane, as wide as its text, within the room the buttons leave, and
+        // nudged clear of them where centering would cut it.
+        addressRoom = x + Tokens.Space.x2...max(x + Tokens.Space.x2, trailing - Tokens.Space.x2)
+        address.frame = Self.pillFrame(center: addressCenter ?? bounds.midX, room: addressRoom,
+                                       fitting: address.fittingWidth, overCard: overCard, midY: y + b / 2)
+        address.isHidden = address.text.isEmpty || !Self.pillFits(address.frame)
+        line.frame = NSRect(x: 0, y: bounds.height - Tokens.Metric.hairline, width: bounds.width, height: Tokens.Metric.hairline)
+        windowGuard.frame = bounds
+    }
+}
+
+/// Laid under a view in the band where a title bar would be, keeps a press there from moving the window. With
+/// `.fullSizeContentView` the window server itself starts moving the window on a press in that band, before the app
+/// sees it, everywhere but the parts AppKit marks as taken. It marks only controls (`NSControl`s) whose
+/// `mouseDownCanMoveWindow` is false; a plain view's own false counts below the band but not in it. This control
+/// marks its frame, and takes no clicks itself: they go to the view it lies under. Hidden, it marks nothing.
+final class TitleBandGuard: NSControl {
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        setAccessibilityElement(false)
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    override var mouseDownCanMoveWindow: Bool { false }
+    /// Out of the key view loop. Not by refusing first responder: AppKit then leaves the control out of the region.
+    override var canBecomeKeyView: Bool { false }
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+}
+
+/// A pane's address: a small field with a faint fill and 1px border; clicking edits it. The top bar has one too
+/// (`TopBarView.pill`) for a single page (#275).
+final class PaneAddressView: InteractiveView {
+
+    // MARK: Dropping a link or words (#182)
+
+    /// Where a link, an address or words dropped on the field go (`AddressDrop`).
+    private(set) lazy var drop = AddressDrop(self)
+    override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation { drop.entered(sender) }
+    override func draggingExited(_ sender: NSDraggingInfo?) { drop.exited() }
+    override func performDragOperation(_ sender: NSDraggingInfo) -> Bool { drop.perform(sender) }
+    private let label = Label("", font: .systemFont(ofSize: Tokens.Pane.addressText), color: Tokens.Color.textSecondary)
+    static let padding = Tokens.Space.x2 + 2
+    /// Site Controls for this pane's page, at the field's end as in the sidebar's address (#160).
+    let siteControls = IconButton(symbol: "slider.horizontal.3", size: PaneAddressView.buttonSide, symbolSize: Tokens.Pane.glyph - 1,
+                                  toolTip: PaneHeaderView.siteControlsTitle)
+    static let buttonSide = Tokens.Pane.addressHeight - buttonInset * 2
+    static let buttonInset: CGFloat = 2
+    /// What the field keeps for its button: the button, its inset from the end, less the padding it stands in.
+    static var buttonRoom: CGFloat { buttonSide + buttonInset * 2 - padding + Tokens.Space.x1 }
+    /// The least of a cut address the field shows beside its button; any narrower and the button goes into the
+    /// strip's ⋯, leaving the address its room.
+    static let minTextWithButton: CGFloat = 56
+
+    /// Whether the button shows at a width: beside the whole address, or beside enough of a cut one to read.
+    static func showsButton(width: CGFloat, fitting: CGFloat, hasText: Bool) -> Bool {
+        hasText && (width >= fitting - 0.5 || width >= padding * 2 + buttonRoom + minTextWithButton)
+    }
+    var showsSiteControls: Bool { !isHidden && !siteControls.isHidden }
+    /// Whether the field has its own Site Controls. The top bar keeps the address buttons beside it instead
+    /// (`TopBarView.pill`), so its field has none.
+    var hasSiteControls = true { didSet { if hasSiteControls != oldValue { needsLayout = true } } }
+
+    /// A control at the field's end, in the place Site Controls take: the top bar puts the pin star inside its pill
+    /// this way (#437), rather than beside the extensions.
+    var pin: NSView? {
+        didSet {
+            guard pin !== oldValue else { return }
+            oldValue?.removeFromSuperview()
+            if let pin {
+                addSubview(pin)
+                // In the pill's rounded end, as Site Controls is, with the field's rim pressing it too (#443).
+                (pin as? IconButton)?.radius = Tokens.Radius.control - Self.buttonInset
+                (pin as? IconButton)?.pressOutset = NSEdgeInsets(top: Self.buttonInset, left: 1,
+                                                                 bottom: Self.buttonInset, right: Self.buttonInset)
+            }
+            needsLayout = true
+        }
+    }
+
+    /// Whether the pin shows at the field's end (#437). The field gave the star up, so the pill decides for itself
+    /// rather than reading the star's leftover hidden flag; the top bar sets this from whether the page can be
+    /// pinned, so a new tab or a private window has no star (#444).
+    var showsPin = true {
+        didSet {
+            guard showsPin != oldValue else { return }
+            pin?.isHidden = !showsPin
+            needsLayout = true
+        }
+    }
+
+    /// Not secure (http, or a certificate allowed from the warning page): shows the not-secure mark before the address,
+    /// as in the sidebar.
+    var notSecure = false {
+        didSet {
+            guard notSecure != oldValue else { return }
+            mark.isHidden = !notSecure
+            mark.toolTip = notSecure ? SitePanel.notSecure : nil
+            refreshAccessibilityLabel()
+            needsLayout = true
+        }
+    }
+    private let mark = NSImageView()
+    /// Width of the mark plus its gap.
+    private static var markRoom: CGFloat { Tokens.Space.x3 + Tokens.Space.x1 }
+
+    var text: String = "" {
+        didSet {
+            label.stringValue = text
+            refreshAccessibilityLabel()
+            needsLayout = true
+        }
+    }
+
+    private func refreshAccessibilityLabel() {
+        let name = text.isEmpty ? String(localized: "Address", comment: "VoiceOver name of the address in a split view page's strip, while it has none.") : text
+        setAccessibilityLabel(notSecure && !text.isEmpty ? String(localized: "\(name), \(SitePanel.notSecure)", comment: "Accessibility label of the address in the sidebar on a plain http page: the site, then that it's not secure.") : name)
+    }
+
+    /// As wide as the whole address and the padding, with the few points a middle-truncating field keeps in hand
+    /// before it cuts (centered, so they never show).
+    var fittingWidth: CGFloat {
+        return fullTextWidth + Self.padding * 2 + Self.slack + (hasSiteControls || (showsPin && pin != nil) ? Self.buttonRoom : 0) + (notSecure ? Self.markRoom : 0)
+    }
+    private static let slack: CGFloat = Tokens.Space.x2
+    /// The whole address's width, measured as the field draws it, whatever it shows now.
+    private var fullTextWidth: CGFloat {
+        let cell = NSTextFieldCell(textCell: text)
+        cell.font = label.font
+        let ink = ceil((text as NSString).size(withAttributes: [.font: label.font ?? Tokens.Font.body()]).width)
+        return max(ceil(cell.cellSize.width) - Label.inset * 2, ink)
+    }
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        label.lineBreakMode = .byTruncatingMiddle
+        label.alignment = .center
+        layer?.cornerRadius = Tokens.Radius.control
+        layer?.cornerCurve = .continuous
+        addSubview(label)
+        mark.image = Tokens.Symbol.image(SitePanel.notSecureSymbol, size: Tokens.Symbol.inline)
+        mark.imageScaling = .scaleNone
+        mark.contentTintColor = Tokens.Color.textTertiary
+        mark.isHidden = true
+        addSubview(mark)
+        siteControls.radius = Tokens.Radius.control - Self.buttonInset
+        siteControls.pressOutset = NSEdgeInsets(top: Self.buttonInset, left: 1, bottom: Self.buttonInset, right: Self.buttonInset)
+        addSubview(siteControls)
+        _ = drop
+        setAccessibilityRole(.button)
+        setAccessibilityHelp(String(localized: "Edit this page’s address", comment: "VoiceOver hint of the address in a split view page's strip."))
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    override func setFrameSize(_ newSize: NSSize) {
+        super.setFrameSize(newSize)
+        needsLayout = true
+    }
+
+    override func layout() {
+        super.layout()
+        let h = label.lineHeight
+        let button = hasSiteControls && Self.showsButton(width: bounds.width, fitting: fittingWidth, hasText: !text.isEmpty)
+        siteControls.isHidden = !button
+        let side = Self.buttonSide
+        siteControls.frame = NSRect(x: bounds.width - Self.buttonInset - side, y: (bounds.height - side) / 2, width: side, height: side)
+        let pinShown = showsPin && pin != nil
+        pin?.isHidden = !pinShown
+        if pinShown, let pin {
+            pin.frame = siteControls.frame
+        }
+        let trailing = button || pinShown
+        let markRoom = notSecure ? Self.markRoom : 0
+        label.frame = NSRect(x: Self.padding + markRoom - Label.inset, y: label.centeredY(in: bounds.height),
+                             width: max(0, bounds.width - Self.padding * 2 - markRoom - (trailing ? Self.buttonRoom : 0) + Label.inset * 2), height: h)
+        // An address too long for the strip shows its host alone, cut so its domain stays whole (#189): cut in the
+        // middle, "gemini.goo…/app" would hide whose site it is.
+        let fits = label.frame.width - Label.inset * 2 >= fullTextWidth - 0.5
+        let host = text.split(separator: "/", maxSplits: 1).first.map(String.init) ?? text
+        let shown = fits || host == text ? text : host
+        if label.stringValue != shown { label.stringValue = shown }
+        label.lineBreakMode = shown == text && fits ? .byTruncatingMiddle : AddressView.lineBreak(forName: shown)
+        toolTip = shown == text && fits ? nil : text
+        guard notSecure else { return }
+        // The mark sits just before the first letter. In a field wider than the address (centered), the address shifts
+        // by half the mark so both stay centered.
+        let ink = min(ceil((shown as NSString).size(withAttributes: [.font: label.font ?? Tokens.Font.body()]).width), label.frame.width - Label.inset * 2)
+        if label.frame.width - Label.inset * 2 - ink >= markRoom { label.frame.origin.x -= markRoom / 2 }
+        mark.frame = NSRect(x: round(label.frame.midX - ink / 2 - markRoom), y: 0, width: Tokens.Space.x3, height: bounds.height)
+    }
+
+    override func stateDidChange(animated: Bool) {
+        // The sidebar address's look, smaller: a faint fill and a 1px edge, a step deeper under the pointer.
+        let fill = isPressed ? Tokens.Color.pressedFill : isHovered ? Tokens.Color.chromeHover : Tokens.Color.chromeFill
+        layer?.set(backgroundColor: cgColor(fill), animated: animated && !isHovered)
+        Tokens.Motion.withoutAnimation {
+            layer?.borderWidth = Tokens.Metric.hairline
+            layer?.borderColor = cgColor(Tokens.Color.chromeEdge)
+        }
+    }
+}

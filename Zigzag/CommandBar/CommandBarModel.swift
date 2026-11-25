@@ -1,0 +1,598 @@
+import AppKit
+
+/// One line in the command bar.
+struct CommandResult: Equatable {
+    enum Kind: Equatable {
+        /// `httpFallback`: a scheme-less address, retried over http if https fails (`CommandRanker.Destination`).
+        case open(URL, httpFallback: Bool = false)
+        case search(String)
+        /// A search on one site, from the address bar's site search.
+        case searchOn(URL)
+        case switchTo(UUID)
+        case bookmark(UUID)
+        case history(URL)
+        case suggestion(String)
+        /// A Zigzag command ("Import from Another Browser…"), by its ID in `CommandRanker.actions`.
+        case action(String)
+        /// A line that only says something ("No history yet"): nothing to run, so Return and clicks pass it by.
+        case note
+        /// What's typed after an extension's keyword, or one of its suggestions: sent to the extension (BridgeOmnibox).
+        case omnibox(extensionID: String, content: String, isDefault: Bool)
+    }
+
+    let kind: Kind
+    let title: String
+    let detail: String
+    var icon: NSImage?
+    var symbol: String?
+    /// A bookmark that's a favorite rather than a pinned tab, so the bar says which it opens.
+    var isFavorite = false
+    /// Stretches of the title an extension's suggestion marks as a match, dim or an address.
+    var titleRuns: [OmniboxText.Run] = []
+
+    var actionLabel: String {
+        switch kind {
+        case .open, .history, .omnibox(_, _, false): String(localized: "Open", comment: "Action label at the right of the selected command bar result, saying what Return does: opens the page.")
+        case .search, .suggestion, .searchOn, .omnibox(_, _, true): String(localized: "Search", comment: "Action label at the right of the selected command bar result, saying what Return does: searches for it.")
+        case .switchTo: String(localized: "Switch to Tab", comment: "Action label at the right of the selected command bar result, saying what Return does: goes to the open tab.")
+        case .bookmark: isFavorite ? String(localized: "Open Favorite", comment: "Action label at the right of the selected command bar result, saying what Return does: opens the favorite.")
+                                    : String(localized: "Open Pinned Tab", comment: "Action label at the right of the selected command bar result, saying what Return does: opens the pinned tab.")
+        case .action: String(localized: "Run", comment: "Action label at the right of the selected command bar result, saying what Return does: runs the command.")
+        case .note: ""
+        }
+    }
+
+    var isActionable: Bool { kind != .note }
+
+    static func == (a: CommandResult, b: CommandResult) -> Bool { a.kind == b.kind && a.title == b.title && a.detail == b.detail }
+}
+
+/// Turns what you typed into ranked results: URLs, searches, open tabs, bookmarks and history.
+enum CommandRanker {
+    /// Where typed, pasted, dropped or selected text goes. A scheme-less address tries https, then http once, as
+    /// Chrome, Safari and Firefox do, so http-only dev servers (localtest.me:3000) still open. Not for typed schemes,
+    /// addresses already on http (localhost, IPs, local names), links or searches.
+    struct Destination: Equatable {
+        let url: URL
+        /// Retried once over http (`Tab.load`).
+        var httpFallback = false
+    }
+
+    /// A URL if the text looks like an address, otherwise nil.
+    static func url(from text: String) -> URL? { destination(from: text)?.url }
+
+    /// Nil unless the text looks like an address.
+    static func destination(from text: String) -> Destination? {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, !trimmed.contains(" ") else { return nil }
+        let lower = trimmed.lowercased()
+        // An extension's page as Chrome names it opens as Zigzag's own (Tab.extensionPageAddress).
+        if lower.hasPrefix("http://") || lower.hasPrefix("https://") || lower.hasPrefix("file://") || lower.hasPrefix("about:")
+            || lower.hasPrefix("chrome-extension://") {
+            return URL(string: trimmed).map { Destination(url: $0) }
+        }
+        // The host is everything before the first of / ? #; the port comes off too.
+        let hostEnd = lower.firstIndex { "/?#".contains($0) } ?? lower.endIndex
+        let hostPart = String(lower[..<hostEnd])
+        // An email address is something to search for, not a place to go. An @ further on is part of the page
+        // ("youtube.com/@name").
+        if hostPart.contains("@") { return nil }
+        let host = hostPart.split(separator: ":", omittingEmptySubsequences: false).first.map(String.init) ?? hostPart
+        if host == "localhost" || host.range(of: #"^\d{1,3}(\.\d{1,3}){3}$"#, options: .regularExpression) != nil {
+            return URL(string: "http://" + trimmed).map { Destination(url: $0) }
+        }
+        let labels = host.split(separator: ".", omittingEmptySubsequences: false)
+        guard labels.count >= 2, labels.allSatisfy({ !$0.isEmpty }), let tld = labels.last.map(String.init) else { return nil }
+        // Names only a local network knows go over plain http, the way a printer or router serves them.
+        if localTLDs.contains(tld) { return URL(string: "http://" + trimmed).map { Destination(url: $0) } }
+        // A real top-level domain, so "node.js" and "readme.txt" are searched, not opened.
+        guard knownTLDs.contains(tld) || tld.hasPrefix("xn--") else { return nil }
+        // https first, then http.
+        return URL(string: "https://" + trimmed).map { Destination(url: $0, httpFallback: true) }
+    }
+
+    /// Strips surrounding quotes, brackets and punctuation. A parenthesis stays if its pair is inside
+    /// (en.wikipedia.org/wiki/Mercury_(planet)); one wrapping the whole text or unpaired is stripped.
+    static func withoutSurroundings(_ text: String) -> String {
+        let around = CharacterSet(charactersIn: "\"'“”‘’«»<>[]{}.,;:!?。，；：！？")
+        var bare = text.trimmingCharacters(in: around)
+        while true {
+            let before = bare
+            if bare.hasPrefix("("), bare.hasSuffix(")"), bare.count >= 2 {
+                bare = String(bare.dropFirst().dropLast())
+            } else if bare.hasSuffix(")"), !bare.contains("(") {
+                bare = String(bare.dropLast())
+            } else if bare.hasPrefix("("), !bare.contains(")") {
+                bare = String(bare.dropFirst())
+            }
+            bare = bare.trimmingCharacters(in: around)
+            if bare == before { return bare }
+        }
+    }
+
+    /// Selected text that is only a web address (#234): "example.com" or a full https URL, minus surrounding
+    /// punctuation. Never file: or about:.
+    static func destination(fromSelection text: String) -> Destination? {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, trimmed.count <= 2048, !trimmed.contains(where: \.isNewline) else { return nil }
+        guard let destination = destination(from: withoutSurroundings(trimmed)), let scheme = destination.url.scheme?.lowercased(),
+              scheme == "http" || scheme == "https", destination.url.host?.isEmpty == false else { return nil }
+        return destination
+    }
+
+    private static let localTLDs: Set<String> = ["local", "lan", "internal", "test", "localhost", "home", "arpa", "corp", "intranet"]
+
+    /// Every top-level domain IANA lists, bundled with the app.
+    private static let knownTLDs: Set<String> = {
+        guard let url = Bundle.main.url(forResource: "tlds", withExtension: "txt"),
+              let text = try? String(contentsOf: url, encoding: .utf8) else { return ["com", "org", "net", "io", "app", "dev"] }
+        return Set(text.split(separator: "\n").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty })
+    }()
+
+    static func matches(_ words: [String], _ haystacks: String...) -> Bool {
+        let joined = haystacks.joined(separator: " ").lowercased()
+        return words.allSatisfy { joined.contains($0) }
+    }
+
+    /// The grey line under a result, left out when it only says the title again (a page with no title goes by its host).
+    static func detail(_ detail: String, under title: String) -> String {
+        detail.withoutWWW.caseInsensitiveCompare(title.withoutWWW) == .orderedSame ? "" : detail
+    }
+
+    /// A row for an open tab on one of Zigzag's own pages that a command listed with it already opens (Settings):
+    /// the command goes there too, so the row would only say the same thing twice.
+    static func repeatsCommand(_ url: URL?, offered actionIDs: Set<String>) -> Bool {
+        (SettingsPage.isSettings(url) && actionIDs.contains("settings")) || (HistoryPage.isHistory(url) && actionIDs.contains("history"))
+            || (ArchivePage.isArchive(url) && actionIDs.contains("archive"))
+    }
+
+    /// The open tabs offered before anything is typed: the latest six but the one you're on, and, with
+    /// `leavingOutFailed` (Zigzag Mini, on its own), none that are only showing an error page, as there's nothing there to go back to.
+    static func recentChoices<T: AnyObject>(_ tabs: [T], selected: T?, failed: (T) -> Bool, leavingOutFailed: Bool) -> [T] {
+        tabs.filter { !(leavingOutFailed && failed($0)) }.prefix(6).filter { $0 !== selected }
+    }
+
+    /// For display: no "https://", no "www.", never user info before the host (`AddressText`).
+    static func displayURL(_ url: URL) -> String {
+        var text = AddressText.withoutUserInfo(url).absoluteString
+        for prefix in ["https://", "http://"] where text.hasPrefix(prefix) { text.removeFirst(prefix.count) }
+        text = text.withoutWWW
+        if text.hasSuffix("/") { text.removeLast() }
+        return text
+    }
+
+    /// The address what you typed completes to, e.g. "wiki" → "wikipedia.org": sites from your history, weighed by
+    /// how often and how lately you went, and the ones you keep at hand (open tabs, favorites, pinned tabs).
+    /// `manager`: the browser window whose open tabs count, if there is one. `history`: the sites History has for
+    /// `completionPrefix(for: text)`, read off the main thread (`HistoryLookup`).
+    static func inlineCompletion(for text: String, manager: TabManager?, profile: Profile, history: [(entry: HistoryEntry, score: Double)]) -> InlineCompletion.Match? {
+        guard let bare = completionPrefix(for: text) else { return nil }
+        var sites: [InlineCompletion.Site] = history.compactMap { entry, score in
+            InlineCompletion.target(entry.url, wholePage: true).map { InlineCompletion.Site(url: $0, score: score) }
+        }
+        // Each place a site is kept at hand counts as much as a visit this week.
+        // What you keep at hand in this profile: another's open pages, favorites and pinned tabs aren't suggested here.
+        let kept = (manager?.allTabs ?? []).filter { $0.homeProfile === profile }.compactMap(\.url) + Library.shared.favorites(in: profile.id).map(\.url)
+            + Library.shared.allBookmarks.filter { Library.shared.profileID(ofSpace: $0.1.id) == profile.id }.map(\.0.url)
+        // Whether its host or a shorter form of it matches is for `best` to say.
+        for url in kept where HistoryStore.normalizedHost(url).contains(bare) {
+            if let site = InlineCompletion.target(url, wholePage: false) { sites.append(InlineCompletion.Site(url: site, score: 1)) }
+        }
+        return InlineCompletion.best(for: text, among: InlineCompletion.merge(sites))
+    }
+
+    /// What History is asked for to complete the text: it lowercased and without "www.", or nil when it can't complete.
+    static func completionPrefix(for text: String) -> String? {
+        let lower = text.lowercased()
+        let bare = lower.withoutWWW
+        return !bare.isEmpty && InlineCompletion.looksLikeHost(lower) ? bare : nil
+    }
+
+    struct Action {
+        let id: String
+        let title: String
+        let keywords: [String]
+        let symbol: String
+    }
+
+    static let actions: [Action] = [
+        Action(id: "clear-cache", title: String(localized: "Clear Cache…", comment: "A command in the command bar, named as in the menu bar."),
+               keywords: ["clear", "cache", "empty", "reset", "refresh"], symbol: "arrow.clockwise"),
+        Action(id: "clear-cookies", title: String(localized: "Clear Cookies…", comment: "A command in the command bar, named as in the menu bar."),
+               keywords: ["clear", "cookies", "sign", "out", "logout", "reset", "data"], symbol: "trash"),
+        Action(id: "settings", title: String(localized: "Settings…", comment: "Zigzag menu item, and a command in the command bar."),
+               keywords: ["settings", "preferences", "options", "engine", "privacy", "extensions", "shortcuts"], symbol: "gearshape"),
+        Action(id: "archive", title: String(localized: "Show Archive", comment: "History menu item, and a command in the command bar: opens the Archive page, the list of archived tabs."),
+               keywords: ["archive", "archived", "tabs", "old", "tidy", "restore"], symbol: "archivebox"),
+        Action(id: "passwords", title: String(localized: "Passwords", comment: "A command in the command bar, named as in the menu bar."),
+               keywords: ["passwords", "logins", "keychain", "accounts"], symbol: "key"),
+        Action(id: "import", title: String(localized: "Import from Another Browser…", comment: "A command in the command bar, named as in the menu bar."),
+               keywords: ["import", "bring", "move", "switch", "passwords", "bookmarks", "arc", "chrome", "safari", "firefox"], symbol: "square.and.arrow.down"),
+        Action(id: "feedback", title: String(localized: "Send Feedback…", comment: "A command in the command bar, named as in the menu bar."),
+               keywords: ["feedback", "send", "suggest", "idea", "contact", "email", "help"], symbol: "bubble.left"),
+        Action(id: "report", title: String(localized: "Report a Problem…", comment: "A command in the command bar, named as in the menu bar."),
+               keywords: ["report", "bug", "issue", "problem", "crash", "freeze", "broken", "help"], symbol: "exclamationmark.bubble"),
+    ]
+
+    /// What the bar needs to know about the window to offer only the commands that would do something.
+    struct Context {
+        struct Space { let id: UUID; let name: String }
+        var isPrivate = false
+        /// The page you're on has an address (a blank new tab doesn't).
+        var hasPage = false
+        /// The page can go into Pinned, or the favorites; Zigzag's own views can't (#472).
+        var canPin = true
+        var canFavorite = true
+        var isPinned = false
+        /// Pin and unpin act on the whole group (#209).
+        var isGroup = false
+        var isFavorite = false
+        var inSplit = false
+        /// Another tab, the last one you were on, can open beside this one.
+        var canSplitWithRecent = false
+        /// The page you're on is an ordinary tab, so it can move to another space.
+        var canMove = false
+        var hasOtherTabs = false
+        var hasTabsBelow = false
+        var canReopen = false
+        var spaces: [Space] = []
+        var currentSpaceID: UUID?
+        /// The developer tools (#141) that would do something on the page you're on.
+        var developerTools: [DeveloperTool] = []
+        /// The site you're on is in Developer Mode.
+        var isDevelopmentSite = false
+        /// The listed page sizes (Settings › Developer), offered by name where Page Size is.
+        var pageSizes: [PageSizes.Size] = []
+        /// The page can be captured (⇧⌘2).
+        var canCapture = false
+    }
+
+    /// The commands about the page and window you're in, each named as in the menu bar, and only those that apply.
+    static func contextActions(_ c: Context) -> [Action] {
+        var list: [Action] = []
+        if c.hasPage, !c.isPrivate, !c.isFavorite {
+            // One verb: Save. A group of tabs saves as one pinned folder, so the command says so.
+            if c.isPinned {
+                list.append(Action(id: "unpin", title: c.isGroup ? String(localized: "Unpin Group", comment: "A command in the command bar, named as in the menu bar: takes the pinned group out of Pinned.")
+                                   : String(localized: "Unpin Tab", comment: "A command in the command bar, named as in the menu bar: takes a pinned page out of Pinned."),
+                                   keywords: ["save", "unsave", "unpin", "pin", "tab", "group", "remove"], symbol: "star.slash"))
+            } else if c.canPin {
+                list.append(Action(id: "pin", title: c.isGroup ? String(localized: "Pin Group", comment: "A command in the command bar, named as in the menu bar: pins the group of tabs as one folder.")
+                                   : String(localized: "Pin Tab", comment: "A command in the command bar, named as in the menu bar: pins the page into Pinned."),
+                                   keywords: ["save", "pin", "tab", "group", "keep", "bookmark"], symbol: "star"))
+                list.append(Action(id: "pin-to-folder", title: String(localized: "Pin Tab to Folder…", comment: "A command in the command bar, named as in the menu bar: pins the page, asking which folder of the space it goes in."),
+                                   keywords: ["save", "folder", "pin", "tab", "file"], symbol: "folder.badge.plus"))
+            }
+        }
+        if c.hasPage, c.canFavorite, !c.isFavorite, !c.isPrivate {
+            list.append(Action(id: "favorite", title: String(localized: "Add to Favorites", comment: "A command in the command bar, named as in the menu bar."),
+                               keywords: ["add", "favorites", "favourites", "star", "bookmark"], symbol: SidebarMenus.Symbol.favorite))
+        }
+        if c.inSplit {
+            list.append(Action(id: "separate", title: String(localized: "Separate Tabs", comment: "A command in the command bar, named as in the menu bar."),
+                               keywords: ["separate", "tabs", "split", "unsplit", "view", "close"], symbol: "rectangle.split.2x1.slash"))
+        } else if c.canSplitWithRecent {
+            list.append(Action(id: "split", title: String(localized: "Open in Split View", comment: "A command in the command bar, named as in the menu bar."),
+                               keywords: ["open", "split", "view", "side", "two"], symbol: "rectangle.split.2x1"))
+        }
+        if c.canCapture {
+            list.append(Action(id: "capture", title: String(localized: "Capture…", comment: "File menu item, with ⇧⌘2: a mode over the page to take a picture of an area, an element, the whole page or what's on screen."),
+                               keywords: ["capture", "screenshot", "screen", "shot", "picture", "snapshot", "image", "grab"], symbol: "camera.viewfinder"))
+        }
+        if c.hasOtherTabs {
+            list.append(Action(id: "close-others", title: String(localized: "Close Other Tabs", comment: "A command in the command bar, named as in the menu bar."),
+                               keywords: ["close", "other", "tabs", "clean", "tidy"], symbol: "xmark.circle"))
+        }
+        if c.hasTabsBelow {
+            list.append(Action(id: "close-below", title: String(localized: "Close Tabs Below", comment: "A command in the command bar, named as in the menu bar."),
+                               keywords: ["close", "tabs", "below", "under"], symbol: SidebarMenus.Symbol.closeBelow))
+        }
+        if c.canReopen {
+            list.append(Action(id: "reopen", title: String(localized: "Reopen Closed Tab", comment: "A command in the command bar, named as in the menu bar."),
+                               keywords: ["reopen", "closed", "tab", "undo", "restore", "back"], symbol: "arrow.uturn.backward"))
+        }
+        list += c.developerTools.map {
+            Action(id: $0.commandID, title: $0 == .site ? DeveloperTool.siteShortTitle(listed: c.isDevelopmentSite) : $0.title, keywords: $0.keywords, symbol: $0.symbol)
+        }
+        // Each listed size by its name, as the Page Size menu above the page has them: "iphone" finds iPhone 16.
+        if c.developerTools.contains(.sizeCustom) {
+            list += c.pageSizes.enumerated().map { i, size in
+                Action(id: PageSizes.commandID(i), title: PageSizes.commandTitle(size),
+                       keywords: ["page", "size", "device", "responsive", "developer"] + size.name.lowercased().split(separator: " ").map(String.init),
+                       symbol: DeveloperBarTools.symbol(forSize: size.size))
+            }
+        }
+        // Spaces are kept for good; a private window keeps nothing and has one space.
+        guard !c.isPrivate else { return list }
+        list.append(Action(id: "new-space", title: String(localized: "New Space", comment: "A command in the command bar, named as in the menu bar."),
+                           keywords: ["new", "space", "create", "add"], symbol: "plus.square"))
+        for space in c.spaces where space.id != c.currentSpaceID {
+            let name = space.name.lowercased().split(separator: " ").map(String.init)
+            list.append(Action(id: "space:\(space.id.uuidString)", title: String(localized: "Switch to \(space.name)", comment: "A command in the command bar: goes to another space. The name is the space's."),
+                               keywords: ["switch", "go", "space"] + name, symbol: "square.on.square"))
+            if c.canMove {
+                list.append(Action(id: "move:\(space.id.uuidString)", title: String(localized: "Move to \(space.name)", comment: "A command in the command bar: moves the tab to another space. The name is the space's."),
+                                   keywords: ["move", "tab", "space", "send"] + name, symbol: "arrow.right.square"))
+            }
+        }
+        return list
+    }
+
+    /// Whether every word you typed starts a word of the command's own name ("imp" for Import, "pin t" for Pin Tab),
+    /// rather than only one of its hidden keywords. One or two characters found inside a page command's name (其他
+    /// in 关闭其他标签页) don't count: it's listed after the search, so Return never closes tabs on a near miss.
+    static func isNamed(_ action: Action, by words: [String]) -> Bool {
+        let titleWords = action.title.lowercased().split { !$0.isLetter && !$0.isNumber }.map(String.init)
+        let inside = words.joined().count >= 3 || actions.contains { $0.id == action.id }
+        return !words.isEmpty && words.allSatisfy { word in
+            titleWords.contains { $0.hasPrefix(word) } || (namesFindCommands && inside && action.title.localizedCaseInsensitiveContains(word))
+        }
+    }
+
+    /// The commands every word you typed starts a keyword of. The ones about this page and window (Pin Tab, Close
+    /// Other Tabs) wait for three letters, so a site's first letter and Return never pins or closes anything.
+    static func commands(for query: String, context: Context) -> [Action] {
+        let words = query.lowercased().split(separator: " ").map(String.init)
+        guard !words.isEmpty else { return [] }
+        let pageCommands = contextActions(context)
+        let candidates = (isEnough(query, for: (pageCommands + actions).map(\.title)) ? pageCommands : []) + actions
+        return candidates.filter { action in
+            words.allSatisfy { word in
+                action.keywords.contains { $0.hasPrefix(word) } || (namesFindCommands && action.title.localizedCaseInsensitiveContains(word))
+            }
+        }
+    }
+
+    /// Whether what you typed is enough for the commands about this page and window. Three letters in Latin; in
+    /// Chinese or Japanese a character or two already make a word, so two are enough, and one is when it starts
+    /// just one command's name (固 for 固定标签页).
+    static func isEnough(_ query: String, for names: [String]) -> Bool {
+        if query.count >= 3 { return true }
+        let typed = query.lowercased().filter { !$0.isWhitespace }
+        guard !typed.isEmpty, typed.allSatisfy(isCJK) else { return false }
+        if typed.count == 2 { return true }
+        return typed.count == 1 && names.filter { $0.lowercased().hasPrefix(typed) }.count == 1
+    }
+
+    /// A Chinese character, kana or Hangul: one of these says about as much as a Latin word.
+    private static func isCJK(_ c: Character) -> Bool {
+        c.unicodeScalars.allSatisfy { s in
+            s.properties.isIdeographic || (0x3040...0x30FF).contains(s.value) || (0xAC00...0xD7AF).contains(s.value)
+        }
+    }
+
+    /// The keywords are English. With Zigzag in another language, what you type in it finds a command by its own
+    /// name too (Chinese has no spaces to start words at, so anywhere in the name counts). In English, only the
+    /// keywords do, as they always have.
+    private static let namesFindCommands = !(Bundle.main.preferredLocalizations.first ?? "en").hasPrefix("en")
+
+    static func context(for manager: TabManager) -> Context {
+        var c = Context()
+        c.isPrivate = manager.isPrivate
+        c.canReopen = WindowManager.shared.canReopenLastClosed(from: manager)
+        c.spaces = Library.shared.spaces.map { Context.Space(id: $0.id, name: $0.name) }
+        c.currentSpaceID = manager.currentSpaceID
+        let tabs = manager.currentTabs
+        guard let tab = manager.selectedTab else { return c }
+        c.hasPage = tab.url != nil
+        c.canPin = manager.canPin(tab)
+        c.canFavorite = manager.canPin(tab, keepingGroup: false)
+        c.canCapture = WindowManager.shared.controllers.first { $0.tabManager === manager }?.capture.canBegin ?? false
+        c.developerTools = DeveloperTool.allCases.filter { $0.isOffered(for: tab, isPrivate: manager.isPrivate, inSplit: manager.split(for: tab) != nil) }
+        c.isDevelopmentSite = DevelopmentSites.covers(tab.url)
+        c.pageSizes = PageSizes.all
+        c.isFavorite = tab.isFavorite
+        c.isPinned = tab.bookmarkID != nil && !tab.isFavorite
+        c.isGroup = c.isPinned ? tab.bookmarkID.flatMap(Library.shared.pinnedGroup(containing:)) != nil : manager.pinsGroup(tab)
+        c.inSplit = manager.split(for: tab) != nil
+        c.canSplitWithRecent = splitPartner(for: tab, in: manager) != nil
+        c.canMove = tab.bookmarkID == nil && tab.url != nil
+        // On a pinned page or favorite, every tab is another tab, and all of them are below it.
+        // Its split partner is part of it, as Close Other Tabs and Close Tabs Below count it.
+        let panes = manager.panes(of: tab)
+        let last = tabs.lastIndex { page in panes.contains { $0 === page } }
+        c.hasOtherTabs = tabs.contains { page in !panes.contains { $0 === page } }
+        c.hasTabsBelow = tabs.count > (last.map { $0 + 1 } ?? 0)
+        return c
+    }
+
+    /// The tab Open in Split View puts beside this one: the last other page you were on, in this space.
+    static func splitPartner(for tab: Tab, in manager: TabManager) -> Tab? {
+        guard tab.url != nil, manager.split(for: tab) == nil else { return nil }
+        return manager.recentTabs.first { other in
+            other !== tab && other.url != nil && other.spaceID == tab.spaceID && manager.split(for: other) == nil && manager.canSplit(tab, with: other)
+        }
+    }
+
+    /// How many pages `results` wants from History: twice what it shows, as some are already a tab or a bookmark.
+    static func historyLimit(historyOnly: Bool) -> Int { historyOnly ? 20 : 8 }
+
+    /// `manager`: the browser window whose tabs and commands are offered; with none (Zigzag Mini on its own), only
+    /// pages to open and searches. `history`: the pages History has for the text, read off the main thread
+    /// (`HistoryLookup`, asked for `historyLimit` of them; nil while it still is), so these results never wait on History.
+    static func results(for text: String, manager: TabManager?, profile: Profile, suggestions: [String], history: [HistoryEntry]?,
+                        editingCurrent: Bool, historyOnly: Bool, leavingOutFailed: Bool = false) -> [CommandResult] {
+        let query = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        var results: [CommandResult] = []
+        var seen = Set<String>()
+        func add(_ result: CommandResult, key: String) {
+            guard !seen.contains(key) else { return }
+            seen.insert(key)
+            results.append(result)
+        }
+
+        if query.isEmpty {
+            if historyOnly {
+                for entry in profile.history.recent(limit: 8) {
+                    let title = entry.title.isEmpty ? HistoryStore.fileName(of: entry.url) ?? displayURL(entry.url) : entry.title
+                    add(CommandResult(kind: .history(entry.url), title: title,
+                                      detail: detail(displayURL(entry.url), under: title), icon: SiteIcons.shownIcon(for: entry.url, privateStore: manager?.privateStore)),
+                        key: TabManager.normalize(entry.url))
+                }
+                // No history yet: say what this is for rather than showing nothing.
+                if results.isEmpty {
+                    add(CommandResult(kind: .note, title: String(localized: "No history yet", comment: "The command bar searching history, when there is none yet."),
+                                      detail: String(localized: "Pages you visit show up here", comment: "Under No history yet, in the command bar searching history."),
+                                      symbol: "clock"), key: "empty-history")
+                }
+                return results
+            }
+            // Nothing typed yet: recent tabs, so switching is one keystroke away.
+            let recent = recentChoices((manager?.recentTabs ?? []).filter { $0.homeProfile === profile }, selected: manager?.selectedTab,
+                                       failed: \.showsErrorPage, leavingOutFailed: leavingOutFailed)
+            for tab in recent {
+                guard let url = tab.url else { continue }
+                add(CommandResult(kind: .switchTo(tab.id), title: tab.displayTitle, detail: detail(displayURL(url), under: tab.displayTitle), icon: tab.displayIcon),
+                    key: TabManager.normalize(url))
+            }
+            return results
+        }
+
+        let words = query.lowercased().split(separator: " ").map(String.init)
+        let engine = Library.shared.searchEngine
+
+        // What you typed always comes first, as a search or the address it names, so Return never does something
+        // else: someone typing "settings" may want to search the web for it. Zigzag's own commands follow, the ones
+        // you've named ("import", "pin tab") right under it, then those the words only touch through a keyword.
+        let matched = historyOnly ? [] : manager.map { commands(for: query, context: context(for: $0)) } ?? []
+        let named = matched.filter { Self.isNamed($0, by: words) }
+        func addActions(_ list: [Action]) {
+            for action in list {
+                // Split View says which page it puts beside this one.
+                let partner = action.id == "split" ? manager.flatMap { m in m.selectedTab.flatMap { splitPartner(for: $0, in: m) } } : nil
+                add(CommandResult(kind: .action(action.id), title: action.title, detail: partner.map { String(localized: "with \($0.displayTitle)", comment: "Under the command bar's Open in Split View command: the page it opens beside this one. The title is that page's.") } ?? "",
+                                  symbol: action.symbol), key: "action:\(action.id)")
+            }
+        }
+        if !historyOnly {
+            if let destination = destination(from: query) {
+                let url = destination.url
+                add(CommandResult(kind: .open(url, httpFallback: destination.httpFallback), title: displayURL(url), detail: "",
+                                  icon: SiteIcons.shownIcon(for: url, privateStore: manager?.privateStore), symbol: "globe"),
+                    key: TabManager.normalize(url))
+            } else {
+                add(CommandResult(kind: .search(query), title: query, detail: engine.name, symbol: "magnifyingglass"), key: "search:\(query)")
+            }
+        }
+        addActions(named)
+        addActions(matched.filter { !Self.isNamed($0, by: words) })
+
+        if !historyOnly {
+            var tabCount = 0
+            let offered = Set(matched.map(\.id))
+            // Open pages of this profile: one typed for here never lands you in another profile's.
+            for tab in (manager?.recentTabs ?? []) + (manager?.allTabs ?? []) where tabCount < 3 && tab.homeProfile === profile {
+                guard let url = tab.url, matches(words, tab.displayTitle, url.absoluteString),
+                      !repeatsCommand(url, offered: offered) else { continue }
+                let key = TabManager.normalize(url)
+                guard !seen.contains(key) else { continue }
+                add(CommandResult(kind: .switchTo(tab.id), title: tab.displayTitle, detail: detail(displayURL(url), under: tab.displayTitle), icon: tab.displayIcon), key: key)
+                tabCount += 1
+            }
+            var bookmarkCount = 0
+            // Favorites first: they're the sites you go to most.
+            let shown = Library.shared.favorites(in: profile.id)
+            let favorites = Set(shown.map(\.id))
+            let pinned = Library.shared.allBookmarks.filter { Library.shared.profileID(ofSpace: $0.1.id) == profile.id }.map(\.0)
+            for bookmark in shown + pinned where bookmarkCount < 3 {
+                guard matches(words, bookmark.title, bookmark.url.absoluteString) else { continue }
+                let key = TabManager.normalize(bookmark.url)
+                guard !seen.contains(key) else { continue }
+                add(CommandResult(kind: .bookmark(bookmark.id), title: bookmark.title, detail: detail(displayURL(bookmark.url), under: bookmark.title),
+                                  icon: bookmark.displayIcon, isFavorite: favorites.contains(bookmark.id)), key: key)
+                bookmarkCount += 1
+            }
+        }
+
+        // Tabs that tidied themselves away: still a few letters from coming back.
+        if !historyOnly {
+            for entry in TabArchive.shared.search(words, limit: 2, where: { Library.shared.profileID(ofSpace: $0.spaceID) == profile.id }) {
+                let key = TabManager.normalize(entry.url)
+                guard !seen.contains(key) else { continue }
+                let space = Library.shared.space(entry.spaceID)?.name
+                add(CommandResult(kind: .history(entry.url), title: entry.title.isEmpty ? displayURL(entry.url) : entry.title,
+                                  detail: space.map { String(localized: "Archived from \($0)", comment: "Under a command bar result for a tab that tidied itself away. The name is the space it was in.") }
+                                      ?? String(localized: "Archived", comment: "Under a command bar result for a tab that tidied itself away."),
+                                  icon: SiteIcons.shownIcon(for: entry.url, privateStore: manager?.privateStore), symbol: "archivebox"), key: key)
+            }
+        }
+
+        var historyCount = 0
+        let shown = historyOnly ? 10 : 4
+        for entry in history ?? [] where historyCount < shown {
+            let key = TabManager.normalize(entry.url)
+            guard !seen.contains(key), !SearchFolding.isSearchResultsPage(entry.url) else { continue }
+            let title = entry.title.isEmpty ? displayURL(entry.url) : entry.title
+            add(CommandResult(kind: .history(entry.url), title: title,
+                              detail: detail(displayURL(entry.url), under: title), icon: SiteIcons.shownIcon(for: entry.url, privateStore: manager?.privateStore)), key: key)
+            historyCount += 1
+        }
+
+        // Searching history and nothing matches: never a blank bar. Say so, with the web search one Return away. Still
+        // being read: nothing yet, rather than saying nothing matches a beat before it does.
+        if historyOnly, results.isEmpty, history != nil {
+            add(CommandResult(kind: .search(query), title: String(localized: "Search the web for “\(query)”", comment: "Command bar result when nothing in history matches. The query is what was typed."),
+                              detail: String(localized: "Nothing in your history matches", comment: "Under the command bar's search-the-web result, when nothing in history matches."),
+                              symbol: "magnifyingglass"), key: "search:\(query)")
+        }
+
+        if !historyOnly && url(from: query) == nil {
+            for suggestion in suggestions.prefix(4) where suggestion.lowercased() != query.lowercased() {
+                add(CommandResult(kind: .suggestion(suggestion), title: suggestion, detail: "", symbol: "magnifyingglass"), key: "search:\(suggestion)")
+            }
+        }
+        return Array(results.prefix(Tokens.Metric.commandBarMaxRows))
+    }
+}
+
+/// Fetches search suggestions from the chosen engine. Only what you type in the command bar is sent.
+final class SuggestionFetcher {
+    private var task: Task<Void, Never>?
+    /// In a private window: suggestions go through a session of their own, so the search engine can't tie them to
+    /// your other browsing.
+    var isPrivate = false
+    private lazy var privateSession = URLSession(configuration: .cookieless)
+    /// Everyday windows' suggestions: no cookies and no cache either, so what you type can't be tied to you by a
+    /// cookie the engine set, only your text and the address it came from.
+    private static let session = URLSession(configuration: .cookieless)
+
+    /// On by default. Off, nothing you type in the command bar leaves the Mac for suggestions.
+    static var isOn: Bool {
+        get { UserDefaults.standard.object(forKey: "SearchSuggestions") as? Bool ?? true }
+        set { UserDefaults.standard.set(newValue, forKey: "SearchSuggestions") }
+    }
+
+    /// Where a query would be sent for suggestions, or nil when it stays on the Mac.
+    static func url(for query: String, engine: SearchEngine, isOn: Bool) -> URL? {
+        let trimmed = query.trimmingCharacters(in: .whitespaces)
+        guard isOn, trimmed.count >= 2, CommandRanker.url(from: trimmed) == nil else { return nil }
+        return engine.suggestionsURL(trimmed)
+    }
+
+    func fetch(_ query: String, completion: @escaping ([String]) -> Void) {
+        task?.cancel()
+        guard let url = Self.url(for: query, engine: Library.shared.searchEngine, isOn: Self.isOn) else { completion([]); return }
+        let session = isPrivate ? privateSession : Self.session
+        task = Task {
+            try? await Task.sleep(for: .milliseconds(90))
+            guard !Task.isCancelled else { return }
+            guard let (data, _) = try? await session.data(from: url), !Task.isCancelled else { return }
+            completion(Self.parse(data))
+        }
+    }
+
+    func cancel() { task?.cancel() }
+
+    nonisolated static func parse(_ data: Data) -> [String] {
+        guard let json = try? JSONSerialization.jsonObject(with: data) else { return [] }
+        // OpenSearch format: [query, [suggestions...]]
+        if let array = json as? [Any], array.count > 1, let list = array[1] as? [String] { return list }
+        // DuckDuckGo: [{phrase: ...}]
+        if let array = json as? [[String: Any]] { return array.compactMap { $0["phrase"] as? String } }
+        // Kagi: [{t: ...}] or {data: [...]}
+        if let dict = json as? [String: Any], let list = dict["suggestions"] as? [[String: Any]] {
+            return list.compactMap { ($0["value"] ?? $0["t"]) as? String }
+        }
+        return []
+    }
+}
