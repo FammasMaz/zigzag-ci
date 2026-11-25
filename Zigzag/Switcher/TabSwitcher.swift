@@ -1,0 +1,628 @@
+import AppKit
+
+/// A page as a picture: its snapshot filling the frame, scaled to cover it and pinned to its top left, as a page is
+/// read, never letterboxed. A split shows both pages where they sit on screen, side by side or stacked, at the
+/// split's own ratio, and a tile group its three or four (#160). Cards draw one, and so does the page flying into or
+/// out of its card in desk view.
+final class PagePicture {
+    /// What goes on screen. Its owner places it and sizes it with `layout(size:)`.
+    let layer = CALayer()
+    private let panes = (0..<TileShape.maxPanes).map { _ in CALayer() }
+    private let images = (0..<TileShape.maxPanes).map { _ in CALayer() }
+    /// The hairlines between the pages: one per stretch of the line between the columns, and one per stretch of the
+    /// line between the rows (#316), so a group whose rows have lines of their own draws each where it is.
+    private let dividers = (0..<4).map { _ in CALayer() }
+    private var shape: TileShape?
+    /// Each page's picture's size, in points.
+    private var sizes: [CGSize?] = Array(repeating: nil, count: TileShape.maxPanes)
+    /// Shows the copies `ReadyPictures` made of the pictures for this size, where there are any, rather than the
+    /// pictures themselves, which Core Animation would decode on the main thread as it first draws them.
+    var readyCopies: ReadyPictures.Size?
+    /// A picture with no ready copy yet is left out for now rather than shown as it is, until this is turned off.
+    var waitsForReadyCopies = false
+
+    init() {
+        for (pane, image) in zip(panes, images) {
+            pane.masksToBounds = true
+            pane.addSublayer(image)
+            layer.addSublayer(pane)
+        }
+        dividers.forEach { layer.addSublayer($0) }
+    }
+
+    /// The hairlines' color.
+    var dividerColor: CGColor? {
+        get { dividers[0].backgroundColor }
+        set { dividers.forEach { $0.backgroundColor = newValue } }
+    }
+
+    /// The first page's picture, and with a split, the second's and how the two share the frame.
+    func show(_ first: NSImage?, _ second: NSImage?, split: (ratio: CGFloat, vertical: Bool)?) {
+        show([first, second], shape: split.map { TileShape.pair(ratio: $0.ratio, vertical: $0.vertical) })
+    }
+
+    /// Each page's picture, in order, laid out as `shape` (nil: the first one alone).
+    func show(_ pictures: [NSImage?], shape: TileShape?) {
+        self.shape = shape
+        let count = shape?.regions.count ?? 1
+        Tokens.Motion.withoutAnimation {
+            for (i, image) in images.enumerated() {
+                let picture = i < count && i < pictures.count ? pictures[i] : nil
+                sizes[i] = picture?.size
+                // Flying, a card's copy will do until the whole picture is ready: it starts out card-sized.
+                let ready = picture.flatMap { picture in
+                    readyCopies.flatMap { ReadyPictures.copy(of: picture, for: $0) ?? ReadyPictures.copy(of: picture, for: .card) }
+                }
+                image.contents = ready ?? (waitsForReadyCopies ? nil : picture)
+            }
+        }
+        layout(size: layer.bounds.size)
+    }
+
+    /// Sizes the picture and places the pages in it.
+    func layout(size: CGSize) {
+        Tokens.Motion.withoutAnimation {
+            layer.bounds.size = size
+            let b = layer.bounds
+            let frames = shape?.frames(in: b, gap: 1) ?? [b]
+            // Worked out top-down, as the window lays its panes out; a layer's y runs up.
+            func up(_ r: CGRect) -> CGRect { CGRect(x: r.minX, y: b.height - r.maxY, width: r.width, height: r.height) }
+            for i in panes.indices {
+                panes[i].isHidden = i >= frames.count
+                if i < frames.count { fill(i, in: up(frames[i])) }
+            }
+            // A hairline per stretch of a line, where it is: each row's line between the columns and each column's
+            // between the rows, drawn in the gap (#316).
+            let segments = shape?.segments(in: b, gap: 1, slop: 0) ?? []
+            for (i, line) in dividers.enumerated() {
+                guard i < segments.count else { line.isHidden = true; continue }
+                line.isHidden = false
+                line.frame = up(segments[i].frame)
+            }
+        }
+    }
+
+    private func fill(_ index: Int, in rect: CGRect) {
+        panes[index].frame = rect
+        guard images[index].contents != nil, let size = sizes[index], size.width > 0, size.height > 0 else { return }
+        let scale = max(rect.width / size.width, rect.height / size.height)
+        let w = size.width * scale, h = size.height * scale
+        images[index].frame = CGRect(x: 0, y: rect.height - h, width: w, height: h)
+    }
+}
+
+/// A page thumbnail with its site and title underneath, used by the switcher and desk view.
+final class TabThumbnailView: InteractiveView {
+    let imageClip = NSView()
+    /// The page, or a split's two, as they are on screen.
+    let picture = PagePicture()
+    private let placeholder = FaviconView()
+    let icon = FaviconView()
+    let title = Label("", font: Tokens.Font.body(), color: Tokens.Color.textPrimary)
+    /// With a split: the other page's icon and title, under its half.
+    private let icon2 = FaviconView()
+    private let title2 = Label("", font: Tokens.Font.body(), color: Tokens.Color.textPrimary)
+    private let ring = CALayer()
+    /// A page playing sound: a speaker after its title, as in the sidebar. Clicking it mutes the page, or unmutes it.
+    private let audioButton = IconButton(symbol: "speaker.wave.2", size: .compact, toolTip: String(localized: "Mute Tab", comment: "Tooltip of a button on a card in the tab switcher (Control-Tab)."))
+    var showsTitle = true { didSet { needsLayout = true } }
+    /// Desk view marks selection with an accent ring; the switcher uses a quiet highlight.
+    var showsRing = false
+    var showsHover = true
+    /// Desk view: the tab you were on, held in the same quiet fill as its row in the sidebar.
+    var isCurrent = false { didSet { if oldValue != isCurrent { refreshColors() } } }
+    /// Desk view: where the arrow keys are, and what Return opens. A softer ring than a selection's.
+    var isFocused = false { didSet { if oldValue != isFocused { refreshColors() } } }
+    /// Desk view: an × on the card while the pointer is over it.
+    var onClose: (() -> Void)? { didSet { closeButton.isHidden = true } }
+    private let closeButton = IconButton(symbol: "xmark", size: .compact, toolTip: String(localized: "Close Tab", comment: "Tooltip of a button on a card in the tab switcher (Control-Tab)."))
+    /// A dark disc under the close button, so its white × reads on any page, light or busy.
+    private let closeDisc = ColorView(color: NSColor(white: 0, alpha: 0.62))
+    /// A page with no picture yet, or only a blank one (asleep, or caught before it drew): its site instead.
+    private let siteName = Label("", font: Tokens.Font.small(.medium), color: Tokens.Color.textSecondary)
+    static let titleHeight = Tokens.Space.x8
+    private(set) weak var tab: Tab?
+    /// The pages beside it in split view or a tile group, in order.
+    private var partnerRefs: [WeakTab] = []
+    var partners: [Tab] { partnerRefs.compactMap(\.tab) }
+    /// The other page of a split of two, whose icon and title go under its half; nil alone or in a tile group.
+    var partner: Tab? { partnerRefs.count == 1 ? partnerRefs[0].tab : nil }
+    /// Every page on the card: its own first.
+    var pages: [Tab] { ([tab] + partnerRefs.map(\.tab)).compactMap { $0 } }
+    /// How the pages share the page area; nil for one page.
+    private(set) var shape: TileShape?
+    private struct WeakTab { weak var tab: Tab? }
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        layer?.cornerCurve = .continuous
+        imageClip.wantsLayer = true
+        imageClip.layer?.cornerRadius = Tokens.Radius.thumbnail
+        imageClip.layer?.cornerCurve = .continuous
+        imageClip.layer?.masksToBounds = true
+        imageClip.layer?.borderWidth = Tokens.Metric.hairline
+        imageClip.layer?.addSublayer(picture.layer)
+        imageClip.addSubview(placeholder)
+        ring.borderWidth = 2.5
+        ring.cornerCurve = .continuous
+        ring.isHidden = true
+        ring.zPosition = 10
+        siteName.alignment = .center
+        siteName.lineBreakMode = .byTruncatingMiddle
+        imageClip.addSubview(siteName)
+        closeButton.showsFillAtRest = false
+        closeButton.tint = .white
+        closeButton.isHidden = true
+        closeDisc.wantsLayer = true
+        closeDisc.isHidden = true
+        closeDisc.layer?.shadowColor = NSColor.black.cgColor
+        closeDisc.layer?.shadowOpacity = 0.25
+        closeDisc.layer?.shadowRadius = 3
+        closeDisc.layer?.shadowOffset = .zero
+        closeButton.onClick = { [weak self] _ in self?.onClose?() }
+        audioButton.isHidden = true
+        audioButton.onClick = { [weak self] _ in
+            guard let self, let page = self.audioTab else { return }
+            page.setMuted(!page.isMuted)
+            self.refreshAudio()
+        }
+        [imageClip, icon, title, icon2, title2, audioButton, closeDisc, closeButton].forEach { addSubview($0) }
+        layer?.addSublayer(ring)
+        setAccessibilityRole(.button)
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    func configure(_ tab: Tab, partner: Tab? = nil, split: (ratio: CGFloat, vertical: Bool)? = nil) {
+        configure(tab, partners: partner.map { [$0] } ?? [], shape: split.map { TileShape.pair(ratio: $0.ratio, vertical: $0.vertical) })
+    }
+
+    /// A page, or the pages of its split or tile group (its own first), sharing the picture as `shape` says.
+    func configure(_ tab: Tab, partners: [Tab], shape: TileShape?) {
+        self.tab = tab
+        // A shape for as many pages as there are, or the page alone.
+        let shape = shape ?? (partners.count == 1 ? TileShape(regions: [.left, .right]) : nil)
+        if let shape, shape.regions.count == partners.count + 1 {
+            self.shape = shape
+            partnerRefs = partners.map { WeakTab(tab: $0) }
+        } else {
+            self.shape = nil
+            partnerRefs = []
+        }
+        let partner = self.partner
+        // Set only when changed: the desk configures every card each time it opens, and each set redraws.
+        let displayIcon = tab.displayIcon, displayTitle = tab.displayTitle
+        if placeholder.image !== displayIcon { placeholder.image = displayIcon }
+        // A web page by its site; Zigzag's own pages (History) and files by their title, never a bare "history".
+        let site: String
+        if let url = tab.url, ["http", "https"].contains(url.scheme), let host = url.host() {
+            site = host.withoutWWW
+        } else {
+            site = displayTitle
+        }
+        if siteName.stringValue != site { siteName.stringValue = site }
+        if icon.image !== displayIcon { icon.image = displayIcon }
+        if title.stringValue != displayTitle { title.stringValue = displayTitle }
+        let partnerIcon = partner?.displayIcon
+        if icon2.image !== partnerIcon { icon2.image = partnerIcon }
+        // A page that isn't running wears the ring it has in the sidebar, and loses it the moment it loads (#205).
+        loadTokens = [tab, partner].compactMap { $0 }.map { page in
+            page.changed.observe { [weak self] change in if change == .webView { self?.refreshUnloaded() } }
+        }
+        refreshUnloaded()
+        let partnerTitle = partner?.displayTitle ?? ""
+        if title2.stringValue != partnerTitle { title2.stringValue = partnerTitle }
+        setAccessibilityLabel(pages.count > 1 ? Words.list(pages.map(\.displayTitle)) : tab.displayTitle)
+        refreshImage()
+        refreshAudio()
+        needsLayout = true
+    }
+
+    private var loadTokens: [SignalToken] = []
+
+    private func refreshUnloaded() {
+        icon.isUnloaded = tab.map { !$0.isLoaded } ?? false
+        icon2.isUnloaded = partner.map { !$0.isLoaded } ?? false
+    }
+
+    /// The page with sound on (or muted), the first one's before its split partner's.
+    private var audioTab: Tab? {
+        pages.first { $0.isPlayingAudio || $0.isMuted }
+    }
+
+    private func refreshAudio() {
+        let page = audioTab
+        let symbol = page?.isMuted == true ? "speaker.slash" : "speaker.wave.2"
+        if audioButton.symbol != symbol { audioButton.symbol = symbol }
+        let tip = page?.isMuted == true ? String(localized: "Unmute Tab", comment: "Tooltip of a button on a card in the tab switcher (Control-Tab).") : String(localized: "Mute Tab", comment: "Tooltip of a button on a card in the tab switcher (Control-Tab).")
+        if audioButton.toolTip != tip { audioButton.toolTip = tip }
+        needsLayout = true
+    }
+
+    /// Desk view, as it opens: pictures wait for their ready copies (`ReadyPictures`), and whether one is blank is
+    /// only what's known already, so nothing is decoded on the main thread. Off again once they're made.
+    var waitsForReadyPictures = false {
+        didSet { picture.waitsForReadyCopies = waitsForReadyPictures }
+    }
+
+    func refreshImage() {
+        guard let tab else { return }
+        let blank = waitsForReadyPictures ? tab.snapshot == nil || Self.knownBlank(tab.snapshot) == true : Self.isBlank(tab.snapshot)
+        picture.show([blank ? nil : tab.snapshot] + partners.map(\.snapshot), shape: shape)
+        let showsPage = !blank || shape != nil
+        placeholder.isHidden = showsPage
+        siteName.isHidden = showsPage
+        refreshColors()
+        needsLayout = true
+    }
+
+    /// Keyed by the picture itself, held weakly: a freed picture's address can be reused by a new one, which
+    /// must be checked afresh, and an entry goes when its picture does.
+    private static let blankness = NSMapTable<NSImage, NSNumber>.weakToStrongObjects()
+
+    /// No picture, or one that's all one color: a page that hadn't drawn yet. Checked once per picture, on a
+    /// thumbnail fine enough that a quiet page (a few lines of text on white, like History or Settings) still
+    /// shows its text; a handful of pixels across averaged that away and took such pages for empty ones.
+    static func isBlank(_ image: NSImage?) -> Bool {
+        guard let image else { return true }
+        if let known = blankness.object(forKey: image) { return known.boolValue }
+        guard let cg = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else { return false }
+        let blank = isBlank(cg)
+        blankness.setObject(NSNumber(value: blank), forKey: image)
+        return blank
+    }
+
+    /// Whether a picture is blank, if that's been worked out already; nil if not.
+    static func knownBlank(_ image: NSImage?) -> Bool? {
+        guard let image else { return true }
+        return blankness.object(forKey: image)?.boolValue
+    }
+
+    /// Notes what a picture read from disk shows, worked out from a small thumbnail of its file, so the switcher
+    /// and the tab overview never decode the whole picture just to ask.
+    static func remember(_ image: NSImage, blank: Bool) {
+        blankness.setObject(NSNumber(value: blank), forKey: image)
+    }
+
+    nonisolated static func isBlank(_ cg: CGImage) -> Bool {
+        let side = 64
+        guard let context = CGContext(data: nil, width: side, height: side, bitsPerComponent: 8, bytesPerRow: side * 4,
+                                      space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue),
+              let pixels = context.data?.bindMemory(to: UInt8.self, capacity: side * side * 4) else { return false }
+        context.interpolationQuality = .medium
+        context.draw(cg, in: CGRect(x: 0, y: 0, width: side, height: side))
+        var low: [UInt8] = [255, 255, 255], high: [UInt8] = [0, 0, 0]
+        for p in 0..<(side * side) {
+            for i in 0..<3 {
+                let v = pixels[p * 4 + i]
+                low[i] = min(low[i], v)
+                high[i] = max(high[i], v)
+            }
+        }
+        return zip(low, high).allSatisfy { Int($1) - Int($0) < 8 }
+    }
+
+    /// Which page a click landed on: with a split, the pane under the pointer.
+    func tab(at event: NSEvent) -> Tab? {
+        guard let shape else { return tab }
+        let point = imageClip.convert(event.locationInWindow, from: nil)
+        // The clip isn't flipped: the panes are worked out top-down.
+        let b = imageClip.bounds
+        let down = CGPoint(x: point.x, y: b.height - point.y)
+        let frames = shape.frames(in: b, gap: 1)
+        let pages = self.pages
+        guard let index = frames.firstIndex(where: { $0.insetBy(dx: -1, dy: -1).contains(down) }), pages.indices.contains(index) else { return tab }
+        return pages[index]
+    }
+
+    /// Space around the picture, so the card can surround it like Command+Tab. The card's corners are the
+    /// picture's plus this, so the two curves run together.
+    var inset: CGFloat = Tokens.Space.x1 { didSet { needsLayout = true } }
+
+    override func layout() {
+        super.layout()
+        layer?.cornerRadius = Tokens.Radius.thumbnail + inset
+        // The lifted card's shadow is its own shape, given rather than worked out from what it shows every frame
+        // it fades or moves.
+        let radius = Tokens.Radius.thumbnail + inset
+        layer?.shadowPath = CGPath(roundedRect: bounds, cornerWidth: radius, cornerHeight: radius, transform: nil)
+        let titleArea = showsTitle ? Self.titleHeight : 0
+        imageClip.frame = NSRect(x: inset, y: inset, width: bounds.width - inset * 2, height: bounds.height - titleArea - inset * (showsTitle ? 1 : 2))
+        picture.layout(size: imageClip.bounds.size)
+        Tokens.Motion.withoutAnimation { picture.layer.position = CGPoint(x: imageClip.bounds.midX, y: imageClip.bounds.midY) }
+        let p = Tokens.Space.x8
+        // The clip isn't flipped: the icon sits a little above the middle, its site under it.
+        let nameHeight = siteName.lineHeight
+        let block = p + Tokens.Space.x2 + nameHeight
+        let bottom = (imageClip.bounds.height - block) / 2
+        placeholder.frame = NSRect(x: (imageClip.bounds.width - p) / 2, y: bottom + nameHeight + Tokens.Space.x2, width: p, height: p)
+        siteName.frame = NSRect(x: Tokens.Space.x2, y: bottom, width: imageClip.bounds.width - Tokens.Space.x4, height: nameHeight)
+        let cs = Tokens.Metric.compactIconButton
+        closeButton.frame = NSRect(x: imageClip.frame.maxX - cs - Tokens.Space.x2, y: imageClip.frame.minY + Tokens.Space.x2, width: cs, height: cs)
+        closeButton.radius = cs / 2
+        closeDisc.frame = closeButton.frame
+        closeDisc.layer?.cornerRadius = cs / 2
+        icon.isHidden = !showsTitle
+        title.isHidden = !showsTitle
+        icon2.isHidden = !showsTitle || partner == nil
+        title2.isHidden = !showsTitle || partner == nil
+        // One title under the card, or with a split, each page's under its own side; stacked pages share the row.
+        let audio = showsTitle ? audioTab : nil
+        audioButton.isHidden = audio == nil
+        if partner != nil {
+            let share = shape.map { $0.isStacked ? 0.5 : $0.column } ?? 0.5
+            let first = round(imageClip.frame.width * share)
+            let leftSide = NSRect(x: imageClip.frame.minX, y: imageClip.frame.maxY, width: first, height: titleArea)
+            let rightSide = NSRect(x: imageClip.frame.minX + first, y: imageClip.frame.maxY, width: imageClip.frame.width - first, height: titleArea)
+            // The card's own page on the right (a pinned page left of it has no card of its own): its title too.
+            let ownOnRight = shape.map { !$0.isStacked && $0.regions.first == .right } ?? false
+            place(icon, title, in: ownOnRight ? rightSide : leftSide, audio: audio === tab)
+            place(icon2, title2, in: ownOnRight ? leftSide : rightSide, audio: audio != nil && audio === partner)
+        } else {
+            place(icon, title, in: NSRect(x: inset, y: imageClip.frame.maxY, width: bounds.width - inset * 2, height: titleArea), audio: audio != nil)
+        }
+        Tokens.Motion.withoutAnimation {
+            let around = Tokens.Space.x1
+            ring.frame = imageClip.frame.insetBy(dx: -around, dy: -around)
+            ring.cornerRadius = Tokens.Radius.thumbnail + around
+        }
+        refreshColors()
+    }
+
+    /// An icon and title, centered together in `area`, with the speaker after them when `audio`.
+    private func place(_ icon: FaviconView, _ title: Label, in area: NSRect, audio: Bool = false) {
+        let iconSize = Tokens.Metric.favicon
+        let speaker = audio ? Tokens.Space.x1 + Tokens.Metric.compactIconButton : 0
+        let textWidth = max(0, min(title.textWidth, area.width - iconSize - Tokens.Space.x2 - Tokens.Space.x2 - speaker))
+        let total = iconSize + Tokens.Space.x2 + textWidth + speaker
+        let x = area.minX + max(Tokens.Space.x1, (area.width - total) / 2)
+        icon.frame = NSRect(x: x, y: area.minY + (area.height - iconSize) / 2, width: iconSize, height: iconSize)
+        let h = title.lineHeight
+        title.frame = NSRect(x: icon.frame.maxX + Tokens.Space.x2, y: area.minY + (area.height - h) / 2, width: textWidth, height: h)
+        if audio {
+            let size = Tokens.Metric.compactIconButton
+            audioButton.frame = NSRect(x: title.frame.maxX + Tokens.Space.x1, y: area.minY + (area.height - size) / 2, width: size, height: size)
+        }
+    }
+
+    override func stateDidChange(animated: Bool) {
+        closeButton.isHidden = onClose == nil || !isHovered
+        closeDisc.isHidden = closeButton.isHidden
+        refreshColors()
+    }
+
+    private func refreshColors() {
+        Tokens.Motion.withoutAnimation {
+            // With no picture yet, a soft wash of the space instead of a blank white page.
+            let empty = !placeholder.isHidden
+            imageClip.layer?.backgroundColor = cgColor(empty ? Brand.Theme.for(self).wash : Tokens.Color.cardBackground)
+            imageClip.layer?.borderColor = cgColor(Tokens.Color.cardEdge)
+            picture.dividerColor = cgColor(Tokens.Color.cardEdge)
+            let selected = isSelected && showsRing
+            ring.borderColor = cgColor(selected ? Tokens.Color.accent : Tokens.Color.accent.withAlphaComponent(0.6))
+            ring.borderWidth = selected ? 2.5 : 2
+            ring.isHidden = !(selected || isFocused)
+        }
+        // The chosen card (Control+Tab's, or the desk's current tab) is the soft card; hover is the row hover.
+        let hovered = isHovered && showsHover
+        let card = (isSelected && !showsRing) || isCurrent
+        let fill: NSColor? = card ? (hovered ? Tokens.Color.selectedHoverFill : Tokens.Color.selectedFill)
+            : hovered ? Tokens.Color.hoverFill : nil
+        layer?.set(backgroundColor: fill.map { cgColor($0) }, animated: false)
+        setLifted(card)
+    }
+}
+
+/// Control+Tab: big thumbnails of recent tabs, like Command+Tab for apps.
+/// Hold Control, press Tab to step through, let go to switch.
+final class TabSwitcher {
+    private weak var controller: BrowserWindowController?
+    private let panel = FloatingPanelView()
+    private var thumbs: [TabThumbnailView] = []
+    private var tabs: [Tab] = []
+    private var index = 0
+    /// Cards in a row, for ↑ and ↓.
+    private var columns = 1
+    private(set) var isActive = false
+
+    /// How many cards go in a row, and how wide each is: as big as the usual card when they fit side by side,
+    /// otherwise in rows, balanced, so titles stay readable instead of the row shrinking to slivers. Narrower only
+    /// when even that won't fit the window.
+    static func grid(count: Int, room: NSSize, aspect: CGFloat, chrome: CGFloat, gap: CGFloat = 0) -> (columns: Int, width: CGFloat) {
+        let full = Tokens.Metric.switcherThumbWidth, least = Tokens.Metric.switcherThumbMinWidth
+        guard count > 0, room.width > 0 else { return (1, full) }
+        let fits = max(1, Int((room.width + gap) / (least + gap)))
+        let rows = Int((Double(count) / Double(fits)).rounded(.up))
+        let columns = Int((Double(count) / Double(rows)).rounded(.up))
+        var width = min(full, floor((room.width - CGFloat(columns - 1) * gap) / CGFloat(columns)))
+        // Rows taller than the window: smaller cards, keeping their shape.
+        let tall = CGFloat(rows) * (width * aspect + chrome) + CGFloat(rows - 1) * gap
+        if tall > room.height {
+            let pictures = (room.height - CGFloat(rows - 1) * gap - CGFloat(rows) * chrome) / (CGFloat(rows) * aspect)
+            width = min(width, max(least * 0.6, floor(pictures)))
+        }
+        return (columns, width)
+    }
+
+    /// Where the panel goes: centered on the page beside the sidebar (the whole window with it hidden; a split's
+    /// two halves together), sized by `grid` to the page so it never spreads over the sidebar. A page too small for
+    /// even the smallest cards lends it some of the window, but it stays a step inside the window's edges.
+    static func panelFrame(size: NSSize, page: NSRect, window: NSRect) -> NSRect {
+        let edge = Tokens.Space.x2
+        let x = min(max(window.minX + edge, round(page.midX - size.width / 2)), window.maxX - edge - size.width)
+        let y = min(max(window.minY + edge, round(page.midY - size.height / 2)), window.maxY - edge - size.height)
+        return NSRect(x: max(window.minX, x), y: max(window.minY, y), width: size.width, height: size.height)
+    }
+
+    /// The room the cards have on a page: the page less a margin all round, as Command+Tab keeps off the screen's edges.
+    static func room(on page: NSRect, pad: CGFloat) -> NSSize {
+        let margin = Tokens.Space.x8
+        return NSSize(width: max(0, page.width - margin * 2 - pad * 2), height: max(0, page.height - margin * 2 - pad * 2))
+    }
+    private var shown = false
+    private var showWork: DispatchWorkItem?
+
+    /// Settings › Tabs › ⌃Tab switches to: recent tabs (Arc's default, this switcher) or the next row in the sidebar.
+    enum Order: String, CaseIterable { case recent, sidebar }
+    static let orderKey = "ControlTabOrder"
+    static var order: Order {
+        get { UserDefaults.standard.string(forKey: orderKey).flatMap(Order.init(rawValue:)) ?? .recent }
+        set { UserDefaults.standard.set(newValue.rawValue, forKey: orderKey) }
+    }
+
+    init(controller: BrowserWindowController) {
+        self.controller = controller
+        // The cards' corners plus the step between them and the panel's edge.
+        panel.radius = Tokens.Radius.thumbnail + Tokens.Space.x1 * 2
+    }
+
+    enum Ending: Equatable { case cancel, commit, letGo }
+
+    /// A key that ends the switcher. Esc and Return always belong to it, so nothing underneath (Reader, find,
+    /// full-screen pages) also gets them. Any other key with Control released unseen (in another app) ends it and
+    /// passes through.
+    static func ending(keyCode: UInt16, controlHeld: Bool) -> Ending? {
+        switch keyCode {
+        case 53 /* esc */: .cancel
+        case 36, 76 /* return, enter */: .commit
+        default: controlHeld ? nil : .letGo
+        }
+    }
+
+    /// Returns true if the event was handled.
+    func handle(_ event: NSEvent) -> Bool {
+        switch event.type {
+        case .keyDown:
+            if isActive, let ending = Self.ending(keyCode: event.keyCode, controlHeld: event.modifierFlags.contains(.control)) {
+                switch ending {
+                case .cancel: cancel(); return true
+                case .commit: commit(); return true
+                case .letGo: cancel(); return false
+                }
+            }
+            guard event.keyCode == 48 /* tab */, event.modifierFlags.contains(.control) else {
+                guard isActive else { return false }
+                // While it's up, the arrows step through the tabs and Return switches, as well as letting go.
+                switch event.keyCode {
+                case 123 /* ← */: step(-1)
+                case 124 /* → */: step(1)
+                // Up and down by rows once the cards are on screen; the last row may be shorter, so down lands on its end.
+                case 126 /* ↑ */: if shown, index - columns >= 0 { index -= columns; updateSelection() }
+                case 125 /* ↓ */: if shown, index / columns < (tabs.count - 1) / columns { index = min(index + columns, tabs.count - 1); updateSelection() }
+                default: break
+                }
+                return true
+            }
+            let backwards = event.modifierFlags.contains(.shift)
+            if !isActive, Self.order == .sidebar {
+                controller?.selectAdjacentRow(by: backwards ? -1 : 1)
+                return true
+            }
+            if !isActive { begin(backwards: backwards) } else { step(backwards ? -1 : 1) }
+            return true
+        case .flagsChanged:
+            if isActive, !event.modifierFlags.contains(.control) { commit(); return true }
+            return false
+        default:
+            return false
+        }
+    }
+
+    private func begin(backwards: Bool) {
+        guard let controller else { return }
+        let manager = controller.tabManager
+        // A split is one card, as on the desk: the half you were on last stands for both.
+        var seen: Set<UUID> = []
+        tabs = Array(manager.recentTabs.filter { tab in
+            defer { seen.insert(tab.id) }
+            return !manager.partners(of: tab).contains { seen.contains($0.id) }
+        }.prefix(9))
+        guard tabs.count > 1 else { return }
+        controller.tabManager.selectedTab?.captureSnapshot()
+        isActive = true
+        index = backwards ? tabs.count - 1 : 1
+        // A quick Control+Tab switches without flashing any UI, like Command+Tab.
+        let work = DispatchWorkItem { [weak self] in MainActor.assumeIsolated { self?.show() } }
+        showWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.12, execute: work)
+    }
+
+    private func show() {
+        guard isActive, let controller else { return }
+        shown = true
+        thumbs.forEach { $0.removeFromSuperview() }
+        let card = controller.root.cardFrame
+        let aspect = min(max(card.height / max(card.width, 1), 0.5), 0.8)
+        // Cards side by side, the panel a step in from them: panel, card and picture corners run together.
+        let pad = Tokens.Space.x1
+        let inset = Tokens.Space.x1
+        // A little air between cards, so a grid of busy pages still reads as separate pages.
+        let gap = Tokens.Space.x2
+        // On the page beside the sidebar: more tabs go into rows, and smaller cards, before reaching over it.
+        let grid = Self.grid(count: tabs.count, room: Self.room(on: card, pad: pad),
+                             aspect: aspect, chrome: TabThumbnailView.titleHeight + inset * 2, gap: gap)
+        columns = grid.columns
+        let thumbWidth = grid.width
+        let thumbHeight = round((thumbWidth - inset * 2) * aspect) + TabThumbnailView.titleHeight + inset
+        let rows = Int((Double(tabs.count) / Double(grid.columns)).rounded(.up))
+        let across = min(tabs.count, grid.columns)
+        let width = pad * 2 + CGFloat(across) * thumbWidth + CGFloat(across - 1) * gap
+        thumbs = tabs.enumerated().map { i, tab in
+            let thumb = TabThumbnailView()
+            let pages = controller.tabManager.panes(of: tab)
+            if let pair = controller.tabManager.split(for: tab), pages.count == pair.count {
+                thumb.configure(pages[0], partners: Array(pages.dropFirst()), shape: pair.shape)
+            } else {
+                thumb.configure(tab)
+            }
+            thumb.showsHover = false
+            // The chosen card is ringed, as in the tab overview: among a few rows of colorful pages a soft fill is easy to lose.
+            thumb.showsRing = true
+            // Row by row, most recent first; a shorter last row sits in the middle, as text centers.
+            let row = i / grid.columns, column = i % grid.columns
+            let inRow = row == rows - 1 ? tabs.count - row * grid.columns : grid.columns
+            let lead = (width - pad * 2 - CGFloat(inRow) * thumbWidth - CGFloat(inRow - 1) * gap) / 2
+            thumb.frame = NSRect(x: pad + lead + CGFloat(column) * (thumbWidth + gap), y: pad + CGFloat(row) * (thumbHeight + gap), width: thumbWidth, height: thumbHeight)
+            thumb.onClick = { [weak self] _ in self?.index = i; self?.commit() }
+            panel.addSubview(thumb)
+            return thumb
+        }
+        let height = pad * 2 + CGFloat(rows) * thumbHeight + CGFloat(rows - 1) * gap
+        panel.frame = Self.panelFrame(size: NSSize(width: width, height: height), page: card, window: controller.root.overlay.bounds)
+        controller.root.overlay.addSubview(panel)
+        // Flicked through with ⌃Tab many times an hour: simply there.
+        panel.present(arrival: .instant)
+        updateSelection()
+    }
+
+    private func step(_ delta: Int) {
+        guard isActive else { return }
+        index = (index + delta + tabs.count) % tabs.count
+        updateSelection()
+    }
+
+    private func updateSelection() {
+        for (i, thumb) in thumbs.enumerated() { thumb.isSelected = i == index }
+    }
+
+    private func commit() {
+        guard isActive else { return }
+        let target = tabs.indices.contains(index) ? tabs[index] : nil
+        finish()
+        // Closed while the switcher was up: nothing to switch to.
+        if let target, let manager = controller?.tabManager, manager.tab(with: target.id) === target { manager.select(target) }
+    }
+
+    private func cancel() { finish() }
+
+    /// The window lost focus mid-switch (⌘Tab away): put it away, staying on the current tab.
+    func windowResignedKey() { if isActive { cancel() } }
+
+    private func finish() {
+        isActive = false
+        showWork?.cancel()
+        // Letting go of Control is a key event of its own (flags changed), so the switcher simply goes.
+        if shown { panel.dismiss(instantly: true) }
+        shown = false
+    }
+}

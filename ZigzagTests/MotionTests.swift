@@ -1,0 +1,226 @@
+import AppKit
+import Testing
+@testable import Zigzag
+
+/// How things show up and go (`Tokens.Motion.present`): how long, from where, and how a quick turn around carries on
+/// from what's on screen.
+struct MotionTests {
+    typealias Motion = Tokens.Motion
+
+    /// Where a point of a layer (0 to 1 from its top left, in a flipped superview) lands under `t`.
+    private func land(_ point: CGPoint, of size: CGSize, anchor: CGPoint, under t: CATransform3D) -> CGPoint {
+        let p = CGPoint(x: (point.x - anchor.x) * size.width, y: (point.y - anchor.y) * size.height)
+        return CGPoint(x: p.x * t.m11 + p.y * t.m21 + t.m41, y: p.x * t.m12 + p.y * t.m22 + t.m42)
+    }
+
+    @Test func exitsAreQuickerThanEntrances() {
+        for origin: Motion.Origin in [.point(.zero), .offstage(.minY, 80), .inPlace] {
+            let enter = Motion.presenceDuration(origin, entering: true, reduceMotion: false)
+            let exit = Motion.presenceDuration(origin, entering: false, reduceMotion: false)
+            #expect(exit < enter)
+            // Two thirds to three quarters, and nothing past the ceiling for UI.
+            #expect(exit / enter > 0.6 && exit / enter < 0.8)
+            #expect(enter <= Motion.large)
+        }
+        #expect(Motion.presenceDuration(.point(.zero), entering: true, reduceMotion: false) == Motion.enter)
+        // What hangs from an edge (a toast, the find bar) lifts back at the pace it dropped in.
+        #expect(Motion.presenceDuration(.edge(.minY), entering: false, reduceMotion: false) == Motion.presenceDuration(.edge(.minY), entering: true, reduceMotion: false))
+        #expect(Motion.presenceDuration(.offstage(.minY, 80), entering: true, reduceMotion: false) == Motion.noticeIn)
+    }
+
+    /// The five roles every animation plays (DESIGN.md › Motion).
+    @Test func everyRoleHasItsPlaceAndPace() {
+        #expect(Motion.Role.allCases == [.feedback, .state, .present, .drawer, .large])
+        let feedback = Motion.Role.feedback.duration(entering: true, reduceMotion: false)
+        let state = Motion.Role.state.duration(reduceMotion: false)
+        let enter = Motion.Role.present.duration(entering: true, reduceMotion: false)
+        let exit = Motion.Role.present.duration(entering: false, reduceMotion: false)
+        let drawerIn = Motion.Role.drawer.duration(entering: true, reduceMotion: false)
+        let drawerOut = Motion.Role.drawer.duration(entering: false, reduceMotion: false)
+        let large = Motion.Role.large.duration(reduceMotion: false)
+        // Hover and press: about a tenth of a second; a small change a touch longer; panels longer again.
+        #expect(feedback >= 0.08 && feedback <= 0.12)
+        #expect(Motion.Role.feedback.duration(entering: false, reduceMotion: false) <= 0.12)
+        #expect(state >= 0.15 && state <= 0.18)
+        #expect(enter >= 0.18 && enter <= 0.2)
+        #expect(exit >= 0.12 && exit <= 0.15)
+        #expect(drawerIn == 0.26 && drawerOut == 0.2)
+        // Under 300ms, the ceiling for every role.
+        #expect(large >= 0.25 && large < 0.3)
+        for role in Motion.Role.allCases {
+            #expect(role.duration(entering: true, reduceMotion: false) <= large)
+            #expect(role.duration(entering: false, reduceMotion: false) <= large)
+        }
+        // What shows up leaves quicker than it came. (A press lets go a touch slower than it went down, to settle.)
+        #expect(exit < enter && drawerOut < drawerIn)
+        // One family of curves: the ease-out for what answers or appears, the drawer's for what travels.
+        #expect(Motion.Role.feedback.timing === Motion.easeOut)
+        #expect(Motion.Role.state.timing === Motion.easeOut)
+        #expect(Motion.Role.present.timing === Motion.easeOut)
+        #expect(Motion.Role.drawer.timing === Motion.drawer)
+        #expect(Motion.Role.large.timing === Motion.drawer)
+        // The names the app uses are the roles.
+        #expect(Motion.quick == feedback && Motion.pressIn == feedback)
+        #expect(Motion.selection == state && Motion.highlightGlide == state && Motion.hoverFade == state)
+        #expect(Motion.standard == drawerOut && Motion.zoom == large)
+        #expect(Motion.edgeSlide.duration == drawerIn && Motion.edgeTuck.duration == drawerOut)
+        #expect(Motion.spaceSwitch.duration == large && Motion.gentle.duration == large)
+        #expect(Motion.noticeIn == drawerIn && Motion.noticeOut == drawerOut)
+        // Nothing springs except a swipe let go mid-move.
+        for curve in [Motion.feedback, Motion.change, Motion.snappy, Motion.edgeSlide, Motion.edgeTuck, Motion.snap,
+                      Motion.spaceSwitch, Motion.gentle, Motion.entering, Motion.leaving, Motion.crossfading] {
+            #expect(curve.bounce == nil)
+        }
+        #expect(Motion.swipeSettle.bounce == 0)
+    }
+
+    @Test func reduceMotionMakesEveryRoleInstantOrACrossfade() {
+        #expect(Motion.crossfade > 0 && Motion.crossfade <= 0.15)
+        for role in Motion.Role.allCases {
+            for entering in [true, false] {
+                let reduced = role.duration(entering: entering, reduceMotion: true)
+                #expect(reduced == 0 || reduced == Motion.crossfade)
+            }
+        }
+        // A press doesn't move at all; whatever else showed movement only crossfades.
+        #expect(Motion.Role.feedback.duration(reduceMotion: true) == 0)
+        #expect(Motion.Role.drawer.duration(reduceMotion: true) == Motion.crossfade)
+        #expect(Motion.Role.large.duration(reduceMotion: true) == Motion.crossfade)
+    }
+
+    @Test func reduceMotionOnlyCrossfades() {
+        for origin: Motion.Origin in [.point(.zero), .edge(.minY), .offstage(.minY, 80)] {
+            #expect(Motion.presenceDuration(origin, entering: true, reduceMotion: true) == Motion.crossfade)
+            #expect(Motion.presenceDuration(origin, entering: false, reduceMotion: true) == Motion.crossfade)
+        }
+    }
+
+    @Test func growsAroundTheControlThatOpenedIt() {
+        let size = CGSize(width: 200, height: 120)
+        for anchor in [CGPoint.zero, CGPoint(x: 0.5, y: 0.5)] {
+            for point in [CGPoint(x: 0, y: 0), CGPoint(x: 1, y: 0), CGPoint(x: 0.3, y: 1), CGPoint(x: 0.5, y: 0.7)] {
+                let t = Motion.hiddenTransform(.point(point), entering: true, size: size, anchor: anchor, flipped: true)
+                #expect(abs(t.m11 - Motion.enterScale) < 0.0001)
+                // The control's point stays put; everything else draws in toward it.
+                let at = land(point, of: size, anchor: anchor, under: t)
+                let expected = CGPoint(x: (point.x - anchor.x) * size.width, y: (point.y - anchor.y) * size.height)
+                #expect(abs(at.x - expected.x) < 0.001 && abs(at.y - expected.y) < 0.001)
+            }
+        }
+        // Leaving, it shrinks less than it grew.
+        let out = Motion.hiddenTransform(.point(.zero), entering: false, size: size, anchor: .zero, flipped: true)
+        #expect(abs(out.m11 - Motion.exitScale) < 0.0001)
+        #expect(Motion.exitScale > Motion.enterScale && Motion.enterScale >= 0.96)
+    }
+
+    @Test func slidesFromTheEdgeItHangsFrom() {
+        let size = CGSize(width: 300, height: 36)
+        // The top as you look at it: up in a flipped superview (y runs down), down the axis in an unflipped one.
+        let flipped = Motion.hiddenTransform(.edge(.minY), entering: true, size: size, anchor: .zero, flipped: true)
+        #expect(flipped.m42 == -Motion.edgeOffset && flipped.m41 == 0 && flipped.m11 == 1)
+        let unflipped = Motion.hiddenTransform(.edge(.minY), entering: true, size: size, anchor: .zero, flipped: false)
+        #expect(unflipped.m42 == Motion.edgeOffset)
+        let bottom = Motion.hiddenTransform(.edge(.maxY), entering: true, size: size, anchor: .zero, flipped: true)
+        #expect(bottom.m42 == Motion.edgeOffset)
+        // It leaves back the way it came, as far as it dropped.
+        let leaving = Motion.hiddenTransform(.edge(.minY), entering: false, size: size, anchor: .zero, flipped: true)
+        #expect(leaving.m42 == -Motion.edgeOffset)
+        #expect(Motion.edgeOffset >= 4 && Motion.edgeOffset <= 8)
+        // A notice goes all the way back out past the window's edge.
+        let notice = Motion.hiddenTransform(.offstage(.minY, 90), entering: false, size: size, anchor: .zero, flipped: true)
+        #expect(notice.m42 == -90)
+        #expect(CATransform3DIsIdentity(Motion.hiddenTransform(.inPlace, entering: true, size: size, anchor: .zero, flipped: true)))
+    }
+
+    @Test func turningAroundTakesOnlyWhatsLeft() {
+        let full = Motion.enter
+        // Closed when it had just begun to show: reopening takes nearly the whole way; nearly shown, almost nothing.
+        #expect(abs(Motion.remainingDuration(full, shownOpacity: 0.1, entering: true) - full * 0.9) < 0.0001)
+        #expect(abs(Motion.remainingDuration(full, shownOpacity: 0.75, entering: true) - full * 0.25) < 0.0001)
+        // Leaving while half shown: half the exit.
+        #expect(abs(Motion.remainingDuration(Motion.exit, shownOpacity: 0.5, entering: false) - Motion.exit * 0.5) < 0.0001)
+        // Already there: nothing left to animate.
+        #expect(Motion.remainingDuration(full, shownOpacity: 1, entering: true) == 0)
+        #expect(Motion.remainingDuration(Motion.exit, shownOpacity: 0, entering: false) == 0)
+        // A sliver left still moves for a frame or two instead of snapping.
+        #expect(Motion.remainingDuration(full, shownOpacity: 0.95, entering: true) >= 0.04)
+        // Never longer than the full change.
+        #expect(Motion.remainingDuration(full, shownOpacity: -1, entering: true) <= full)
+    }
+
+    @MainActor @Test func aPanelOpenedTwiceFastTurnsAroundFromWhereItIs() {
+        let host = FlippedView(frame: NSRect(x: 0, y: 0, width: 400, height: 300))
+        host.wantsLayer = true
+        let panel = FloatingPanelView(frame: NSRect(x: 20, y: 20, width: 200, height: 40))
+        host.addSubview(panel)
+        panel.attachedEdge = .minY
+        panel.present()
+        #expect(panel.layer?.animation(forKey: "presence.opacity") != nil)
+        #expect(panel.layer?.opacity == 1)
+        panel.dismiss()
+        #expect(panel.dismissing)
+        #expect(panel.layer?.opacity == 0)
+        // Shown again before the exit finished: it stays, and is on its way back in.
+        panel.present()
+        #expect(!panel.dismissing)
+        #expect(panel.superview === host)
+        #expect(panel.layer?.opacity == 1)
+        // Shown at once: nothing left moving.
+        panel.present(arrival: .instant)
+        #expect(panel.layer?.animation(forKey: "presence.opacity") == nil)
+        #expect(panel.layer?.animation(forKey: "presence.transform") == nil)
+        // Sent off at once: gone.
+        panel.dismiss(instantly: true)
+        #expect(panel.superview == nil)
+        #expect(panel.layer?.opacity == 1)
+    }
+
+    @MainActor @Test func aLeavingPanelLetsClicksThrough() {
+        let host = FlippedView(frame: NSRect(x: 0, y: 0, width: 400, height: 300))
+        host.wantsLayer = true
+        let panel = FloatingPanelView(frame: NSRect(x: 20, y: 20, width: 200, height: 40))
+        host.addSubview(panel)
+        let inside = NSPoint(x: 40, y: 30)
+        panel.present()
+        #expect(panel.hitTest(inside) != nil)
+        // While dismissing it's still drawn but clicks pass through.
+        panel.dismiss()
+        #expect(panel.superview === host)
+        #expect(panel.hitTest(inside) == nil)
+        // Shown again while leaving: takes clicks again.
+        panel.present()
+        #expect(panel.hitTest(inside) != nil)
+    }
+
+    @MainActor @Test func aScrimGoingLetsClicksThroughAndTurnsAround() {
+        let host = FlippedView(frame: NSRect(x: 0, y: 0, width: 400, height: 300))
+        host.wantsLayer = true
+        let scrim = ScrimView()
+        scrim.frame = host.bounds
+        host.addSubview(scrim)
+        let inside = NSPoint(x: 100, y: 100)
+        scrim.show(evenFromKeyboard: true)
+        #expect(scrim.hitTest(inside) != nil)
+        scrim.hide(evenFromKeyboard: true)
+        #expect(scrim.hitTest(inside) == nil)
+        // Shown again mid-fade: fully visible, taking clicks.
+        scrim.show(animated: false)
+        #expect(scrim.alphaValue == 1)
+        #expect(scrim.hitTest(inside) != nil)
+    }
+
+    @MainActor @Test func aFieldsMenuGrowsOutOfItsField() {
+        let host = FlippedView(frame: NSRect(x: 0, y: 0, width: 400, height: 300))
+        let field = NSRect(x: 40, y: 40, width: 120, height: 24)
+        // Below the field: arrow out of its top, centered on the field.
+        let below = FloatingPanelView(frame: NSRect(x: 40, y: 68, width: 240, height: 100))
+        host.addSubview(below)
+        below.grow(from: field)
+        #expect(below.growsFrom == CGPoint(x: 0.25, y: 0))
+        // No room below, so above: arrow out of its bottom.
+        let above = FloatingPanelView(frame: NSRect(x: 40, y: -64, width: 240, height: 100))
+        host.addSubview(above)
+        above.grow(from: field)
+        #expect(above.growsFrom.y == 1)
+    }
+}

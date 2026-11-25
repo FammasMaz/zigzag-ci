@@ -1,0 +1,947 @@
+import AppKit
+
+/// Favorites: a grid of icon tiles under the address, the same in every space.
+final class FavoritesView: NSView {
+    var onOpen: ((Bookmark) -> Void)?
+    var onMenu: ((Bookmark) -> NSMenu?)?
+    /// The × on an open favorite: unloads its page, the favorite stays.
+    var onClose: ((Bookmark) -> Void)?
+    private var tiles: [FavoriteTile] = []
+    #if DEBUG
+    func debugTiles() -> [(String, NSRect)] {
+        guard let window else { return [] }
+        return tiles.map { tile in
+            ("fav:" + ([tile.bookmark?.title] + tile.partners.map(\.title)).compactMap { $0 }.joined(separator: "|"),
+             tile.convert(tile.bounds, to: nil).flippedIn(window))
+        }
+    }
+    #endif
+
+    /// The first favorite: an empty tile in the empty grid shows where it will be.
+    private let dropTile = FavoriteTile(bookmark: nil)
+    /// Where a tab carried over the grid would go between tiles, as the tab list shows it with a line.
+    private let dropBar = ColorView(color: Tokens.Color.accent)
+    /// While a tab or pinned page is carried over the grid. As in the tab list, nothing moves: a bar shows where it
+    /// would go, and the middle of a tile offers to open the two side by side as one favorite.
+    var isDropTarget = false {
+        didSet {
+            guard oldValue != isDropTarget else { return }
+            if !isDropTarget {
+                scrollNearEdge(at: nil)
+                dropIndex = nil
+                showSplit(nil)
+                dropBar.isHidden = true
+            }
+            dropTile.isHidden = !(isDropTarget && tiles.isEmpty)
+            if tiles.isEmpty {
+                onHeightChange?()
+                relayout(gliding: false)
+            }
+        }
+    }
+    /// Where among the tiles it would land; nil: at the end.
+    private(set) var dropIndex: Int?
+    /// The favorite whose middle it's over, and on which side it would open.
+    private(set) var splitTarget: (id: UUID, onRight: Bool)?
+
+    /// Carried over the grid at this point (in window coordinates). `carrying`: what's carried, as one side of a
+    /// split (nil: it can't open beside a favorite).
+    func hoverDrop(at windowPoint: NSPoint, carrying: TabManager.SplitSide?) {
+        aim(at: convert(windowPoint, from: nil), carried: carrying, moving: nil)
+        scrollNearEdge(at: windowPoint) { [weak self] in
+            guard let self, self.isDropTarget else { return }
+            self.aim(at: self.convert(windowPoint, from: nil), carried: carrying, moving: nil)
+        }
+    }
+
+    /// How close to the grid's top or bottom a carried item scrolls it, while it's taller than its room.
+    static let edgeScrollZone: CGFloat = 16
+    private var edgeScrollTimer: Timer?
+
+    /// Held near the top or bottom of a grid that scrolls: it scrolls that way, a step a frame, `moved` after each.
+    /// Nil, or away from the edges: stops.
+    func scrollNearEdge(at windowPoint: NSPoint?, _ moved: @escaping () -> Void = {}) {
+        // What shows of the grid, without the room above it for a corner ×.
+        let top = enclosingScrollView?.contentInsets.top ?? 0
+        let visible = enclosingScrollView.map { scroll in
+            let clip = scroll.contentView.bounds
+            return NSRect(x: clip.minX, y: clip.minY + top, width: clip.width, height: clip.height - top)
+        } ?? visibleRect
+        var direction: CGFloat = 0
+        if let windowPoint, let clip = enclosingScrollView?.contentView, bounds.height > visible.height + 1 {
+            let y = convert(windowPoint, from: nil).y
+            let zone = Self.edgeScrollZone
+            if y < visible.minY + zone, y > visible.minY - zone, visible.minY > 0 { direction = -1 }
+            if y > visible.maxY - zone, y < visible.maxY + zone, visible.maxY < bounds.height { direction = 1 }
+            if direction != 0 {
+                guard edgeScrollTimer == nil else { edgeScrollDirection = direction; edgeScrollMoved = moved; return }
+                edgeScrollDirection = direction
+                edgeScrollMoved = moved
+                let timer = Timer(timeInterval: 1.0 / 60, repeats: true) { [weak self, weak clip] _ in
+                    MainActor.assumeIsolated {
+                        guard let self, let clip, let scroll = self.enclosingScrollView else { return }
+                        let limit = max(-top, self.bounds.height - clip.bounds.height)
+                        let y = min(max(clip.bounds.minY + self.edgeScrollDirection * 4, -top), limit)
+                        guard y != clip.bounds.minY else { self.scrollNearEdge(at: nil); return }
+                        clip.scroll(to: NSPoint(x: 0, y: y))
+                        scroll.reflectScrolledClipView(clip)
+                        self.edgeScrollMoved()
+                    }
+                }
+                RunLoop.main.add(timer, forMode: .common)
+                edgeScrollTimer = timer
+                return
+            }
+        }
+        edgeScrollTimer?.invalidate()
+        edgeScrollTimer = nil
+    }
+    private var edgeScrollDirection: CGFloat = 0
+    private var edgeScrollMoved: () -> Void = {}
+
+    /// Where something carried over the grid would go, from a point in this view: beside a favorite as a split, or
+    /// between two. `moving`: a favorite of this grid being moved, which stays where it is meanwhile.
+    private func aim(at point: NSPoint, carried: TabManager.SplitSide?, moving: FavoriteTile?) {
+        guard !tiles.isEmpty else { dropIndex = 0; return }
+        // Most of a tile, away from its edges, is for a split.
+        let middle = tiles.first { tile in
+            guard tile !== moving, let carried, tile.frame.insetBy(dx: tile.frame.width * 0.2, dy: tile.frame.height * 0.2).contains(point) else { return false }
+            return TabManager.canSplit(carried, onto: TabManager.SplitSide(kind: .favorite, inSplit: !tile.partners.isEmpty))
+        }
+        if let middle, let id = middle.bookmark?.id {
+            showSplit((id, point.x > middle.frame.midX))
+            dropBar.isHidden = true
+            return
+        }
+        showSplit(nil)
+        // The row of tiles at the pointer's height, and the slot in it by which tiles' middles it's past.
+        let row = tiles.filter { point.y >= $0.frame.minY - Tokens.Space.x2 / 2 }.last.map { $0.frame.minY }
+        let rowStart = tiles.firstIndex { $0.frame.minY == row } ?? 0
+        dropIndex = rowStart + tiles[rowStart...].prefix { $0.frame.minY == row && $0.frame.midX < point.x }.count
+        // Next to where the carried favorite already is, it wouldn't move: no bar.
+        if let moving, let from = tiles.firstIndex(where: { $0 === moving }), dropIndex == from || dropIndex == from + 1 {
+            dropBar.isHidden = true
+            return
+        }
+        placeBar(at: dropIndex ?? tiles.count)
+    }
+
+    private func clearAim() {
+        dropIndex = nil
+        showSplit(nil)
+        dropBar.isHidden = true
+    }
+
+    private func showSplit(_ target: (id: UUID, onRight: Bool)?) {
+        splitTarget = target
+        for tile in tiles { tile.splitSide = tile.bookmark?.id == target?.id ? (target?.onRight == true ? 1 : 0) : nil }
+    }
+
+    /// The bar in the gap before tile `index` (after the last one for the end), the height of its row.
+    private func placeBar(at index: Int) {
+        let gap = Tokens.Space.x2
+        let x: CGFloat, row: NSRect
+        if index < tiles.count {
+            row = tiles[index].frame
+            let previous = index > 0 ? tiles[index - 1].frame : nil
+            x = previous.map { $0.minY == row.minY ? ($0.maxX + row.minX) / 2 : row.minX - gap / 2 } ?? row.minX - gap / 2
+        } else {
+            row = tiles.last?.frame ?? .zero
+            x = row.maxX + gap / 2
+        }
+        let width: CGFloat = 2
+        Tokens.Motion.withoutAnimation {
+            dropBar.frame = NSRect(x: min(max(x - width / 2, 0), bounds.width - width), y: row.minY + 6, width: width, height: row.height - 12)
+        }
+        dropBar.isHidden = false
+        addSubview(dropBar, positioned: .above, relativeTo: nil)
+    }
+
+    var onHeightChange: (() -> Void)?
+    /// A tile is being carried: where the pointer is, in screen points. Returns true while it's over the tab list,
+    /// where it would become a tab again.
+    var onDragMove: ((Bookmark, NSPoint) -> Bool)?
+    /// Dropped somewhere outside the grid: whether that did something, and the row it became, to land on.
+    var onDrop: ((Bookmark, NSPoint) -> (handled: Bool, landing: NSView?))?
+    /// The drag is over, dropped or called off with Esc (true).
+    var onDragEnd: ((Bool) -> Void)?
+    var onReorder: ((Bookmark, Int) -> Void)?
+    /// A favorite dropped on another's middle: the two become one, side by side (`onRight`: the carried one right).
+    var onJoin: ((Bookmark, UUID, Bool) -> Void)?
+
+    static var tileHeight: CGFloat { Tokens.Sidebar.favoriteHeight }
+
+    /// How many favorites to a row, a setting: 0 for as many as fit (`Sidebar.favoriteMinWidth`), or 2, 3 or 4.
+    static var perRow: Int {
+        get { UserDefaults.standard.integer(forKey: "FavoritesPerRow") }
+        set {
+            UserDefaults.standard.set(newValue, forKey: "FavoritesPerRow")
+            NotificationCenter.default.post(name: perRowChanged, object: nil)
+        }
+    }
+    static let perRowChanged = Notification.Name("FavoritesPerRowChanged")
+    static let perRowChoices = [0, 2, 3, 4]
+
+    /// The columns a grid this wide has for this many favorites: the chosen count, or, on Automatic, rows that look
+    /// whole. As few columns as fill every row, so tiles stay large; failing that, a last row of at least two, never
+    /// one tile left on its own. Tiles may narrow from their comfortable width to their tightest for that: four at the
+    /// usual width sit in one row rather than three and a lone one.
+    static func columns(for width: CGFloat, count: Int) -> Int {
+        if perRow > 0 { return perRow }
+        let gap = Tokens.Sidebar.favoriteGap
+        func fitting(_ tile: CGFloat) -> Int { min(max(Int((width + gap) / (tile + gap)), 2), Tokens.Sidebar.favoriteMaxColumns) }
+        let roomy = fitting(Tokens.Sidebar.favoriteMinWidth), tight = max(roomy, fitting(Tokens.Sidebar.favoriteTightWidth))
+        guard count > roomy else { return roomy }
+        if let whole = (roomy...tight).first(where: { count % $0 == 0 }) { return whole }
+        // Then fewer, larger columns; when every count leaves one over (13 does), the roomy one.
+        return (roomy...tight).first { count % $0 != 1 } ?? (2..<roomy).reversed().first { count % $0 != 1 } ?? roomy
+    }
+
+    /// The setting changing: the tiles glide to their new rows and widths, and the sidebar makes room.
+    private var perRowObserver: NSObjectProtocol?
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        wantsLayer = true
+        dropTile.isHidden = true
+        dropTile.isPlaceholder = true
+        addSubview(dropTile)
+        dropBar.wantsLayer = true
+        dropBar.layer?.cornerRadius = 1
+        dropBar.isHidden = true
+        addSubview(dropBar)
+        perRowObserver = NotificationCenter.default.addObserver(forName: Self.perRowChanged, object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                self.onHeightChange?()
+                self.relayout(gliding: true)
+            }
+        }
+        // Settings › Appearance › Sidebar size: the tiles take their new height and icons at once.
+        sizeObserver = NotificationCenter.default.addObserver(forName: Tokens.Sidebar.sizeChanged, object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                self.onHeightChange?()
+                self.relayout(gliding: false)
+                self.tiles.forEach { $0.needsLayout = true }
+            }
+        }
+    }
+    private var sizeObserver: NSObjectProtocol?
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    override var isFlipped: Bool { true }
+
+    /// A favorite's × hangs past its tile's corner, and past this grid's edge in the top row or last column.
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        let local = convert(point, from: superview)
+        for tile in tiles.reversed() { if let badge = tile.badgeHit(at: convert(local, to: tile)) { return badge } }
+        return super.hitTest(point)
+    }
+
+    private var tileCount: Int { tiles.count + (isDropTarget && tiles.isEmpty ? 1 : 0) }
+
+    /// How tall the grid is at its own width.
+    var preferredHeight: CGFloat { preferredHeight(for: bounds.width) }
+
+    /// How tall the grid is at a width: its rows of tiles and the gaps between them.
+    func preferredHeight(for width: CGFloat) -> CGFloat {
+        guard tileCount > 0 else { return 0 }
+        let columns = Self.columns(for: width, count: tileCount)
+        let rows = (tileCount + columns - 1) / columns
+        return CGFloat(rows) * Self.tileHeight + CGFloat(rows - 1) * Tokens.Sidebar.favoriteGap
+    }
+
+    /// One tile per favorite; a split favorite's two pages, or a tile group's three or four (#203), share one, each
+    /// part opening its own page (and the rest with it).
+    /// `tabs`: the favorites' tabs, by favorite; a tile is open only while one of its pages is loaded (#205).
+    func reload(favorites: [(Bookmark, partners: [Bookmark])], selectedID: UUID?, tabs: [UUID: Tab] = [:]) {
+        if tiles.map({ [$0.bookmark?.id] + $0.partners.map(\.id) }) != favorites.map({ [$0.0.id] + $0.partners.map(\.id) }) {
+            // The tiles that stay are the same tiles, gliding to their new places; a new one fades in where it lands
+            // and one that's gone fades out where it was.
+            let animated = window != nil && !tiles.isEmpty && !Tokens.Motion.isFromKey
+            var kept: [[UUID?]: FavoriteTile] = [:]
+            for tile in tiles { kept[[tile.bookmark?.id] + tile.partners.map(\.id)] = tile }
+            let wanted = Set(favorites.map { [$0.0.id] + $0.partners.map(\.id) as [UUID?] })
+            for (key, tile) in kept where !wanted.contains(key) {
+                kept[key] = nil
+                guard animated else { tile.removeFromSuperview(); continue }
+                Tokens.Motion.animate(Tokens.Motion.feedback, { tile.animator().alphaValue = 0 }, completion: { tile.removeFromSuperview() })
+            }
+            tiles = favorites.map { favorite, partners in
+                if let tile = kept[[favorite.id] + partners.map(\.id)] { return tile }
+                let tile = FavoriteTile(bookmark: favorite, partners: partners)
+                // Each reads the tile's favorite when it happens, never the one it was made with.
+                tile.onClick = { [weak self, weak tile] event in
+                    guard let self, let tile, let favorite = tile.bookmark else { return }
+                    self.onOpen?(tile.page(at: tile.convert(event.locationInWindow, from: nil)) ?? favorite)
+                }
+                tile.onRightClick = { [weak self, weak tile] _ in tile?.bookmark.flatMap { self?.onMenu?($0) } }
+                tile.onClose = { [weak self, weak tile] in if let favorite = tile?.bookmark { self?.onClose?(favorite) } }
+                tile.onMiddleClick = tile.onClose
+                tile.onDragStart = { [weak self, weak tile] event in
+                    guard let self, let tile, let favorite = tile.bookmark else { return false }
+                    self.drag(tile, favorite: favorite, event: event)
+                    return true
+                }
+                tile.dragsByTouch = true
+                addSubview(tile)
+                if animated {
+                    tile.alphaValue = 0
+                    DispatchQueue.main.async { Tokens.Motion.animate(Tokens.Motion.feedback) { tile.animator().alphaValue = 1 } }
+                }
+                return tile
+            }
+            relayout(gliding: animated)
+        }
+        for (tile, favorite) in zip(tiles, favorites) {
+            tile.update(favorite.0, partners: favorite.partners, regions: Library.shared.pinnedSplit(containing: favorite.0.id)?.regions)
+        }
+        for tile in tiles {
+            guard let id = tile.bookmark?.id else { continue }
+            let ids = [id] + tile.partners.map(\.id)
+            let wasSelected = tile.isSelected
+            tile.isSelected = selectedID.map(ids.contains) ?? false
+            // Opened from a key or the menu while scrolled out of the grid's room: it comes into view.
+            if tile.isSelected, !wasSelected { tile.scrollToVisible(tile.bounds) }
+            tile.track(tabs[id], partners: tile.partners.map { tabs[$0.id] })
+            tile.refreshIcon()
+        }
+    }
+
+    /// While ⌘ is held: each tile's number, by its favorite (the left page's, for a split one). Empty: none.
+    func showNumbers(_ numbers: [UUID: Int]) {
+        for tile in tiles { tile.number = tile.bookmark.flatMap { numbers[$0.id] } }
+    }
+
+    /// The tile showing a favorite (any page of a split or group one).
+    func tile(for bookmarkID: UUID) -> NSView? { tiles.first { $0.bookmark?.id == bookmarkID || $0.partners.contains { $0.id == bookmarkID } } }
+
+    /// Picks the tile up, as a row in the tab list is: it stays in its place, faint, and a see-through copy follows
+    /// the pointer. Over the grid a bar shows where it would go, and the middle of another favorite offers to open
+    /// the two side by side as one. Off the grid (the tab list, a space's dot) it's handed on; over the tab list the
+    /// copy turns into the row it would be there.
+    private func drag(_ tile: FavoriteTile, favorite: Bookmark, event: NSEvent) {
+        guard let window, let from = tiles.firstIndex(where: { $0 === tile }) else { return }
+        let start = window.convertPoint(toScreen: event.locationInWindow)
+        let row = TabRowView.carried(favorite, icon: tile.iconImage, partners: tile.partners, partnerIcons: tile.partnerIconImages)
+        let rowSize = NSSize(width: bounds.width, height: Tokens.Sidebar.rowHeight)
+        // As a row it's held just past its icon, as if it had been picked up there.
+        let rowGrab = NSPoint(x: Tokens.Sidebar.rowInset + Tokens.Sidebar.favicon + Tokens.Space.x1, y: rowSize.height / 2)
+        let copy = CarriedCopy(of: tile, picture: CarriedCopy.picture(of: tile), grabbedAt: start, ground: Tokens.Color.panelBackground,
+                               radius: Tokens.Sidebar.favoriteRadius, alternate: (row, rowSize, rowGrab, Tokens.Sidebar.rowRadius))
+        tile.alphaValue = CarriedCopy.faint
+        copy.lift()
+        let carried = TabManager.SplitSide(kind: .favorite, inSplit: !tile.partners.isEmpty)
+        var last = start
+        var inside = true
+        CarriedCopy.carry(in: window, moved: { event in
+            last = window.convertPoint(toScreen: event.locationInWindow)
+            copy.follow(last)
+            let local = self.convert(window.convertPoint(fromScreen: last), from: nil)
+            inside = self.visibleRect.insetBy(dx: 0, dy: -Tokens.Space.x2).contains(local)
+            if inside { self.aim(at: local, carried: carried, moving: tile) } else { self.clearAim() }
+            let point = window.convertPoint(fromScreen: last)
+            self.scrollNearEdge(at: inside ? point : nil) { [weak self] in
+                guard let self, let window = self.window else { return }
+                self.aim(at: self.convert(window.convertPoint(fromScreen: last), from: nil), carried: carried, moving: tile)
+            }
+            copy.showsAlternate = self.onDragMove?(favorite, last) ?? false
+        }) { released in
+            self.scrollNearEdge(at: nil)
+            let split = self.splitTarget, index = self.dropIndex
+            self.clearAim()
+            var landing: NSView? = tile
+            if released == nil {
+                copy.showsAlternate = false
+            } else if inside {
+                if let split {
+                    self.onJoin?(favorite, split.id, split.onRight)
+                } else {
+                    // The bar counts the carried favorite where it is; past it, everything is one place earlier.
+                    var slot = index ?? from
+                    if slot > from { slot -= 1 }
+                    if slot != from { self.onReorder?(favorite, slot) }
+                }
+                copy.showsAlternate = false
+                self.layoutSubtreeIfNeeded()
+                landing = self.tile(for: favorite.id)
+                landing?.scrollToVisible(landing?.bounds ?? .zero)
+            } else if let dropped = self.onDrop?(favorite, last), dropped.handled {
+                landing = dropped.landing
+            } else {
+                copy.showsAlternate = false
+            }
+            self.onDragEnd?(released == nil)
+            tile.alphaValue = 1
+            copy.land(on: landing)
+        }
+    }
+
+    /// While true, tiles already in place slide to their new places instead of jumping there.
+    private var glides = false
+
+    private func relayout(gliding: Bool) {
+        glides = gliding && window != nil
+        needsLayout = true
+        layoutSubtreeIfNeeded()
+        glides = false
+    }
+
+    override func layout() {
+        super.layout()
+        var all = tiles
+        if isDropTarget, tiles.isEmpty { all.append(dropTile) }
+        let gap = Tokens.Sidebar.favoriteGap
+        // As many columns as fit or were chosen, every tile one size, a shorter last row from the left. A lone
+        // favorite is never wider than two would be: half the row, not a long bar around a small icon.
+        let columns = max(2, min(Self.columns(for: bounds.width, count: all.count), all.count))
+        let width = (bounds.width - gap * CGFloat(columns - 1)) / CGFloat(columns)
+        for (i, tile) in all.enumerated() {
+            let row = i / columns, column = i % columns
+            let frame = NSRect(x: (width + gap) * CGFloat(column), y: (Self.tileHeight + gap) * CGFloat(row),
+                               width: width, height: Self.tileHeight).integral
+            if glides, tile !== dropTile, tile.frame.width > 0, tile.frame.size == frame.size {
+                Tokens.Motion.glide(tile, to: frame)
+            } else if glides, tile !== dropTile, tile.frame.width > 0, !Tokens.Motion.reduceMotion {
+                // A row gaining or losing a column: the tiles change width as they move, in the same stride.
+                NSAnimationContext.runAnimationGroup { context in
+                    context.duration = Tokens.Motion.standard
+                    context.timingFunction = Tokens.Motion.drawer
+                    tile.animator().frame = frame
+                }
+            } else {
+                tile.frame = frame
+            }
+        }
+    }
+}
+
+/// A favorite: a soft gray tile with the site's icon, a split's two icons side by side, or a tile group's three or
+/// four small icons placed as its pages are on screen (#203).
+final class FavoriteTile: InteractiveView {
+    /// The favorite as it is now: renamed or moved to another address, the same tile shows and opens the new one.
+    private(set) var bookmark: Bookmark?
+    /// A split favorite's other page, or a tile group's other pages, in order, shown with the first in the same tile.
+    private(set) var partners: [Bookmark] = []
+    /// A tile group's places, in its pages' order; nil for a favorite of one page or a split of two.
+    private var regions: [TileRegion]?
+    private let icon = FaviconView()
+    private let partnerIcon = FaviconView()
+    /// A tile group's third and fourth pages' icons.
+    private var extraIcons: [FaviconView] = []
+    /// Every page's icon view, in order.
+    var pageIcons: [FaviconView] { [icon, partnerIcon] + extraIcons }
+    /// While a tab is held over this tile's middle: the half it would open in, as a tab row shows it.
+    private let dropHalf = ColorView()
+    /// 0: would open on the left, 1: on the right, nil: not a split target.
+    var splitSide: Int? {
+        didSet {
+            guard oldValue != splitSide else { return }
+            needsLayout = true
+            dropHalf.isHidden = splitSide == nil
+        }
+    }
+    /// Page loaded in the background: shown with a fine edge. Not for sleeping pages or ones not loaded since relaunch,
+    /// which look unopened (#205).
+    private(set) var isOpen = false { didSet { if oldValue != isOpen { stateDidChange(animated: false) } } }
+
+    /// Tile style in tab row terms: the current one gets the selected card, a loaded one the open edge, others neither.
+    /// Icons stay full strength; faded ones looked washed out rather than closed.
+    enum Look: Equatable { case closed, open, selected }
+
+    static func look(selected: Bool, loaded: [Bool]) -> Look {
+        selected ? .selected : TabRowView.showsOpenEdge(pinned: true, loaded: loaded) ? .open : .closed
+    }
+
+    /// How strong a tile's icons are drawn.
+    static func iconAlpha(_ look: Look, hovered: Bool) -> CGFloat {
+        1
+    }
+
+    /// Whether the open page has left its saved URL (`TabManager.isAway`, as pinned rows): neither the saved URL nor where
+    /// it redirects.
+    static func isAway(current: URL?, saved: URL, landing: URL?) -> Bool {
+        guard let current else { return false }
+        let here = TabManager.normalize(current)
+        return here != TabManager.normalize(saved) && here != landing.map(TabManager.normalize)
+    }
+
+    /// Tooltip: the name, plus the current page while away, like a pinned row's "Original / Current page".
+    static func pageName(saved: String, away current: String?) -> String {
+        guard let current, !current.isEmpty else { return saved }
+        return String(localized: "\(saved) — \(current)", comment: "Tooltip of a favorite whose page moved on from the one it was saved with: the favorite's name, then the page it shows now.")
+    }
+
+    /// Which pages, in order, have left their saved URL.
+    private(set) var awayParts: [Bool] = []
+
+    /// Each page's open tab, in order (nil when not open).
+    private var livePages: [Tab?] { [tab] + partners.indices.map { partnerTabs.indices.contains($0) ? partnerTabs[$0].tab : nil } }
+    override var pressSinks: Bool { get { true } set {} }
+    var iconImage: NSImage? { icon.image }
+    var partnerIconImages: [NSImage?] { Array(pageIcons.dropFirst().prefix(partners.count).map(\.image)) }
+
+    /// The page a click at `point` opens: the part of the tile it's in, as the pages share the page area; the first
+    /// page for a favorite of one.
+    func page(at point: NSPoint) -> Bookmark? {
+        guard let bookmark, !partners.isEmpty else { return bookmark }
+        let pages = [bookmark] + partners
+        if let regions, regions.count == pages.count {
+            let column = point.x > bounds.midX ? 1 : 0
+            let row = (point.y > bounds.midY) == isFlipped ? 1 : 0
+            let cell: UInt8 = 1 << (row * 2 + column)
+            return regions.firstIndex { $0.cells & cell != 0 }.map { pages[$0] } ?? bookmark
+        }
+        return point.x > bounds.midX ? partners[0] : bookmark
+    }
+    var onClose: (() -> Void)?
+    /// Shown under the pointer on every favorite that's open, the one you're on too, as a tab's is: a small ×
+    /// hanging on the tile's top-right corner, clear of every icon even four to a row.
+    private static let closeSide = Tokens.Sidebar.favoriteClose
+    /// From the tile's top and right edges to the number hint: inside the tile's rounded corner, not on it.
+    private static let closeInset = Tokens.Sidebar.favoriteCloseInset
+    private lazy var closeButton: IconButton = {
+        let button = IconButton(symbol: "xmark", size: Self.closeSide, symbolSize: Tokens.Sidebar.favoriteCloseGlyph, toolTip: String(localized: "Unload Page", comment: "Tooltip of a favorite's close button: unloads its page; the favorite stays."))
+        button.tint = Tokens.Color.textSecondary
+        button.wantsLayer = true
+        button.radius = Self.closeSide / 2
+        // A small solid chip with a hairline, so the mark reads cleanly on any icon or tile behind it.
+        button.showsFillAtRest = true
+        button.layer?.borderWidth = Tokens.Metric.hairline
+        button.layer?.borderColor = cgColor(Tokens.Color.controlEdge)
+        button.onClick = { [weak self] _ in self?.onClose?() }
+        button.isHidden = true
+        addSubview(button)
+        return button
+    }()
+
+    /// How far the × hangs past its tile's corner: nearly half of it, as far as the sidebar's edge allows.
+    static let badgeOverhang = min(Tokens.Sidebar.favoriteClose / 2, Tokens.Sidebar.edge)
+
+    /// Every favorite's ×, a split's too: one for the whole tile, on its top-right corner, clear of every icon.
+    static func badgeFrame(in bounds: NSRect, flipped: Bool) -> NSRect {
+        let side = closeSide, out = badgeOverhang
+        return NSRect(x: bounds.maxX - side + out, y: flipped ? bounds.minY - out : bounds.maxY - side + out, width: side, height: side)
+    }
+
+    /// The × while it shows and `point` (in this tile) is on it, outside the tile too.
+    func badgeHit(at point: NSPoint) -> NSView? {
+        !closeButton.isHidden && closeButton.frame.contains(point) ? closeButton : nil
+    }
+
+    /// Whether the × shows: on an open favorite under the pointer or tapped, not over a number hint or a placeholder.
+    nonisolated static func showsClose(open: Bool, hovered: Bool, numbered: Bool, placeholder: Bool) -> Bool {
+        open && hovered && !numbered && !placeholder
+    }
+
+    private func refreshClose() {
+        closeButton.isHidden = !Self.showsClose(open: isOpen, hovered: isHovered || touchRevealed, numbered: number != nil, placeholder: isPlaceholder)
+        let backed = !closeButton.isHidden
+        if backed, closeBacking == nil {
+            let disc = ColorView(color: Tokens.Color.surface)
+            disc.layer?.cornerRadius = Self.closeSide / 2
+            disc.frame = closeButton.frame
+            addSubview(disc, positioned: .below, relativeTo: closeButton)
+            closeBacking = disc
+        }
+        closeBacking?.isHidden = !backed
+    }
+
+    /// Under the ×, which sits partly off the tile: a solid disc, so it reads the same over the sidebar.
+    private var closeBacking: ColorView?
+
+    /// The part of the × outside the tile keeps it hovered.
+    private var badgeTracking: NSTrackingArea?
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let badgeTracking { removeTrackingArea(badgeTracking) }
+        badgeTracking = nil
+        let area = NSTrackingArea(rect: Self.badgeFrame(in: bounds, flipped: isFlipped), options: [.mouseEnteredAndExited, .activeInActiveApp], owner: self)
+        addTrackingArea(area)
+        badgeTracking = area
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        // Only the tile itself lights up; the × past its corner shows once it does.
+        if let badgeTracking, event.trackingArea === badgeTracking { return }
+        TouchReveal.pointerMoved(over: self)
+        super.mouseEntered(with: event)
+    }
+
+    // MARK: Touch
+
+    /// Shown by a tap as hovering shows it: the × of an open favorite (`TouchReveal`).
+    private(set) var touchRevealed = false {
+        didSet { if oldValue != touchRevealed { refreshClose() } }
+    }
+
+    /// A tap on the tile, once AppKit's click from it has gone through: its × shows as if hovered.
+    func touchTapped() {
+        touchRevealed = true
+        var area: NSView? = superview
+        while let current = area, !(current is SidebarView) { area = current.superview }
+        TouchReveal.reveal(self, keptWithin: area) { [weak self] in self?.touchRevealed = false }
+    }
+
+    private func addTouchWatch() {
+        let watch = TouchWatch()
+        watch.onTap = { [weak self] _ in self?.touchTapped() }
+        addGestureRecognizer(watch)
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        let point = convert(event.locationInWindow, from: nil)
+        if isHovered, bounds.contains(point) || badgeHit(at: point) != nil { return }
+        super.mouseExited(with: event)
+    }
+
+    #if DEBUG
+    var debugCloseButton: IconButton { closeButton }
+    #endif
+
+    /// While its page plays sound, or is muted: a small speaker badge on the icon's bottom corner (`SpeakerBadge`), as
+    /// a status sits on an avatar. Clicking it mutes the page, or unmutes it.
+    private lazy var audioButton: IconButton = {
+        let button = IconButton(symbol: "speaker.wave.2", size: Self.closeSide, symbolSize: Tokens.Sidebar.favoriteCloseGlyph,
+                                toolTip: String(localized: "Mute Tab", comment: "Tooltip of the speaker on a favorite whose page plays sound."))
+        button.tint = Tokens.Color.textSecondary
+        SpeakerBadge.style(button)
+        button.onClick = { [weak self] _ in
+            guard let tab = self?.tab else { return }
+            tab.setMuted(!tab.isMuted)
+        }
+        button.isHidden = true
+        addSubview(button)
+        return button
+    }()
+
+    /// Developer Mode (#141): the icon of a favorite whose open page is in it has the chip a tab's row has
+    /// (`FaviconView.developerBadge`), and its tooltip says so, with the host.
+    private var inDeveloperMode: Bool { tab?.isDevelopment == true && !isPlaceholder }
+
+    private func refreshDeveloperMode() {
+        if inDeveloperMode { _ = themeToken }
+        refreshLoading()
+        stateDidChange(animated: false)
+    }
+
+    private func refreshAudio() {
+        let shows = tab.map { $0.isPlayingAudio || $0.isMuted } ?? false
+        guard shows || !audioButton.isHidden else { return }
+        audioButton.isHidden = !shows
+        if !shows { icon.speakerCut = nil }
+        let muted = tab?.isMuted == true
+        SpeakerBadge.show(audioButton, muted: muted)
+        audioButton.toolTip = muted ? String(localized: "Unmute Tab", comment: "Tooltip of the speaker on a favorite whose page is muted.")
+            : String(localized: "Mute Tab", comment: "Tooltip of the speaker on a favorite whose page plays sound.")
+        needsLayout = true
+    }
+
+    /// While ⌘ is held: the number that opens it with ⌘, in the corner its × uses (the × steps aside meanwhile).
+    var number: Int? {
+        didSet {
+            guard oldValue != number else { return }
+            if let number {
+                let hint = numberHint ?? NumberHintView()
+                if numberHint == nil { numberHint = hint; addSubview(hint) }
+                hint.number = number
+                layoutNumber()
+                hint.show(true)
+            } else {
+                numberHint?.show(false)
+            }
+            stateDidChange(animated: false)
+        }
+    }
+    private var numberHint: NumberHintView?
+    private weak var tab: Tab?
+    private var tabToken: SignalToken?
+    /// A split or group favorite's other pages, while open.
+    private struct WeakTab { weak var tab: Tab? }
+    private var partnerTabs: [WeakTab] = []
+    private var partnerTokens: [SignalToken] = []
+    /// The Developer Mode chip follows the space's color as it changes, or another space is shown.
+    private lazy var themeToken: SignalToken = Brand.themeChanged.observe { [weak self] in
+        guard let self, self.inDeveloperMode else { return }
+        self.icon.developerBadge = Brand.Theme.for(self).badge
+    }
+    /// An icon that arrives later (fetched, or saved by a visit) shows at once, not only after a relaunch.
+    private var iconToken: SignalToken?
+    var isPlaceholder = false { didSet { icon.isHidden = isPlaceholder; stateDidChange(animated: false) } }
+
+    init(bookmark: Bookmark?, partners: [Bookmark] = []) {
+        self.bookmark = bookmark
+        self.partners = partners
+        super.init(frame: .zero)
+        drawsMenu = true
+        layer?.cornerRadius = Tokens.Sidebar.favoriteRadius
+        layer?.cornerCurve = .continuous
+        addSubview(icon)
+        partnerIcon.isHidden = partners.isEmpty
+        addSubview(partnerIcon)
+        makeExtraIcons()
+        dropHalf.wantsLayer = true
+        dropHalf.layer?.cornerRadius = Tokens.Sidebar.favoriteRadius - Tokens.Metric.dropInset
+        dropHalf.layer?.cornerCurve = .continuous
+        dropHalf.layer?.borderWidth = Tokens.Metric.dropEdge
+        dropHalf.isHidden = true
+        addSubview(dropHalf, positioned: .below, relativeTo: icon)
+        setAccessibilityRole(.button)
+        describe()
+        if TouchGestures.isAvailable { addTouchWatch() }
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    /// The same favorite, changed (renamed, another address, its group laid out anew): its name and icons follow.
+    func update(_ bookmark: Bookmark, partners: [Bookmark], regions: [TileRegion]? = nil) {
+        let changed = bookmark != self.bookmark || partners != self.partners
+        let placed = partners.count > 1 ? regions : nil
+        if placed != self.regions { self.regions = placed; needsLayout = true }
+        self.bookmark = bookmark
+        self.partners = partners
+        makeExtraIcons()
+        if changed { describe() }
+    }
+
+    /// One icon view for each of a group's third and fourth pages.
+    private func makeExtraIcons() {
+        while extraIcons.count < partners.count - 1 {
+            let view = FaviconView()
+            addSubview(view, positioned: .above, relativeTo: partnerIcon)
+            extraIcons.append(view)
+        }
+        partnerIcon.isHidden = partners.isEmpty
+        for (i, view) in extraIcons.enumerated() { view.isHidden = i >= partners.count - 1 }
+    }
+
+    /// Page names in order; an away page with its current page.
+    private var name: String {
+        guard let bookmark else { return "" }
+        let live = livePages
+        return Words.list(([bookmark] + partners).enumerated().map { i, page in
+            let away = awayParts.indices.contains(i) && awayParts[i]
+            return Self.pageName(saved: page.title, away: away ? live[i]?.displayTitle : nil)
+        })
+    }
+
+    private func refreshAway() {
+        guard let bookmark else { awayParts = []; return }
+        let live = livePages
+        let away = ([bookmark] + partners).enumerated().map { i, page in
+            live[i].map { Self.isAway(current: $0.url, saved: page.url, landing: $0.pinnedLanding) } ?? false
+        }
+        guard away != awayParts else { return }
+        awayParts = away
+        setAccessibilityLabel(name)
+        refreshIcon()
+    }
+
+    private func describe() {
+        let name = self.name
+        toolTip = name
+        setAccessibilityLabel(name)
+        refreshIcon()
+        // Only its own sites' icons arriving redraw it.
+        let keys = Set(([bookmark] + partners.map { Optional($0) }).compactMap { $0.flatMap { FaviconStore.shared.iconKey(for: $0.url) } })
+        iconToken = FaviconStore.shared.updated.observe { [weak self] key in
+            guard let self, keys.contains(key), self.tab?.favicon == nil || self.tab?.isLoading != true else { return }
+            self.refreshIcon()
+        }
+    }
+
+    /// Follows the favorite's page (and a split or group favorite's other pages), so the tile shows the loading ribbon
+    /// while it loads, like a tab does, and its open edge only while one of them is loaded.
+    func track(_ tab: Tab?, partners: [Tab?] = []) {
+        if partners.map({ $0.map(ObjectIdentifier.init) }) != partnerTabs.map({ $0.tab.map(ObjectIdentifier.init) }) {
+            partnerTabs = partners.map { WeakTab(tab: $0) }
+            partnerTokens = partners.compactMap { $0 }.map { page in
+                page.changed.observe { [weak self] change in
+                    if change == .webView || change == .url || change == .title || change == .favicon || change == .loading { self?.refreshLoading() }
+                }
+            }
+        }
+        guard tab !== self.tab else { refreshLoading(); return }
+        self.tab = tab
+        tabToken = tab?.changed.observe { [weak self] change in
+            if change == .loading || change == .favicon || change == .webView || change == .url || change == .title { self?.refreshLoading() }
+            if change == .audio || change == .webView { self?.refreshAudio() }
+            if change == .developer { self?.refreshDeveloperMode() }
+        }
+        refreshLoading()
+        refreshAudio()
+        refreshDeveloperMode()
+    }
+
+    private func refreshLoading() {
+        let live = livePages
+        for (page, view) in zip(live, pageIcons) { view.isLoading = (page?.isLoading ?? false) && !(page?.isSuspended ?? true) }
+        isOpen = TabRowView.showsOpenEdge(pinned: true, loaded: live.compactMap { $0?.isLoaded })
+        refreshClose()
+        refreshAway()
+        let name = self.name
+        // Favorites have no hover card, so the tooltip explains an unloaded page (asleep and memory freed, or not loaded since
+        // relaunch). Shown without an edge, like an unopened favorite.
+        let notes = [inDeveloperMode ? TabRowView.developerTip(for: tab?.url) : nil, tab?.notLoadedNote].compactMap { $0 }
+        toolTip = ([name].filter { !$0.isEmpty } + notes).joined(separator: "\n")
+        if awayParts.first != true, let image = tab?.displayIcon, !(tab?.isLoading ?? false) { icon.image = image; needsLayout = true }
+        refreshAwayIcons()
+    }
+
+    func refreshIcon() {
+        guard let bookmark else { return }
+        for (i, (partner, view)) in zip(partners, pageIcons.dropFirst()).enumerated() where !isAway(part: i + 1) {
+            if let image = partner.displayIcon {
+                view.image = image
+            } else {
+                // Back to its site's icon, not fetched yet: the one you chose doesn't stay meanwhile.
+                if view.image.map(IconChoice.isPageIcon) == true { view.image = nil }
+                FaviconStore.shared.prefetch(for: partner.url)
+            }
+        }
+        if isAway(part: 0) {
+            // Current page's icon: `refreshAwayIcons`.
+        } else if let image = bookmark.displayIcon {
+            icon.image = image
+            needsLayout = true
+        } else {
+            if icon.image.map(IconChoice.isPageIcon) == true { icon.image = nil; needsLayout = true }
+            FaviconStore.shared.prefetch(for: bookmark.url)
+        }
+        refreshAwayIcons()
+    }
+
+    private func isAway(part: Int) -> Bool { awayParts.indices.contains(part) && awayParts[part] }
+
+    /// An away page shows its current page's icon with the saved icon as a small corner badge, so the tile is still
+    /// recognizable. Tooltip names both; the menu goes back. Only once that icon is known (`awayIcon`); until then the
+    /// saved icon, no badge.
+    private func refreshAwayIcons() {
+        guard let bookmark else { return }
+        let live = livePages
+        for (i, (page, view)) in zip([bookmark] + partners, pageIcons).enumerated() {
+            let now = Self.awayIcon(away: isAway(part: i), current: live[i]?.favicon)
+            view.originalIcon = now == nil ? nil : page.displayIcon ?? FaviconView.globeIcon
+            if let now {
+                if view.image !== now { view.image = now; needsLayout = true }
+            } else if isAway(part: i) {
+                guard let own = page.displayIcon else { FaviconStore.shared.prefetch(for: page.url); continue }
+                if view.image !== own { view.image = own; needsLayout = true }
+            }
+        }
+    }
+
+    /// Icon for an away page: the current page's once known; nil draws the saved icon with no badge.
+    static func awayIcon(away: Bool, current: NSImage?) -> NSImage? { away ? current : nil }
+
+    override func layout() {
+        super.layout()
+        refreshCardShadowPath()
+        // Big enough to read at a glance when the site gives a sharp icon; a small one stays at a tab's 16pt rather
+        // than being stretched and blurred.
+        let inset = Tokens.Metric.dropInset
+        dropHalf.frame = NSRect(x: splitSide == 1 ? bounds.midX : inset, y: inset, width: bounds.width / 2 - inset, height: bounds.height - inset * 2)
+        dropHalf.color = Tokens.Color.accent.withAlphaComponent(Tokens.Color.dropAlpha)
+        dropHalf.layer?.borderColor = cgColor(Tokens.Color.accent.withAlphaComponent(Tokens.Color.dropEdgeAlpha))
+        if let regions, regions.count == partners.count + 1, partners.count > 1 {
+            // A tile group: a small icon for each page, placed as the pages share the page area, in a grid of two
+            // columns and two rows; a half sits across the two cells it covers.
+            let rowGap: CGFloat = 2, columnGap = Tokens.Space.x1
+            let size = min(Tokens.Sidebar.favicon, floor((bounds.height - Tokens.Space.x1 * 2 - rowGap) / 2),
+                           floor((bounds.width - inset * 2 - columnGap) / 2))
+            let columns = [bounds.midX - (size + columnGap) / 2, bounds.midX + (size + columnGap) / 2]
+            let top = bounds.midY + (isFlipped ? -1 : 1) * (size + rowGap) / 2, bottom = bounds.midY + (isFlipped ? 1 : -1) * (size + rowGap) / 2
+            let rows = [top, bottom]
+            for (region, view) in zip(regions, pageIcons) {
+                let x = region.columns.map { columns[$0] }.reduce(0, +) / CGFloat(region.columns.count)
+                let y = region.rows.map { rows[$0] }.reduce(0, +) / CGFloat(region.rows.count)
+                view.frame = backingAlignedRect(NSRect(x: x - size / 2, y: y - size / 2, width: size, height: size), options: .alignAllEdgesNearest)
+            }
+        } else if !partners.isEmpty {
+            // A split: both pages' icons side by side, at a tab's size. In the narrowest tiles they move closer, then
+            // shrink, so the two always fit inside it.
+            let room = bounds.width - inset * 2
+            let gap = max(2, min(Tokens.Space.x1, room - Tokens.Sidebar.favicon * 2))
+            let size = min(Tokens.Sidebar.favicon, floor((room - gap) / 2))
+            let x = (bounds.width - size * 2 - gap) / 2, y = (bounds.height - size) / 2
+            icon.frame = backingAlignedRect(NSRect(x: x, y: y, width: size, height: size), options: .alignAllEdgesNearest)
+            partnerIcon.frame = backingAlignedRect(NSRect(x: x + size + gap, y: y, width: size, height: size), options: .alignAllEdgesNearest)
+        } else {
+            // Every favorite at one size: a site's own 32px icon is drawn up to it with the best filtering, only a
+            // 16px one stays at a tab's size rather than blur.
+            // An icon you chose is drawn, never blurred: always the larger size.
+            let size = icon.image.map { IconChoice.isPageIcon($0) || FaviconStore.sharpSide(of: $0) >= Self.iconSide } == true ? Self.iconSide : Tokens.Sidebar.favicon
+            icon.frame = backingAlignedRect(NSRect(x: (bounds.width - size) / 2, y: (bounds.height - size) / 2, width: size, height: size), options: .alignAllEdgesNearest)
+        }
+        closeButton.frame = Self.badgeFrame(in: bounds, flipped: isFlipped)
+        closeBacking?.frame = closeButton.frame
+        if !audioButton.isHidden { layoutSpeaker() }
+        layoutNumber()
+    }
+
+    /// The speaker badge on the icon's bottom corner, its button centered on it.
+    private func layoutSpeaker() { SpeakerBadge.place(audioButton, on: icon) }
+
+    /// The number tucked into the top-right corner: the digit alone, one mark as the × is, so it
+    /// stays clear of the icon however narrow the tile.
+    private func layoutNumber() {
+        guard let hint = numberHint, number != nil else { return }
+        let edge = Self.closeInset, height = NumberHintView.height
+        hint.showsCommand = false
+        hint.frame = NSRect(x: bounds.width - edge - hint.width, y: isFlipped ? edge : bounds.height - height - edge, width: hint.width, height: height)
+    }
+
+    override func stateDidChange(animated: Bool) {
+        // VoiceOver says which favorite you're on and which are open, as it does for tab rows.
+        let state = isSelected ? String(localized: "current tab", comment: "Spoken by VoiceOver after a tab row's name: it's the tab you're on.") : isOpen ? String(localized: "open", comment: "Spoken by VoiceOver after a favorite's name: its page is loaded.") : nil
+        let mode = inDeveloperMode ? DeveloperTool.modeName : nil
+        let value = [state, mode].compactMap { $0 }.joined(separator: String(localized: "accessibility.state-separator", defaultValue: ", ", comment: "Separates the states VoiceOver reads after a tab row's name, like “current tab, playing audio”."))
+        setAccessibilityValue(value.isEmpty ? nil : value)
+        setAccessibilitySelected(isSelected)
+        // In the space's color, so it follows the space as the tile's own fill does.
+        icon.developerBadge = inDeveloperMode ? Brand.Theme.for(self).badge : nil
+        if isPlaceholder {
+            // Where the first favorite will land: the drop target's look.
+            layer?.backgroundColor = cgColor(Tokens.Color.accent.withAlphaComponent(Tokens.Color.dropAlpha))
+            layer?.borderColor = cgColor(Tokens.Color.accent.withAlphaComponent(Tokens.Color.dropEdgeAlpha))
+            layer?.borderWidth = Tokens.Metric.dropEdge
+            return
+        }
+        refreshClose()
+        let alpha = Self.iconAlpha(Self.look(selected: isSelected, loaded: [isOpen]), hovered: isHovered)
+        for view in pageIcons where view.alphaValue != alpha { view.alphaValue = alpha }
+        // Space-tinted tile, lighter on hover; brighter with a fine edge while loaded. The current one uses the selected card.
+        let fill = isSelected ? (isHovered ? Tokens.Chrome.cardHover : Tokens.Chrome.card)
+            : isPressed ? Tokens.Chrome.fieldPressed
+            : isOpen ? (isHovered ? Tokens.Chrome.openTileHover : Tokens.Chrome.openTile)
+            : isHovered ? Tokens.Chrome.fieldHover : Tokens.Chrome.field
+        layer?.set(backgroundColor: cgColor(fill), animated: animated && !isHovered, duration: Tokens.Motion.selection)
+        Tokens.Motion.withoutAnimation {
+            layer?.borderWidth = isSelected || isOpen ? Tokens.Metric.hairline : 0
+            layer?.borderColor = cgColor(isSelected ? Tokens.Chrome.cardEdge : Tokens.Chrome.openEdge)
+            setCardShadow(isSelected)
+        }
+        if !audioButton.isHidden { SpeakerBadge.refreshColor(audioButton) }
+        setCardRim(isSelected)
+    }
+
+    private static var iconSide: CGFloat { Tokens.Sidebar.favoriteIcon }
+}
+
+/// The row a carried favorite turns into over the tab list: the same row a tab or pinned page has there, a split's or
+/// tile group's pages in its parts.
+extension TabRowView {
+    static func carried(_ favorite: Bookmark, icon: NSImage?, partners: [Bookmark], partnerIcons: [NSImage?]) -> TabRowView {
+        let row = TabRowView()
+        row.bookmarkIcon = icon
+        row.fixedTitle = favorite.title
+        row.configure(tab: nil)
+        row.configure(parts: partners.enumerated().map { i, page in
+            Part(page: nil, name: page.title, icon: partnerIcons.indices.contains(i) ? partnerIcons[i] : nil)
+        })
+        return row
+    }
+}

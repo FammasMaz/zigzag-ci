@@ -1,0 +1,129 @@
+// The rest of Chrome's extension API, so an extension never meets `undefined` where Chrome has something.
+//
+// Runs after the bridge and the compatibility layer, in an extension's background and pages. `surface` is every
+// Chrome namespace with its functions, events, constants, enums and objects (chrome-api.json, written from Chrome's
+// own definitions by scripts/chrome-api.py). Anything WebKit, the bridge or the compatibility layer already provides
+// is left as it is; what's still missing is added, for namespaces the extension asked permission for: constants and
+// enums with Chrome's values, events that never fire, and functions that say they aren't available (a rejected
+// promise, or the callback with nothing). Such a call is noted once in the extensions log, so what an extension
+// needed and didn't get is on record.
+(() => {
+  const surface = __SURFACE__;
+  const start = () => {
+    const api = globalThis.chrome || globalThis.browser;
+    if (globalThis.__zigzagSurface) return true;
+    if (!api || !api.runtime) return false;
+    globalThis.__zigzagSurface = true;
+
+    let manifest = {};
+    try { manifest = api.runtime.getManifest() || {}; } catch (e) {}
+    const asked = new Set([...(manifest.permissions || []), ...(manifest.optional_permissions || [])]);
+    // runtime.getContexts is MV3-only. MV2 gets no member, not even a stand-in, so feature detection stays correct.
+    const mv3 = manifest.manifest_version === 3;
+    // MV3-only members, absent from MV2 so feature detection works. Only members Chrome reserves for MV3, not whole
+    // namespaces' constants.
+    const mv3Only = { 'chrome.runtime': new Set(['ContextType']) };
+    const inWorker = typeof window === 'undefined';
+    const noted = new Set();
+    const note = (name) => {
+      if (noted.has(name)) return;
+      noted.add(name);
+      try { api.runtime.sendNativeMessage('zigzag.diagnostics', { where: 'surface', kind: 'unavailable', text: name }); } catch (e) {}
+    };
+    const unavailable = (name) => (...args) => {
+      note(name);
+      const callback = typeof args[args.length - 1] === 'function' ? args[args.length - 1] : null;
+      if (callback) { setTimeout(() => { try { callback(); } catch (e) { console.error(e); } }, 0); return undefined; }
+      return Promise.reject(new Error(`${name} isn't available in Zigzag`));
+    };
+    const event = () => ({
+      addListener() {}, removeListener() {}, hasListener: () => false, hasListeners: () => false,
+      addRules(rules, callback) { if (typeof callback === 'function') setTimeout(() => callback([]), 0); },
+      getRules(ids, callback) { const cb = typeof ids === 'function' ? ids : callback; if (typeof cb === 'function') setTimeout(() => cb([]), 0); },
+      removeRules(ids, callback) { const cb = typeof ids === 'function' ? ids : callback; if (typeof cb === 'function') setTimeout(() => cb(), 0); },
+    });
+    // WebKit names some features with nothing behind them: `in` isn't enough, and plain assignment can fail quietly.
+    // (Where WebKit won't let the member be set, webkit-differences.js stands in for the object holding it.)
+    const setMember = globalThis.__zigzagSetMember;
+    let root = api;   // the object (chrome or browser) being filled now
+    const put = (target, key, value, path) => {
+      if (target[key] != null) return target[key];
+      try { Object.defineProperty(target, key, { value, configurable: true, enumerable: true, writable: true }); } catch (e) {}
+      if (target[key] == null && setMember && path) setMember(path, key, value);
+      if (!path) return target[key];
+      const holder = path.reduce((object, part) => object && object[part], root);
+      return (holder && holder[key]) ?? target[key];
+    };
+    // `path` is where `target` sits under chrome, for the stand-in that's needed where WebKit refuses a member.
+    const fill = (target, spec, name, path) => {
+      // MV2 must not see MV3-only constants, even ones webkit-differences.js added: remove before filling (hiding
+      // undeletable members is the differences script's job).
+      const reserved = mv3 ? null : mv3Only[name];
+      if (reserved) for (const key of reserved) {
+        if (!(key in target)) continue;
+        try { delete target[key]; } catch (e) {}
+        if (key in target && typeof globalThis.__zigzagRemoveMember === 'function') {
+          try { globalThis.__zigzagRemoveMember(path || [], key); } catch (e) {}
+        }
+      }
+      for (const fn of spec.functions || []) {
+        if (!mv3 && name === 'chrome.runtime' && fn === 'getContexts') continue;
+        // Storage area methods are WebKit's own; missing ones stay missing so feature detection works (`setAccessLevel` must
+        // read as undefined).
+        if (name.startsWith('chrome.storage.')) continue;
+        if (typeof target[fn] !== 'function') put(target, fn, unavailable(`${name}.${fn}`), path);
+      }
+      for (const ev of spec.events || []) put(target, ev, event(), path);
+      for (const [key, value] of Object.entries(spec.constants || {})) {
+        if (reserved && reserved.has(key)) continue;
+        if (target[key] === undefined) put(target, key, value, path);
+      }
+      for (const [key, values] of Object.entries(spec.enums || {})) {
+        if (reserved && reserved.has(key)) continue;
+        if (target[key] === undefined) put(target, key, Object.freeze({ ...values }), path);
+      }
+      for (const [key, inner] of Object.entries(spec.objects || {})) {
+        const object = put(target, key, {}, path);
+        if (!object || typeof object !== 'object') continue;
+        if (inner.properties) for (const [prop, members] of Object.entries(inner.properties)) {
+          const child = put(object, prop, {}, path && [...path, key]);
+          if (child && typeof child === 'object') fill(child, members, `${name}.${key}.${prop}`, path && [...path, key, prop]);
+        } else fill(object, inner, `${name}.${key}`, path && [...path, key]);
+      }
+    };
+    const available = (spec) => {
+      for (const flag of spec.flags || []) {
+        const [kind, value = ''] = flag.split('=');
+        if (kind === 'chrome-platform' && !value.split(' ').includes('mac')) return false;
+        if (kind === 'chrome-channel' && value && value !== 'stable') return false;
+        if (kind === 'chrome-install-location') return false;
+        if (kind === 'chrome-disallow-service-workers' && inWorker) return false;
+      }
+      return !(spec.permissions || []).length || spec.permissions.some((permission) => asked.has(permission));
+    };
+    for (const target of new Set([globalThis.chrome, globalThis.browser])) {
+      if (!target) continue;
+      for (const [path, spec] of Object.entries(surface)) {
+        // DevTools pages only, and those get their own from WebKit. userScripts stays missing unless the bridge made it
+        // (it needs WebKit's scripting), as Chrome leaves it missing until it's allowed: extensions check for it and take
+        // another way, and a stand-in that does nothing would send them down this one.
+        // publicSuffix answers at once in Chrome, not with a promise: a stand-in's rejected promise, taken as the
+        // answer, would be a site's domain to its callers. Missing, they use their own list (Tampermonkey's beta does).
+        if (path.startsWith('devtools.') || (path === 'userScripts' && !target.userScripts) || path === 'publicSuffix' || !available(spec)) continue;
+        let namespace = target;
+        const parts = path.split('.');
+        root = target;
+        parts.forEach((part, index) => { namespace = namespace && put(namespace, part, {}, parts.slice(0, index)); });
+        if (namespace && typeof namespace === 'object') fill(namespace, spec, `chrome.${path}`, parts);
+      }
+    }
+    // Answers for what's now there but Zigzag can't do (webkit-differences.js).
+    if (typeof globalThis.__zigzagAfterSurface === 'function') { try { globalThis.__zigzagAfterSurface(); } catch (e) {} }
+    return true;
+  };
+  if (!start()) {
+    let tries = 0;
+    const again = () => { if (!start() && ++tries < 100) setTimeout(again, 20); };
+    setTimeout(again, 0);
+  }
+})();
