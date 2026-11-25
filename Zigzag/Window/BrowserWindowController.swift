@@ -1,0 +1,4524 @@
+import AppKit
+import Translation
+import UniformTypeIdentifiers
+import WebKit
+
+/// One browser window: its tabs, its sidebar, its page card, and everything floating above them.
+final class BrowserWindowController: NSWindowController, NSWindowDelegate {
+    /// Where tabs moved out of this window go back to on ⌘Z (#167): this window, or once it has closed, the window ⌘Z
+    /// opened in its place.
+    final class MoveHome {
+        weak var window: BrowserWindowController?
+        var frame: NSRect?
+        var space = UUID()
+    }
+    var moveHome = MoveHome()
+
+    /// The last to be asked about a key: one nothing took goes by quietly (`QuietKeys`).
+    override func noResponder(for eventSelector: Selector) {
+        if QuietKeys.passQuietly(eventSelector, NSApp.currentEvent) { return }
+        super.noResponder(for: eventSelector)
+    }
+
+    let tabManager: TabManager
+    let sidebar = SidebarView()
+    /// The sidebar the screen's edge brings out over other apps (#363), made the first time it comes out.
+    private(set) var edgeSidebar: SidebarView?
+    private var edgeContainer: SidebarContainer?
+    let root: BrowserRootView
+    let inPageMini = InPageMiniHost()
+    private var inPageMiniEscMonitor: Any?
+    var browserWindow: BrowserWindow { window as! BrowserWindow }
+
+    private var tokens: [SignalToken] = []
+    private var selectedTabToken: SignalToken?
+    private weak var shownTab: Tab?
+    private var fadeTimer: Timer?
+    /// The page in The Whole Screen: the browser's own full-screen space, with the chrome out of the way.
+    private var pageFullScreenTab: Tab?
+    /// Whether the browser entered its space for that page, so leaving gives the window back.
+    private var pageFullScreenAskedForSpace = false
+    /// The space is still coming: leave it as soon as it arrives.
+    private var pageFullScreenExitAfterEnter = false
+    /// The expand button asked for WebKit's own full screen: taken once the browser's space is given back.
+    private var pageFullScreenNativeAfterSpace: Tab?
+    var onClose: ((BrowserWindowController) -> Void)?
+    var onStateChange: (() -> Void)?
+
+    lazy var commandBar = CommandBarController(host: self)
+    lazy var findBar = FindBarController(window: self)
+    lazy var desk = DeskController(window: self)
+    lazy var previews = TabPreviewController(controller: self)
+    lazy var switcher = TabSwitcher(controller: self)
+    lazy var spaceSwitcher = SpaceSwitcher(controller: self)
+    /// Holding ⌘ a moment: the number on each favorite and row that ⌘ goes to.
+    private(set) var numberHints: NumberHints?
+    /// ⌘Z for sidebar actions; also the window's undo manager, so page text editing shares it.
+    /// Each step it remembers holds on to the tabs it can bring back, closed ones too, so it keeps the last hundred
+    /// rather than a whole day's worth.
+    let sidebarUndo: UndoManager = {
+        let undo = UndoManager()
+        undo.levelsOfUndo = 100
+        return undo
+    }()
+    /// Inside a `pageChange`: the steps it's made of (pin, then into a folder) are its own, one ⌘Z and one redo.
+    var isInPageChange = false
+    lazy var linkStatus = LinkStatusController(overlay: root.overlay)
+    /// With the sidebar hidden, notes a link opened in a background tab (#272).
+    lazy var newTabNote = NewTabNote(controller: self)
+    /// Capture (⇧⌘2): the mode over the page and the card it leaves.
+    lazy var capture = PageCapture(controller: self)
+    /// A playing video you've left, in a small card over the page.
+    lazy var miniPlayer = MiniPlayer(controller: self)
+
+    init(tabManager: TabManager, frame: NSRect?, sidebarVisible: Bool = true, sidebarWidth: CGFloat? = nil) {
+        self.tabManager = tabManager
+        root = BrowserRootView(sidebar: sidebar)
+        let rect = frame ?? BrowserWindowController.defaultFrame()
+        let window = BrowserWindow(contentRect: rect)
+        super.init(window: window)
+        window.delegate = self
+        window.contentView = root
+        window.sidebar = sidebar
+        window.setFrame(rect, display: false)
+        root.sidebarVisible = sidebarVisible
+        inPageMini.browser = self
+        // A width saved before the toolbar's buttons grew can be narrower than they now need. With none given, the
+        // view keeps the width dragged out last time, which every window shares (#431).
+        if let sidebarWidth {
+            // A window restored from a session keeps its own; the shared width is written only by a drag (#431).
+            root.sidebarWidth = min(max(sidebarWidth, Tokens.Metric.sidebarMinWidth), Tokens.Metric.sidebarMaxWidth)
+        }
+        root.onLayoutChange = { [weak self] in
+            guard let self else { return }
+            self.layoutTrafficLights()
+            self.commandBar.reposition()
+            self.findBar.reposition()
+            self.capture.reposition()
+            self.miniPlayer.place()
+            PermissionPrompt.reposition(in: self)
+            NoticeCard.reposition(in: self)
+            Toast.reposition(in: self)
+            self.newTabNote.reposition()
+            AgentControl.shared.reposition(in: self)
+            if self.floatingDownloads.superview != nil {
+                if self.root.chromeSidebarShown { self.hideFloatingDownloads() } else { self.showFloatingDownloads() }
+            }
+            self.placeFloatingUpdate()
+        }
+        root.onInPageMiniLayout = { [weak self] _ in self?.inPageMini.browserLayoutChanged() }
+        root.onInPageMiniSlide = { [weak self] show, duration in
+            self?.inPageMini.sidebarSlid(show: show, duration: duration)
+        }
+        // Only a docked Mini needs the window's Esc monitor: with the setting off, none is installed.
+        inPageMini.onRecordChanged = { [weak self] in self?.inPageMiniRecordChanged() }
+        root.onSidebarWidthChange = { [weak self] _ in self?.onStateChange?() }
+        root.onTouchPull = { [weak self] pulling in
+            guard let self else { return }
+            if pulling, !self.browserWindow.trafficLightsHidden, let image = self.browserWindow.trafficLightsImage() { self.trafficLightsPicture = image }
+            self.sidebarPulled = pulling
+            self.layoutTrafficLights()
+        }
+        root.onGrabberMoved = { [weak self] in self?.layoutTrafficLights() }
+        root.onFingerWhereBarWent = { [weak self] point in self?.fingerLanded(where: point) ?? false }
+        root.onSlide = { [weak self] duration, timing in
+            guard let self else { return }
+            self.sidebarSliding(duration)
+            PermissionPrompt.reposition(in: self, slide: duration, timing: timing)
+            NoticeCard.reposition(in: self, slide: duration, timing: timing)
+            Toast.reposition(in: self, slide: duration, timing: timing)
+            self.newTabNote.reposition()
+            AgentControl.shared.reposition(in: self)
+            self.placeFloatingUpdate()
+        }
+        // A panel opened from the slid-out sidebar keeps it out until the panel closes, so it's never left floating alone.
+        // So does the guide while it points at something in it.
+        root.keepsRevealed = { [weak self] in
+            SitePanel.isOpen(in: self?.window) || DownloadsPanel.isOpen(in: self?.window) || GuidedTour.holdsSidebar(in: self?.window)
+                || self?.popupHoldsSidebar == true
+        }
+        // The Whole Screen's bar stays down while a panel hangs from it or the keyboard is in it.
+        root.keepsTopBar = { [weak self] in
+            guard let self else { return false }
+            if self.hasFloatingPanel { return true }
+            guard let responder = self.window?.firstResponder as? NSView else { return false }
+            return responder.isDescendant(of: self.root.topBar)
+        }
+        // One floating thing at a time, the sidebar that slides out included: while the command bar is up, or a panel
+        // opened from the bar above the page, the pointer at the window's edge leaves it hidden. It would slide in
+        // under them, and under a panel it would then be held there.
+        root.blocksEdgeReveal = { [weak self] in
+            self?.commandBar.isVisible == true || SitePanel.isOpen(in: self?.window) || DownloadsPanel.isOpen(in: self?.window)
+                || ReaderOptions.isOpen(in: self?.window)
+        }
+        // A click beside a zoomed pane puts it back.
+        root.zoomScrim.onClick = { [weak self] in self?.unzoomPane() }
+        root.onTilesChange = { [weak self] shape, final in
+            guard let self, let tab = self.tabManager.selectedTab else { return }
+            // The reset button shows while a grid's line is parted, and goes when it's one line again.
+            self.root.paneCards.forEach { $0.header.resetsLayout = shape.isParted }
+            guard final else { return }
+            // A whole drag is one change: the group's lines when it began are what ⌘Z puts back (#435).
+            self.applyTileShape(shape, undoTo: self.tabManager.split(for: tab)?.shape)
+        }
+
+        sidebar.delegate = self
+        sidebar.onEditSpace = { [weak self] id in self?.openSpaceEditor(id, anchor: self?.sidebar.dot(for: id)) }
+
+        sidebar.onSwipeSpace = { [weak self] offset in
+            guard let self else { return false }
+            let before = self.tabManager.currentSpaceID
+            self.tabManager.switchSpace(by: offset)
+            return before != self.tabManager.currentSpaceID
+        }
+        sidebar.onSwipeLook = { [weak self] space, share in self?.swipeLook(toward: space, share: share) }
+        sidebar.backButton.onClick = { [weak self] _ in self?.goBack(nil) }
+        // Right-click or hold Back or Forward: the pages that way, to jump several at once.
+        Self.showsHistory(sidebar.backButton, back: true) { [weak self] in self?.selectedWebView }
+        Self.showsHistory(sidebar.forwardButton, back: false) { [weak self] in self?.selectedWebView }
+        // A finger's tap toggles once: the other toggle, now under it, doesn't take its tap.
+        sidebar.sidebarButton.onClick = { [weak self] event in
+            self?.toggleBrowserSidebar(nil)
+            self?.browserWindow.spendFingerClick(event)
+        }
+        root.topBar.sidebarButton.onClick = { [weak self] event in
+            self?.toggleBrowserSidebar(nil)
+            self?.browserWindow.spendFingerClick(event)
+        }
+        sidebar.forwardButton.onClick = { [weak self] _ in self?.goForward(nil) }
+        sidebar.address.onRightClick = { [weak self] _ in
+            if let self { SitePanel.toggle(in: self, from: self.sidebar.address) }
+            return nil
+        }
+        sidebar.address.readerButton.onClick = { [weak self] _ in self?.toggleReader() }
+        sidebar.address.translateButton.onClick = { [weak self] _ in self?.showTranslateMenu() }
+        wireAddressButtons()
+        // The site pill above the page (#275) acts as the address: click opens the command bar over it, as in split
+        // panes; right-click, middle-click and drop act as on the sidebar address.
+        let pill = root.topBar.pill
+        pill.onClick = { [weak self, weak pill] _ in
+            guard let self, let pill else { return }
+            if let tab = self.tabManager.selectedTab { self.editAddress(of: tab, from: pill) } else { self.commandBar.show(mode: .editCurrent, anchor: pill) }
+        }
+        pill.onRightClick = { [weak self] _ in
+            if let self { SitePanel.toggle(in: self, from: self.sidebar.address) }
+            return nil
+        }
+        pill.onMiddleClick = { [weak self] in self?.closeTab(nil) }
+        pill.drop.onDrop = { [weak self] destination in
+            self?.open(destination.url, disposition: .currentTab, httpFallback: destination.httpFallback)
+            return self != nil
+        }
+        // A link or words dropped on the address: the page you're on goes there (#182).
+        sidebar.address.drop.onDrop = { [weak self] destination in
+            self?.open(destination.url, disposition: .currentTab, httpFallback: destination.httpFallback)
+            return self != nil
+        }
+        // The address stands for the tab you're on: a middle-click closes it, as on the tab's own row.
+        sidebar.address.onMiddleClick = { [weak self] in self?.closeTab(nil) }
+        sidebar.address.onPinsMoved = { [weak self] in
+            if #available(macOS 15.4, *), let self { ExtensionCenter.repositionPinPopups(of: self) }
+        }
+        sidebar.address.onPinDragBegan = { [weak self] in
+            if #available(macOS 15.4, *) { ExtensionCenter.closePopups(in: self?.window) }
+        }
+        sidebar.address.onPinsReordered = { [weak self] in self?.installs.reorderPins(visible: $0) }
+        // Extensions with an icon for light bars and one for dark ones show the one for this bar (1Password).
+        sidebar.address.onAppearanceChanged = {
+            if #available(macOS 15.4, *) { ExtensionCenter.toolbarAppearanceChanged() }
+        }
+        sidebar.address.siteControlsButton.onClick = { [weak self] _ in
+            if let self { SitePanel.toggle(in: self, from: self.sidebar.address) }
+        }
+        sidebar.address.siteControlsButton.onRightClick = { [weak self] _ in
+            if let self { SitePanel.toggle(in: self, from: self.sidebar.address) }
+            return nil
+        }
+        sidebar.address.captureButton.onClick = { [weak self] _ in
+            guard let self, let tab = self.tabManager.selectedTab, let origin = SiteOrigin.of(tab.url) else { return }
+            var items: [MenuPanel.Entry] = [
+                .item(.init(title: String(localized: "Stop Camera and Microphone", comment: "Menu item of the address bar's camera button: stops the page using the camera and microphone."), symbol: "stop.circle") { tab.stopCapture() }),
+            ]
+            // Ask holds for this page only; Always Allow saves for the site and Ask Every Time removes that. Private
+            // windows save nothing. Only what's in use now: an audio call never grants the camera permanently or
+            // overrides a Block.
+            let inUse = [tab.isUsingCamera ? SitePermission.camera : nil, tab.isUsingMicrophone ? SitePermission.microphone : nil].compactMap { $0 }
+            if !tab.isPrivate, !inUse.isEmpty {
+                let allAllowed = inUse.allSatisfy { SitePermissions.choice($0, origin: origin) == .allow }
+                if allAllowed {
+                    items.append(.item(.init(title: String(localized: "Ask Every Time", comment: "Menu item of the address bar's camera button: the site, allowed the camera and microphone for good, asks again on every visit."), symbol: "arrow.counterclockwise") {
+                        inUse.forEach { SitePermissions.setChoice(.ask, for: $0, origin: origin) }
+                    }))
+                } else {
+                    items.append(.item(.init(title: String(localized: "Always Allow on This Site", comment: "Menu item of the address bar's camera button: the site may use the camera and microphone from now on without asking."), symbol: "checkmark.circle") {
+                        inUse.forEach { SitePermissions.setChoice(.allow, for: $0, origin: origin) }
+                    }))
+                }
+            }
+            MenuPanel.show(items, from: self.sidebar.address.captureButton)
+        }
+        sidebar.onNowPlayingShow = { [weak self] tab in self?.tabManager.select(tab) }
+        sidebar.onNowPlayingToggle = { [weak self] tab in self?.toggleNowPlaying(tab) }
+        sidebar.onNowPlayingHide = { [weak self] tab in self?.hideNowPlaying(tab) }
+        sidebar.onNowPlayingMenu = { [weak self] tab in self?.nowPlayingMenu(for: tab) }
+        // Updates show in every window, private too: they're app-wide, and restarting closes private windows like
+        // quitting.
+        sidebar.updateCard.onRestart = { Updater.shared.restartToUpdate() }
+        sidebar.updateCard.onHide = { Updater.shared.dismissCard() }
+        sidebar.updateCard.onUpdate = { Updater.shared.getUpdate() }
+        sidebar.updateCard.onSkip = { Updater.shared.skipOffered() }
+        sidebar.setUpdateCard(Updater.shared.cardState)
+        tokens.append(Updater.changed.observe { [weak self] in
+            guard let self else { return }
+            // Closed in this window: hide like a closed card; fade in others.
+            let hiding = Updater.shared.readiness.isDismissed && self.window?.isKeyWindow == true
+            self.bothSidebars { $0.setUpdateCard(Updater.shared.cardState, hiding: hiding) }
+            self.placeFloatingUpdate(hiding: hiding)
+        })
+        sidebar.reloadButton.onClick = { [weak self] _ in
+            guard let tab = self?.tabManager.selectedTab else { return }
+            tab.isLoading ? tab.stopLoading() : tab.reload()
+        }
+
+        UndoClock.start()
+        tabManager.host = self
+        tokens.append(tabManager.changed.observe { [weak self] change in self?.tabManagerChanged(change) })
+        tokens.append(Library.shared.changed.observe { [weak self] in self?.libraryChanged() })
+        // A live folder's pages read, or its refresh failing: their rows and menu follow.
+        tokens.append(LiveFolders.shared.changed.observe { [weak self] in self?.sidebar.list.refreshRows() })
+        // Tools above the page turned on or off (Settings › Developer): the page you're on gains or loses them.
+        tokens.append(DeveloperTools.changed.observe { [weak self] in self?.showDeveloperBarTools() })
+        // Always or Never Translate chosen in another window or Settings: the translate button follows.
+        tokens.append(PageTranslator.choicesChanged.observe { [weak self] in self?.updateTranslateButton() })
+        // A shortcut changed in Settings: the buttons' tooltips say the new keys at once.
+        tokens.append(Shortcuts.changed.observe { [weak self] in
+            self?.layoutTrafficLights()
+            self?.updateReaderButton()
+        })
+        // Reduce Transparency turned on or off while Zigzag is open: the window follows at once.
+        NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(displayOptionsChanged),
+                                                          name: NSWorkspace.accessibilityDisplayOptionsDidChangeNotification, object: nil)
+        // Plugged in or on battery, Low Power Mode on or off: clear glass comes and goes with it.
+        PowerSaving.start()
+        NotificationCenter.default.addObserver(self, selector: #selector(displayOptionsChanged), name: PowerSaving.changed, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(placeAddress), name: BrowserRootView.addressPlaceChanged, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(placeSidebarSide), name: BrowserRootView.sidebarSideChanged, object: nil)
+        placeAddress()
+        // Autohide's pointer reveal: the person's pointer near the top brings the bar back, trusted input only.
+        autohidePointerMonitor = NSEvent.addLocalMonitorForEvents(matching: .mouseMoved) { [weak self] event in
+            self?.autohidePointerMoved(event)
+            return event
+        }
+        // The setting or a site's choice changed: a page in full screen follows between The Page and The Whole Screen.
+        tokens.append(PageFullScreen.changed.observe { [weak self] in self?.updatePageFullScreenForLayout() })
+        tokens.append(DownloadManager.shared.changed.observe { [weak self] _ in self?.downloadsChanged() })
+        tokens.append(DownloadManager.shared.started.observe { [weak self] item, window in
+            guard let self, window == nil || window === self.window else { return }
+            self.flyDownload(item)
+        })
+        if #available(macOS 15.4, *) {
+            tokens.append(ExtensionCenter.changed.observe { [weak self] in self?.scheduleExtensionActions() })
+            tokens.append(ExtensionCenter.popupsChanged.observe { [weak self] in self?.scheduleExtensionActions() })
+            // Badges tick for every request an ad blocker stops, in every tab: only the tab shown here is drawn
+            // again, and no more than ten times a second.
+            tokens.append(ExtensionCenter.actionUpdated.observe { [weak self] tab in
+                guard let self, ExtensionCenter.update(for: tab, concerns: self.tabManager.selectedTab) else { return }
+                self.scheduleExtensionActions(after: 0.1)
+            })
+        }
+
+        // Fading is slow; checking once a minute is plenty.
+        fadeTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated {
+                Freezes.mark("sidebar refresh")
+                self?.bothSidebars { $0.list.refreshRows() }
+            }
+        }
+        fadeTimer?.tolerance = 10
+
+        if tabManager.isPrivate {
+            // Private windows are always dark and say so, so you never wonder which one you're in.
+            window.appearance = NSAppearance(named: .darkAqua)
+            sidebar.list.privateLabel = true
+            sidebar.isPrivate = true
+        }
+        sidebar.listedSpaces = { [weak tabManager] in tabManager?.listedSpaces ?? Library.shared.yourSpaces }
+        applySpaceColor(animated: false)
+        sidebar.reloadSpaces(current: tabManager.currentSpaceID)
+        sidebar.onMoveSpace = { [weak self] id, index in
+            guard let self, !self.tabManager.isPrivate else { return }
+            self.libraryChange(String(localized: "Move Space", comment: "What Edit › Undo undoes after a space is dragged to a new place.")) {
+                Library.shared.moveSpace(id, to: index)
+            }
+        }
+        sidebar.favorites.onOpen = { [weak self] favorite in self?.tabManager.openBookmark(favorite) }
+        // A split favorite unloads both its pages, as its Unload Pages does.
+        sidebar.favorites.onClose = { [weak self] favorite in
+            guard let self else { return }
+            let ids = Library.shared.pinnedSplit(containing: favorite.id).map(\.ids) ?? [favorite.id]
+            let pages = ids.compactMap(self.tabManager.bookmarkTab(for:))
+            if !pages.isEmpty { self.tabManager.close(pages) }
+        }
+        sidebar.favorites.onMenu = { [weak self] favorite in
+            guard let self else { return nil }
+            return SidebarMenus.favoriteMenu(for: favorite, controller: self)
+        }
+        sidebar.favorites.onDragMove = { [weak self] _, point in
+            guard let self, let window = self.window else { return false }
+            if self.favoriteDragOrigin == nil { self.favoriteDragOrigin = self.tabManager.currentSpaceID }
+            // Over another window's list, the line shows there instead.
+            let other = self.otherWindowForFavorite(at: point)
+            if self.favoriteDropWindow !== other { self.favoriteDropWindow?.sidebar.list.externalHover(at: nil) }
+            self.favoriteDropWindow = other
+            other?.sidebar.list.externalHover(at: point, allowsPinned: true)
+            let over = other == nil && !self.tabManager.isPrivate && self.isOverList(point)
+            self.sidebar.list.externalHover(at: over ? point : nil, allowsPinned: true)
+            self.favoriteSpring(at: other == nil ? window.convertPoint(fromScreen: point) : nil)
+            self.sidebar.list.carryToEdge(at: other == nil ? point : nil)
+            return over || other != nil
+        }
+        sidebar.favorites.onDrop = { [weak self] favorite, point in
+            guard let self, !self.tabManager.isPrivate, let window = self.window else { return (false, nil) }
+            if let other = self.otherWindowForFavorite(at: point) {
+                return (true, other.takeFavorite(favorite, from: self, at: point))
+            }
+            // Let go on a space's dot: it becomes a tab there, at the top, whichever space is showing.
+            if let dot = self.sidebar.spaceDot(at: window.convertPoint(fromScreen: point)) {
+                self.unfavoriteWithUndo(favorite.id, to: 0, in: dot)
+                return (true, nil)
+            }
+            guard self.isOverList(point) else { return (false, nil) }
+            return (true, self.dropFavorite(favorite, at: point))
+        }
+        sidebar.favorites.onDragEnd = { [weak self] cancelled in
+            guard let self else { return }
+            self.favoriteDropWindow?.sidebar.list.externalHover(at: nil)
+            self.favoriteDropWindow = nil
+            self.sidebar.list.externalHover(at: nil)
+            self.favoriteSpring(at: nil)
+            self.sidebar.list.carryToEdge(at: nil)
+            self.sidebar.clearDropTargets()
+            // Called off: back to the space it started in, as if it had never moved.
+            if cancelled, let origin = self.favoriteDragOrigin { self.tabManager.showSpaceKeepingPage(origin) }
+            self.favoriteDragOrigin = nil
+            self.listDropFinished()
+        }
+        sidebar.favorites.onJoin = { [weak self] favorite, targetID, onRight in
+            guard let self, !self.tabManager.isPrivate else { return }
+            self.pageChange(String(localized: "Split View", comment: "Undo action name, shown in the Edit menu as Undo Split View.")) { [tabManager = self.tabManager] in
+                Library.shared.joinFavorite(favorite, onto: targetID, onRight: onRight)
+                tabManager.openBookmark(favorite)
+            }
+        }
+        sidebar.favorites.onReorder = { [weak self] favorite, index in
+            guard let self, !self.tabManager.isPrivate else { return }
+            self.pageChange(String(localized: "Move Favorite", comment: "Undo action name, shown in the Edit menu as Undo Move Favorite.")) { Library.shared.moveFavorite(favorite.id, to: index) }
+        }
+        reloadFavorites()
+        sidebar.currentSpaceID = tabManager.currentSpaceID
+        sidebar.list.reload(animated: false)
+        showSelectedTab()
+        downloadsChanged()
+        window.eventInterceptor = { [weak self] event in self?.intercept(event) ?? false }
+        numberHints = NumberHints(controller: self)
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    /// Puts a tile group's lines where `shape` has them, and with `undoTo` makes ⌘Z return them there (#435).
+    func applyTileShape(_ shape: TileShape, undoTo inverse: TileShape?) {
+        guard let tab = tabManager.selectedTab, let group = tabManager.split(for: tab) else { return }
+        applyTileShape(shape, undoTo: inverse, in: group.ids)
+    }
+
+    /// As above, for the group of `ids`: a group's pages, not just where its lines were, so ⌘Z after selecting another
+    /// split leaves that one alone (#435).
+    private func applyTileShape(_ shape: TileShape, undoTo inverse: TileShape?, in ids: [UUID]) {
+        // The group the drag was in, wherever it is: another split can be showing when ⌘Z runs, and the step must
+        // still put its lines back rather than be used up doing nothing (#435).
+        guard let group = tabManager.splits.first(where: { $0.ids == ids }) else { return }
+        guard group.shape.regions == shape.regions, group.shape != shape else { return }
+        guard let page = group.ids.compactMap({ tabManager.tab(with: $0) }).first else { return }
+        tabManager.setTileShape(shape, for: page)
+        // Only the group on screen is drawn; the other split is left as it is.
+        if let shown = tabManager.selectedTab, tabManager.split(for: shown)?.ids == ids {
+            root.setTiles(shape, animated: true)
+            root.paneCards.forEach { $0.header.resetsLayout = shape.isParted }
+        }
+        onStateChange?()
+        guard let inverse else { return }
+        sidebarUndo.registerUndo(withTarget: self) { controller in
+            controller.applyTileShape(inverse, undoTo: shape, in: ids)
+        }
+        sidebarUndo.setActionName(String(localized: "Resize Tiles", comment: "Undo action name, shown in the Edit menu as Undo Resize Tiles."))
+    }
+
+    static func defaultFrame() -> NSRect {
+        let screen = NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
+        let size = NSSize(width: min(Tokens.Metric.windowDefaultSize.width, screen.width - Tokens.Space.x16),
+                          height: min(Tokens.Metric.windowDefaultSize.height, screen.height - Tokens.Space.x16))
+        return NSRect(x: screen.midX - size.width / 2, y: screen.midY - size.height / 2, width: size.width, height: size.height)
+    }
+
+    // MARK: Model changes
+
+    private func tabManagerChanged(_ change: TabManager.Change) {
+        switch change {
+        case .structure:
+            // Many at once (`TabManager.together`): once, when they're all done.
+            if tabManager.isBatching { break }
+            inPageMini.tabsChanged()
+            bothSidebars { $0.list.reload(animated: window?.isVisible == true) }
+            // Pinned or unpinned from a row, a drag or ⌘Z, or its opener closed: the star and Back follow.
+            refreshAddress(for: tabManager.selectedTab)
+            newTabNote.listChanged()
+            // A favorite opened or closed: its tile shows it.
+            reloadFavorites()
+            numberHints?.placesChanged()
+            desk.tabsChanged()
+            // A playing tab closed in the background: Now Playing lets it go, and so does the mini player.
+            updateNowPlaying()
+            miniPlayer.tabsChanged()
+        case .selection:
+            if tabManager.selectedTab != nil { commandBar.pageArrived() }
+            showSelectedTab()
+            // An AI app's bar goes with the tab it's using.
+            AgentControl.shared.refresh(self)
+            // "Translating…" belongs to its tab: it goes on there quietly, and shows again when you're back.
+            translationViewChanged()
+        case .space:
+            spaceChanged()
+        case .content:
+            updateNowPlaying()
+            miniPlayer.soundChanged()
+        }
+        onStateChange?()
+    }
+
+    private var lastSpaceID: UUID?
+    private(set) var handoff: NSUserActivity?
+
+    private func spaceChanged() {
+        inPageMini.closeShown()
+        let spaces = tabManager.listedSpaces
+        let old = lastSpaceID
+        let oldIndex = old.flatMap { id in spaces.firstIndex { $0.id == id } } ?? 0
+        let newIndex = spaces.firstIndex { $0.id == tabManager.currentSpaceID } ?? 0
+        // Only a drag needs a picture of the list: otherwise the old list itself slides away.
+        let snapshot = sidebar.list.isDragging ? sidebar.listSnapshot() : nil
+        lastSpaceID = tabManager.currentSpaceID
+        sidebar.currentSpaceID = tabManager.currentSpaceID
+        sidebar.reloadSpaces(current: tabManager.currentSpaceID)
+        sidebar.transitionList(direction: CGFloat((newIndex - oldIndex).signum()), from: old, snapshot: snapshot)
+        if let edgeSidebar {
+            edgeSidebar.currentSpaceID = tabManager.currentSpaceID
+            edgeSidebar.reloadSpaces(current: tabManager.currentSpaceID)
+            if EdgeSidebar.shared.isShowing {
+                edgeSidebar.transitionList(direction: CGFloat((newIndex - oldIndex).signum()), from: old, snapshot: nil)
+            } else {
+                edgeSidebar.list.reload(animated: false)
+            }
+        }
+        // The slide goes to Core Animation first, so it carries on from the fingers at once: the new color (and with
+        // it light or dark, which restyles everything) follows a moment later, and the page after that (tens of
+        // milliseconds of WebKit work). From here they run on their own, so a swipe never catches on that work.
+        CATransaction.flush()
+        // No window-wide cross-fade on a switch: the list is already sliding in, and a fade through a picture of the
+        // window would freeze that slide and ghost the traffic lights.
+        applySpaceColor(animated: true, crossFadesMode: false)
+        desk.spaceChanged()
+        CATransaction.flush()
+    }
+
+    /// A favorite held over another space's dot opens that space after a beat, so it can be dropped among that
+    /// space's tabs, as a tab can. Nil: the drag is over.
+    private var favoriteSpringTarget: (space: UUID, work: DispatchWorkItem)?
+    /// The space a favorite's drag started in, to go back to if it's called off.
+    private var favoriteDragOrigin: UUID?
+    private func favoriteSpring(at windowPoint: NSPoint?) {
+        let hovered = windowPoint.flatMap { sidebar.spaceDot(at: $0) }
+        guard hovered != favoriteSpringTarget?.space else { return }
+        favoriteSpringTarget?.work.cancel()
+        favoriteSpringTarget = nil
+        guard let hovered else { return }
+        Haptics.snap()
+        let work = DispatchWorkItem { [weak self] in
+            MainActor.assumeIsolated { self?.tabManager.showSpaceKeepingPage(hovered) }
+        }
+        favoriteSpringTarget = (hovered, work)
+        if hovered != tabManager.currentSpaceID { DispatchQueue.main.asyncAfter(deadline: .now() + 0.45, execute: work) }
+    }
+
+    private func isOverList(_ screenPoint: NSPoint) -> Bool {
+        guard let window else { return false }
+        let list = sidebar.list.enclosingScrollView ?? sidebar.list
+        return list.convert(list.bounds, to: nil).contains(window.convertPoint(fromScreen: screenPoint))
+    }
+
+    /// The window showing where a favorite carried from here would land, when that's another window's list.
+    private weak var favoriteDropWindow: BrowserWindowController?
+
+    /// Another window whose list is in front at a screen point, to take a favorite carried from here. Never to or
+    /// from a private window: its pages stay in it.
+    private func otherWindowForFavorite(at screenPoint: NSPoint) -> BrowserWindowController? {
+        guard !tabManager.isPrivate, let (controller, _) = SidebarListView.list(at: screenPoint), controller !== self,
+              !controller.tabManager.isPrivate else { return nil }
+        return controller
+    }
+
+    /// A favorite let go over this window's list: a pinned tab among the pinned ones (in a folder, if it's let go
+    /// among a folder's pages), or a regular tab among the tabs, right where it was dropped. Returns its new row.
+    func dropFavorite(_ favorite: Bookmark, at screenPoint: NSPoint) -> NSView? {
+        let landing = sidebar.list.dropTarget(at: screenPoint, allowsPinned: true)
+        let space = tabManager.currentSpaceID
+        if landing.section == .bookmarks {
+            pageChange(SavePath.saveName) {
+                Library.shared.pinFavorite(favorite.id, in: space, at: landing.index)
+                if let folder = landing.folder { Library.shared.moveBookmark(favorite.id, to: landing.index, in: space, folder: .some(folder)) }
+            }
+            return sidebar.list.row(forBookmark: favorite.id)
+        }
+        unfavoriteWithUndo(favorite.id, to: landing.index)
+        let tabs = tabManager.tabs(in: space)
+        return tabs.indices.contains(landing.index) ? sidebar.list.row(for: tabs[landing.index]) : nil
+    }
+
+    /// A pinned page carried over from another window's list: its open pages come along (one already open here stays
+    /// instead), it lands among the pinned tabs or the tabs right where it was dropped, and this window comes forward.
+    func takePinned(_ bookmarkID: UUID, from source: BrowserWindowController, at screenPoint: NSPoint) -> NSView? {
+        let ids = Library.shared.pinnedSplit(containing: bookmarkID).map(\.ids) ?? [bookmarkID]
+        // Sharing windows have the same pages (#162): nothing to bring over.
+        for id in ids where source.tabManager.store !== tabManager.store {
+            if tabManager.bookmarkTab(for: id) != nil {
+                if let live = source.tabManager.bookmarkTab(for: id) { source.tabManager.close(live) }
+            } else if let live = source.tabManager.detachBookmarkTab(id) {
+                tabManager.insertBookmarkTab(live, bookmarkID: id)
+            }
+        }
+        let landing = sidebar.list.dropTarget(at: screenPoint, allowsPinned: true)
+        let space = tabManager.currentSpaceID
+        window?.makeKeyAndOrderFront(nil)
+        if landing.section == .bookmarks {
+            pageChange(String(localized: "Move Pinned Tab", comment: "Undo action name, shown in the Edit menu as Undo Move Pinned Tab.")) { Library.shared.moveBookmark(bookmarkID, to: landing.index, in: space, folder: .some(landing.folder)) }
+            return sidebar.list.row(forBookmark: bookmarkID)
+        }
+        pageChange(SavePath.unsaveName) { [tabManager] in
+            // Into this space first, so it comes down among the tabs you're looking at.
+            Library.shared.moveBookmark(bookmarkID, to: Int.max, in: space)
+            tabManager.unbookmark(bookmarkID, toIndex: landing.index)
+        }
+        let tabs = tabManager.tabs(in: space)
+        return tabs.indices.contains(landing.index) ? sidebar.list.row(for: tabs[landing.index]) : nil
+    }
+
+    /// A favorite carried over from another window's Favorites: its open pages come along (one already open here
+    /// stays instead), it lands as it would from this window's own, and this window comes forward.
+    func takeFavorite(_ favorite: Bookmark, from source: BrowserWindowController, at screenPoint: NSPoint) -> NSView? {
+        let ids = Library.shared.favoriteSplits.first { $0.contains(favorite.id) }.map(\.ids) ?? [favorite.id]
+        for id in ids where source.tabManager.store !== tabManager.store {
+            if tabManager.bookmarkTab(for: id) != nil {
+                if let live = source.tabManager.bookmarkTab(for: id) { source.tabManager.close(live) }
+            } else if let live = source.tabManager.detachBookmarkTab(id) {
+                tabManager.insertBookmarkTab(live, bookmarkID: id)
+            }
+        }
+        let row = dropFavorite(favorite, at: screenPoint)
+        window?.makeKeyAndOrderFront(nil)
+        return row
+    }
+
+    /// The star at the end of the address (#326) and the share button beside it: the star is the quick save, or with ⇧
+    /// The star: a quick pin, or with ⇧ held the place picker.
+    private func wireAddressButtons() {
+        sidebar.address.saveButton.onClick = { [weak self] _ in self?.saveFromStar() }
+    }
+
+    private func reloadFavorites() {
+        // The tiles are the profile's of the space you're in.
+        let favorites = Library.shared.favorites(in: tabManager.profile.id)
+        let tabs = Dictionary(uniqueKeysWithValues: favorites.compactMap { favorite in tabManager.bookmarkTab(for: favorite.id).map { (favorite.id, $0) } })
+        bothSidebars {
+            $0.favorites.reload(favorites: Library.shared.favoriteTiles(in: tabManager.profile.id), selectedID: tabManager.selectedTab?.isFavorite == true ? tabManager.selectedTab?.bookmarkID : nil, tabs: tabs)
+            $0.needsLayout = true
+        }
+    }
+
+    private func libraryChanged() {
+        // The list and favorites reload once already: the tab manager hears the same change first and sends
+        // `.structure` (`tabManagerChanged`).
+        applySpaceColor(animated: true)
+        bothSidebars { $0.reloadSpaces(current: tabManager.currentSpaceID) }
+    }
+
+    /// Back or Forward lists the pages that way in Zigzag's menu: on a right-click, a press held down, or a finger held.
+    static func showsHistory(_ button: InteractiveView, back: Bool, of webView: @escaping () -> WKWebView?) {
+        button.drawsMenu = true
+        button.holdOpensMenu = true
+        button.onRightClick = { _ in historyMenu(of: webView(), back: back) }
+    }
+
+    /// The pages behind or ahead of `webView`'s page, nearest first, for a right-click on Back or Forward.
+    static func historyMenu(of webView: WKWebView?, back: Bool) -> NSMenu? {
+        guard let webView else { return nil }
+        let list = webView.backForwardList
+        let items = back ? Array(list.backList.reversed()) : list.forwardList
+        guard !items.isEmpty else { return nil }
+        let menu = NSMenu()
+        for item in items.prefix(15) {
+            let title = item.title?.isEmpty == false ? item.title! : (item.url.host() ?? item.url.absoluteString)
+            let entry = SidebarMenus.Item(String(title.prefix(60))) { [weak webView] in
+                if let owner = (webView as? BrowserWebView)?.owner { owner.go(to: item) } else { webView?.go(to: item) }
+            }
+            if let icon = SiteIcons.shownIcon(for: item.url, privateStore: (webView as? BrowserWebView)?.owner?.privateStore) {
+                let small = icon.copy() as! NSImage
+                small.size = NSSize(width: 16, height: 16)
+                entry.image = small
+            }
+            menu.addItem(entry)
+        }
+        return menu
+    }
+
+    /// Opens the space panel beside the sidebar (or closes it, if it's already showing that space).
+    func openSpaceEditor(_ spaceID: UUID, anchor: NSView? = nil) {
+        if EdgeSidebar.shared.isShowing { bringForwardForEdge() }
+        if !root.chromeSidebarShown && !root.isSidebarFloatingVisible { root.reveal(true) }
+        previews.hide()
+        SpaceEditorPanel.toggle(spaceID: spaceID, anchor: anchor, in: self)
+    }
+
+    /// While anything is being dragged in the space editor: the window shows that version of the space, unsaved.
+    func previewSpace(_ draft: SpaceInfo) {
+        sidebar.previewDotColor(draft.swatch, for: draft.id)
+        guard draft.id == tabManager.currentSpaceID, !tabManager.isPrivate else { return }
+        render(draft, animated: false)
+    }
+
+    @objc private func displayOptionsChanged() { applySpaceColor(animated: false) }
+
+    /// Settings › Appearance › Address bar above the page: the sidebar's own back, forward, reload and address move
+    /// to the bar above the page, or back. The same views, so everything that hangs from them follows; what was open
+    /// from them is put away first. At once: a setting you change, not a layout you watch.
+    @objc func placeAddress() {
+        let place = BrowserRootView.addressBarPlace
+        // In The Whole Screen the address comes down with the bar, whatever Settings › Appearance says: back, forward,
+        // reload and the address are one place while the page has the screen.
+        let above = Self.addressBelongsInBar(abovePage: place != .off, wholeScreen: pageFullScreenTab != nil)
+        if sidebar.holdsAddress != !above {
+            if window?.isVisible == true { closeFloatingPanels() }
+            sidebar.holdsAddress = !above
+            if above {
+                // The star rides in the pill's end with the address above the page (#437), not beside the extensions.
+                sidebar.address.starInPill = true
+                root.topBar.hold(buttons: sidebar.addressButtons, address: sidebar.address, pin: sidebar.address.saveButton)
+                let tab = tabManager.selectedTab
+                root.topBar.showPage(url: tab?.url, notSecure: tab?.isNotSecure ?? false)
+                root.topBar.showPin(sidebar.address.canSave)
+            } else {
+                root.topBar.pin = nil
+                sidebar.address.starInPill = false
+            }
+        }
+        root.barHoldsAddress = above
+        showTopBar()
+    }
+
+    /// Settings › Appearance › Sidebar position, or View › Move Sidebar to Right: the sidebar slides over to the
+    /// other edge and the pages glide the other way. What was open beside the sidebar is put away first.
+    @objc func placeSidebarSide() {
+        let onRight = BrowserRootView.sidebarOnRight
+        guard root.sidebarOnRight != onRight else { return }
+        let shown = window?.isVisible == true
+        if shown { closeFloatingPanels() }
+        previews.hide()
+        hideFloatingDownloads()
+        switchingSides = true
+        root.setSidebarOnRight(onRight, animated: shown)
+        switchingSides = false
+        layoutTrafficLights()
+    }
+
+    /// While the sidebar changes sides: the lights' room in its row follows at once, with no picture riding over.
+    private var switchingSides = false
+
+    /// Handoff, as in Safari: the key window's page, offered to your iPhone, iPad or other Mac while it stays key.
+    func updateHandoff(asKey: Bool = false) {
+        let page = (asKey || window?.isKeyWindow == true) && !NSApp.isHidden ? handoffPage : nil
+        handoff = HandoffPage.update(handoff, to: page)
+    }
+
+    /// The page Handoff offers while this window is key.
+    var handoffPage: HandoffPage? {
+        let tab = tabManager.selectedTab
+        return HandoffPage.advertised(url: tab?.url, title: tab?.title ?? "", isPrivate: tabManager.isPrivate,
+                                      errorPage: tab?.showsErrorPage ?? false)
+    }
+
+    /// Whether the window shows a look partway to another space, mid-swipe.
+    private var showsSwipeLook = false
+
+    /// Mid-swipe: the window's look `share` of the way to `id`'s, as far as the fingers have pulled that space in. Nil
+    /// or none of the way: the current space's own again, as when a swipe is called off.
+    private func swipeLook(toward id: UUID?, share: CGFloat) {
+        guard !tabManager.isPrivate else { return }
+        let space = tabManager.currentSpace
+        guard let id, id != space.id, share > 0, let next = Library.shared.space(id) else {
+            if showsSwipeLook { applySpaceColor(animated: true, crossFadesMode: false) }
+            return
+        }
+        showsSwipeLook = true
+        let (color, end) = root.paint(space, toward: next, share: share)
+        root.sidebarContainer.tint = color
+        root.sidebarContainer.gradient = end.map { ($0, share < 0.5 ? space.gradientAngle : next.gradientAngle) }
+        let t = Double(min(share, 1))
+        root.sidebarContainer.grain = (space.grain ?? 0) * (1 - t) + (next.grain ?? 0) * t
+        root.sidebarContainer.texture = t < 0.5 ? space.texture : next.texture
+        copyEdgeLook()
+        root.showEmptyPage(of: space, toward: next, share: share)
+    }
+
+    private func applySpaceColor(animated: Bool, crossFadesMode: Bool = true) {
+        Freezes.mark("space color")
+        showsSwipeLook = false
+        lastSpaceID = tabManager.currentSpaceID
+        render(tabManager.currentSpace, animated: animated, crossFadesMode: crossFadesMode)
+    }
+
+    /// Draws the window for a space: its mode, color, gradient, how see-through it is, and grain.
+    private func render(_ space: SpaceInfo, animated: Bool, crossFadesMode: Bool = true) {
+        let (color, end) = root.paint(space, isPrivate: tabManager.isPrivate, animated: animated, crossFadesMode: crossFadesMode)
+        root.sidebarContainer.tint = color
+        root.sidebarContainer.gradient = end.map { ($0, space.gradientAngle) }
+        root.sidebarContainer.grain = tabManager.isPrivate ? 0 : space.grain ?? 0
+        #if DEBUG
+        if GlassVariant.now.dropsGrain { root.sidebarContainer.grain = 0 }
+        #endif
+        root.sidebarContainer.texture = space.texture
+        root.sidebarContainer.windowGlass = root.windowGlass
+        copyEdgeLook()
+        root.showEmptyPage(of: space, isPrivate: tabManager.isPrivate, animated: animated)
+        // Another profile's space, whose buttons this window shows now.
+        if #available(macOS 15.4, *) { ExtensionCenter.toolbarAppearanceChanged() }
+    }
+
+    #if DEBUG
+    /// Redraws the window for a new `GlassVariant`.
+    func debugApplyGlassVariant() {
+        applySpaceColor(animated: false)
+        root.paneCards.forEach { $0.debugRefreshVariant() }
+    }
+    #endif
+
+    /// Back, Forward, Reload, the address and its star for the page you're on, in the sidebar or the bar above the
+    /// page: the one place every path refreshes them, so none shows another's state.
+    func refreshAddress(for tab: Tab?) {
+        sidebar.update(tab: tab)
+        root.topBar.showPage(url: tab?.url, notSecure: tab?.isNotSecure ?? false)
+        root.topBar.showPin(sidebar.address.canSave)
+    }
+
+    private func showSelectedTab() {
+        Freezes.mark("tab switch")
+        inPageMini.willSelect(tabManager.selectedTab)
+        previews.hide()
+        let tab = tabManager.selectedTab
+        // The site panel describes one page; another tab coming forward takes it away.
+        if SitePanel.isOpen(in: window), SitePanel.shown?.describes(tab) == false { SitePanel.closeCurrent() }
+        updateHandoff()
+        if tab !== shownTab {
+            // So is Capture.
+            capture.cancel()
+            // Each tab shows with its bar there (#359).
+            resetAutohide(animated: false)
+            // Reader stays over its pane when you click into the other half of the split; anywhere else, it goes.
+            let readerStillShown = readerTab != nil && (tab.map { tabManager.partners(of: $0) } ?? []).contains { $0 === readerTab }
+            if !readerStillShown { closeReader() }
+            // A page leaving the screen gives back the browser's space first, so its video can follow you.
+            if let full = pageFullScreenTab, full !== tab { PageFullScreen.exit(full) }
+            // A video playing in a page you're leaving follows you in the mini player; coming back puts it in its page.
+            let before = root.paneCards.enumerated().compactMap { i, card in i == 0 || !card.isHidden ? card.webView : nil }
+                .compactMap { ($0 as? BrowserWebView)?.owner }
+            // Not from an unattended window: its video would come up on your screen from pages you never see.
+            if !isUnattended { miniPlayer.switched(from: before, to: tab.map { tabManager.panes(of: $0) } ?? []) }
+            shownTab = tab
+            selectedTabToken = tab?.changed.observe { [weak self] change in self?.selectedTabChanged(change) }
+            if let tab, !tabManager.isShownElsewhere(tab), let webView = pageView(of: tab), window?.isKeyWindow == true, !commandBar.isVisible {
+                DispatchQueue.main.async { [weak self] in self?.window?.makeFirstResponder(webView) }
+            }
+        }
+        showPages()
+        // Shown in a pane some other way (split beside the page you're on): the mini player lets it go.
+        miniPlayer.tabsChanged()
+        // Back on the tab whose video went to the mini player: return it to the page.
+        AutoPictureInPicture.shared.reconsider()
+        refreshAddress(for: tab)
+        paintTopBar()
+        // A collapsed pinned section and a folded tab group (#209) show the current tab, so they update with the
+        // selection.
+        let space = tabManager.currentSpaceID
+        if SidebarListView.isCollapsed(space) || tabManager.groups(in: space).contains(where: { !$0.isOpen }) {
+            bothSidebars { $0.list.reload(animated: true) }
+        } else {
+            bothSidebars { $0.list.refreshRows() }
+        }
+        reloadFavorites()
+        newTabNote.listChanged()
+        sidebar.address.setCapture(camera: tab?.isUsingCamera ?? false, microphone: tab?.isUsingMicrophone ?? false)
+        updateWindowTitle()
+        refreshExtensionActions()
+        updateNowPlaying()
+        offerWebStoreExtension()
+        updateReaderButton()
+        updateTranslateButton()
+        findBar.pageChanged()
+    }
+
+    /// What the profile you're in decided about its extensions: the menus and the pins by the address are about those.
+    private var installs: ExtensionInstalls { tabManager.profile.installs }
+
+    /// Where an extension may read and change pages, Chrome's three choices, for `tab`'s site.
+    static func siteAccessItem(for id: String, profile: Profile, tab: Tab?, isPrivate: Bool) -> NSMenuItem {
+        let item = NSMenuItem(title: String(localized: "Site Access", comment: "Submenu of an extension's menu: which sites the extension may read and change."), action: nil, keyEquivalent: "")
+        item.image = Tokens.Symbol.image("globe")
+        let menu = NSMenu()
+        menu.autoenablesItems = false
+        let installs = profile.installs
+        let access = installs.siteAccess(id)
+        // A private window's site isn't offered: choosing it would keep it.
+        let site = isPrivate ? nil : ContentBlocker.site(of: tab?.url)
+        let all = SidebarMenus.Item(String(localized: "On All Sites", comment: "Site Access choice: the extension works on every site.")) { installs.setSiteAccess(id, .all); tab?.reload() }
+        all.state = access == .all && !profile.extensions.asksForSitesOnlyOptionally(id) ? .on : .off
+        let click = SidebarMenus.Item(String(localized: "On Click", comment: "Site Access choice: the extension works on a site only after its button is clicked.")) { installs.setSiteAccess(id, .click, sites: []); tab?.reload() }
+        click.state = access == .click ? .on : .off
+        menu.addItem(all)
+        menu.addItem(click)
+        if let site {
+            let sites = access == .sites ? installs.accessSites(id) : []
+            let listed = sites.contains(site)
+            let only = SidebarMenus.Item(access == .sites ? String(localized: "On \(site)", comment: "Site Access choice: the extension works on this site, one of the sites listed for it. The site is a domain.")
+                                                                 : String(localized: "Only on \(site)", comment: "Site Access choice: the extension works only on this site. The site is a domain.")) {
+                let next = listed ? sites.filter { $0 != site } : sites + [site]
+                installs.setSiteAccess(id, .sites, sites: next)
+                tab?.reload()
+            }
+            only.state = listed ? .on : .off
+            menu.addItem(.separator())
+            menu.addItem(only)
+            // Turned off from the high energy notice: choosing it turns it back on.
+            if installs.offSites(id).contains(site) {
+                let off = SidebarMenus.Item(String(localized: "Off on \(site)", comment: "Site Access choice, checked: the extension is turned off on this site. Choosing it turns it back on there. The site is a domain.")) {
+                    installs.setOff(id, on: site, false)
+                    tab?.reload()
+                }
+                off.state = .on
+                menu.addItem(off)
+            }
+            if access == .sites {
+                for other in sites where other != site {
+                    let entry = SidebarMenus.Item(String(localized: "On \(other)", comment: "Site Access choice: the extension works on this site, one of the sites listed for it. The site is a domain.")) { installs.setSiteAccess(id, .sites, sites: sites.filter { $0 != other }) }
+                    entry.state = .on
+                    menu.addItem(entry)
+                }
+            }
+        }
+        item.submenu = menu
+        return item
+    }
+
+    /// What you can change for the site you're on: right-click the address.
+    /// Clearing can't be taken back, so it asks first, even for the cache, which only costs a slower first load.
+    func confirmClearCache() {
+        // The profile you're in when you ask; a private window's own store.
+        let store = tabManager.privateStore ?? tabManager.profile.store
+        let only = ProfileSheets.onlyNote(tabManager.isPrivate ? nil : tabManager.profile.id)
+        ConfirmSheet.show(in: root.overlay, title: String(localized: "Clear the cache for every site?", comment: "Title of the sheet that asks before clearing every site's cache."),
+                          message: Words.sentences(String(localized: "Pages load a little slower the first time you open them again. You stay signed in.", comment: "Message of the sheet that asks before clearing every site's cache."), only),
+                          confirmTitle: String(localized: "Clear Cache", comment: "Button that clears the cache, in the sheet that asks first."), destructive: false) { [weak self] confirmed in
+            guard confirmed else { return }
+            Task { @MainActor in
+                await WebsiteData.clear(.cache, in: store)
+                if let self { Toast.show(String(localized: "Cache cleared", comment: "Toast after every site's cache is cleared."), symbol: "arrow.clockwise", duration: 2, in: self) }
+            }
+        }
+    }
+
+    /// Signing out of every site is a big step, so it asks first.
+    func confirmClearCookies() {
+        // The profile you're in when you ask; a private window's own store.
+        let store = tabManager.privateStore ?? tabManager.profile.store
+        let only = ProfileSheets.onlyNote(tabManager.isPrivate ? nil : tabManager.profile.id)
+        // Sites you keep cookies for are left alone; a private window keeps none.
+        let kept = tabManager.isPrivate ? [] : KeptCookies.sites(in: tabManager.profile.id)
+        ConfirmSheet.show(in: root.overlay, title: kept.isEmpty ? String(localized: "Clear cookies for every site?", comment: "Title of the sheet that asks before clearing every site's cookies.") : KeptCookies.clearTitle,
+                          message: Words.sentences(kept.isEmpty ? String(localized: "You’ll be signed out of every site. Your passwords, pinned tabs and history stay.", comment: "Message of the sheet that asks before clearing every site's cookies.")
+                                                                : KeptCookies.clearMessage(keeping: kept.count), only),
+                          confirmTitle: String(localized: "Clear Cookies", comment: "Button that clears cookies, in the sheet that asks first."), destructive: true) { [weak self] confirmed in
+            guard confirmed else { return }
+            Task { @MainActor in
+                await WebsiteData.clear(.cookies, keeping: kept, in: store)
+                self?.tabManager.selectedTab?.reload()
+                let toast = kept.isEmpty ? String(localized: "Cookies cleared. You’re signed out everywhere.", comment: "Toast after every site's cookies are cleared.")
+                                         : String(localized: "Cookies cleared, except for the sites you keep", comment: "Toast after every site's cookies are cleared but those of the sites that keep theirs (Settings › Privacy).")
+                if let self { Toast.show(toast, symbol: "trash", duration: 2.4, in: self) }
+            }
+        }
+    }
+
+    /// Clears one site's cache or cookies, then loads its page again: from Site Controls' ⋯ menu, View › Developer
+    /// and the command bar, which all ask the same way. Only a web site has a cache and cookies of its own.
+    func confirmClear(_ kind: WebsiteData.Kind, of tab: Tab) {
+        Self.confirmClear(kind, of: tab, over: root.overlay) { [weak self] text in
+            if let self { Toast.show(text, symbol: "checkmark.circle", in: self) }
+        }
+    }
+
+    /// The sheet over `overlay` that asks before clearing one site's cache or cookies, then clears them; `done` says
+    /// what was cleared. A browser window's, and Zigzag Mini's (#225).
+    static func confirmClear(_ kind: WebsiteData.Kind, of tab: Tab, over overlay: NSView, done: @escaping @MainActor (String) -> Void) {
+        guard let url = tab.url, ["http", "https"].contains(url.scheme?.lowercased() ?? ""), let site = ContentBlocker.site(of: url) else { return }
+        let cookies = kind == .cookies
+        let message = cookies ? String(localized: "You’ll be signed out of \(site). Other sites aren’t touched.", comment: "Message of the sheet that asks before clearing one site's cookies.")
+                              : String(localized: "It loads a little slower the first time. You stay signed in.", comment: "Message of the sheet that asks before clearing one site's cache.")
+        ConfirmSheet.show(in: overlay,
+                          title: cookies ? String(localized: "Clear cookies for \(site)?", comment: "Title of the sheet that asks before clearing one site's cookies. The site is a domain, like example.com.")
+                                         : String(localized: "Clear the cache for \(site)?", comment: "Title of the sheet that asks before clearing one site's cache. The site is a domain, like example.com."),
+                          message: Words.sentences(message, tab.isDevelopment ? Self.everyPortNote(for: url, site: site) : nil),
+                          confirmTitle: cookies ? String(localized: "Clear Cookies", comment: "Button that clears cookies, in the sheet that asks first.")
+                                                : String(localized: "Clear Cache", comment: "Button that clears the cache, in the sheet that asks first."), destructive: cookies) { [weak tab] confirmed in
+            guard confirmed, let tab else { return }
+            Task { @MainActor in
+                await WebsiteData.clear(kind, site: site, in: tab.privateStore ?? tab.profile.store)
+                tab.reload()
+                done(kind == .cache ? String(localized: "Cache cleared for \(site)", comment: "Toast after one site's cache is cleared. The site is a domain, like example.com.")
+                                    : String(localized: "Cookies cleared for \(site)", comment: "Toast after one site's cookies are cleared. The site is a domain, like example.com."))
+            }
+        }
+    }
+
+    /// Added to that sheet on a development tab whose address has a port of its own (a development server): what
+    /// a site keeps is kept for its host, so clearing localhost:3000 clears every other project on localhost too.
+    /// `site`: the site as the sheet names it.
+    static func everyPortNote(for url: URL, site: String) -> String? {
+        guard let port = url.port, port != (url.scheme?.lowercased() == "https" ? 443 : 80) else { return nil }
+        return String(localized: "That’s every port of \(site), not only \(String(port)).", comment: "Added to the message of the sheet that asks before clearing one site's cache or cookies, on a development site whose address has a port, like localhost:3000. The first placeholder is the site, the second the port's number.")
+    }
+
+    private var offeredExtensionID: String?
+
+    /// On an extension's Chrome Web Store page, offers to add it to Zigzag (the store's own button only works in Chrome).
+    private func offerWebStoreExtension() {
+        guard #available(macOS 15.4, *) else { return }
+        let id = ExtensionStore.webStoreID(from: tabManager.selectedTab?.url)
+        guard id != offeredExtensionID else { return }
+        if offeredExtensionID != nil { WebStoreOffer.hide() }
+        offeredExtensionID = id
+        guard let id, !installs.isInstalled(id) else { return }
+        // Shown once the page has its title, so the bar can name the extension, and only where the store's own
+        // button hasn't taken over (WebStoreButton): the bar stays for a store page that no longer asks it.
+        DispatchQueue.main.asyncAfter(deadline: .now() + WebStoreButton.grace) { [weak self] in
+            guard let self, self.offeredExtensionID == id, !WebStoreButton.isEngaged(self.selectedWebView, for: id) else { return }
+            WebStoreOffer.show(id, in: self)
+        }
+    }
+
+    /// The store's own button asked about the listing on screen: the bar over it steps aside.
+    func webStoreButtonTookOver(_ id: String) {
+        guard offeredExtensionID == id else { return }
+        WebStoreOffer.hide()
+    }
+
+    /// The store's own button: Zigzag's usual download, review sheet and toasts, then whether it went in.
+    func installExtensionFromStore(_ id: String) async -> Bool {
+        await withCheckedContinuation { done in
+            var finished = false
+            installExtension(id, also: { stage in
+                guard !finished else { return }
+                switch stage {
+                case .added: finished = true; done.resume(returning: true)
+                case .failed, .cancelled, .theme: finished = true; done.resume(returning: false)
+                case .downloading, .reviewing, .adding: break
+                }
+            })
+        }
+    }
+
+    /// Adding from the store: verify the package, show what it can do, install only once confirmed.
+    enum InstallStage {
+        case downloading, reviewing, adding, added(String), failed(String), cancelled, theme
+        var isReviewing: Bool { if case .reviewing = self { true } else { false } }
+    }
+
+    /// Installs from the store: verify the package, show its permissions, install once confirmed. `progress` gets each
+    /// stage (the store bar); without it, toasts show them. `also` gets stages alongside toasts (the store button waits
+    /// on it). `into`: the sheet's starting profile when not the window's (from Settings).
+    func installExtension(_ id: String, into chosenProfile: Profile? = nil, progress: ((InstallStage) -> Void)? = nil, also: ((InstallStage) -> Void)? = nil) {
+        guard #available(macOS 15.4, *) else { also?(.failed("")); return }
+        // The profile you were in when you asked: it's added there, wherever you are by the time it's ready.
+        let profile = chosenProfile ?? tabManager.profile
+        let report: (InstallStage) -> Void = { [weak self] stage in
+            also?(stage)
+            if let progress { progress(stage); return }
+            guard let self else { return }
+            switch stage {
+            case .downloading: Toast.show(String(localized: "Downloading extension…", comment: "Toast while an extension downloads from the Chrome Web Store."), symbol: "arrow.down.circle", duration: 3600, in: self)
+            case .reviewing, .cancelled: Toast.hide(in: self)
+            case .theme: Toast.show(ExtensionStore.InstallError.theme.message, symbol: "exclamationmark.triangle", duration: 4, in: self)
+            case .adding: Toast.show(String(localized: "Adding…", comment: "Toast while an extension is being added."), symbol: "arrow.down.circle", duration: 3600, in: self)
+            case .added(let name): Toast.show(String(localized: "Added \(name)", comment: "Toast after an extension is added. The name is the extension's."), symbol: "checkmark.circle", duration: 2, in: self)
+            case .failed(let message): Toast.show(message, symbol: "exclamationmark.triangle", duration: 4, in: self)
+            }
+        }
+        report(.downloading)
+        Task { [weak self] in
+            let result = await ExtensionStore.prepareInstall(id)
+            guard let self else { return }
+            switch result {
+            case .failure(.theme):
+                // A theme has nothing for Zigzag to install: the store bar says so in its line, anywhere else a toast does (#454).
+                report(.theme)
+            case .failure(let error):
+                report(.failed(error.message))
+            case .success(let prepared):
+                report(.reviewing)
+                let info = prepared.extensionInfo
+                let content = ExtensionSheet.Content(
+                    icon: info.icon(for: NSSize(width: 40, height: 40)),
+                    title: info.displayName.map { String(localized: "Add \($0)?", comment: "Title of the sheet that asks before adding an extension. The name is the extension's.") }
+                        ?? String(localized: "Add this extension?", comment: "Title of the sheet that asks before adding an extension that has no name."),
+                    subtitle: String(localized: "Version \(prepared.version), from the Chrome Web Store", comment: "Under the title of the sheet that asks before adding an extension."),
+                    heading: String(localized: "It will be able to", comment: "Heading over the list of what an extension can do, in the sheet that asks before adding it."),
+                    report: prepared.report,
+                    confirm: String(localized: "Add Extension", comment: "Button that adds the extension, in the sheet that asks first."),
+                    cancel: String(localized: "Cancel", comment: "Button that closes a sheet without doing anything."))
+                // With more than one profile, the sheet says which it's added to, and lets you choose another.
+                let profiles = Library.shared.profiles
+                var asked = content
+                if profiles.count > 1 {
+                    asked.destination = ExtensionSheet.Destination(
+                        label: String(localized: "Add to", comment: "Label in the sheet that asks before adding an extension, before the choice of the profile it's added to."),
+                        options: ProfileChoice.options(profiles),
+                        selected: profiles.firstIndex { $0.id == profile.id } ?? 0)
+                }
+                var sheet: ExtensionSheet?
+                sheet = ExtensionSheet.present(asked, in: self, onConfirm: {
+                    let chosen = sheet.map { $0.destinationIndex }.flatMap { profiles.indices.contains($0) ? profiles[$0] : nil }
+                    // The profile chosen, held while the extension goes into it so it isn't removed meanwhile. One
+                    // removed while the sheet was up gets nothing: never the first profile in its place.
+                    guard let profile = Profiles.shared.listed(profiles.count > 1 ? chosen?.id ?? profile.id : profile.id),
+                          Profiles.shared.hold(profile.id) else {
+                        ExtensionStore.discard(prepared)
+                        report(.failed(String(localized: "The profile this was going to has been deleted. Nothing was added.", comment: "Toast when the profile chosen in the sheet that adds an extension was deleted before the extension went in.")))
+                        return
+                    }
+                    report(.adding)
+                    Task {
+                        defer { Profiles.shared.done(profile.id) }
+                        switch await ExtensionStore.finishInstall(prepared, in: profile) {
+                        case .success(let name):
+                            report(.added(name))
+                            // After the store bar has gone, when it's up, so the two never sit on each other.
+                            DispatchQueue.main.asyncAfter(deadline: .now() + (progress == nil ? 1.5 : 3.4)) { [weak controller = self] in
+                                controller?.offerSearchEngine(of: id)
+                                controller?.offerICloudPasswords(of: id, in: profile)
+                            }
+                        case .failure(let error): report(.failed(error.message))
+                        }
+                    }
+                }, onCancel: {
+                    ExtensionStore.discard(prepared)
+                    report(.cancelled)
+                })
+            }
+        }
+    }
+
+
+    /// An extension just added that gives a search engine ("ChatGPT search"): asked, never switched to behind your
+    /// back. Not now, it stays one of the engines in Settings.
+    private func offerSearchEngine(of id: String) {
+        guard let provider = ExtensionSearchProvider.provider(for: id), !ExtensionSearchProvider.isChosen(id) else { return }
+        Toast.show(String(localized: "\(provider.name) can be your search engine", comment: "Toast after adding an extension that gives a search engine. The name is the engine's, like ChatGPT."),
+                   symbol: "magnifyingglass",
+                   action: (String(localized: "Use", comment: "Button in the toast offering an extension's search engine: makes it the one Zigzag searches with."), { ExtensionSearchProvider.use(provider) }),
+                   duration: 10, closes: true, in: self)
+    }
+
+    /// iCloud Passwords extension added while Zigzag still uses iCloud for passwords: ask once whether it takes over
+    /// (#248), never switch silently. Also in Settings › Passwords.
+    private func offerICloudPasswords(of id: String, in profile: Profile) {
+        let offered = ProfileKey.iCloudPasswordsOffered.name(in: profile.id)
+        guard id == ICloudPasswords.id, ICloudPasswords.isOn(in: profile),
+              PasswordFiller.offersSwitch(chosen: PasswordFiller.chosen(in: profile.id),
+                                          zigzagHandles: PasswordCapture.offersToSave(in: profile) || Autofill.isOn(in: profile),
+                                          offered: UserDefaults.standard.bool(forKey: offered)) else { return }
+        UserDefaults.standard.set(true, forKey: offered)
+        Toast.show(String(localized: "Use iCloud Passwords instead of Zigzag’s?", comment: "Toast after adding Apple's iCloud Passwords extension while Zigzag itself still saves and fills passwords. iCloud Passwords is the extension's name, as Apple writes it."),
+                   symbol: "key",
+                   action: (String(localized: "Use", comment: "Button in the toast offering iCloud Passwords: it fills passwords instead of Zigzag."), { ICloudPasswords.use(in: profile) }),
+                   duration: 10, closes: true, in: self)
+    }
+
+    /// An update that wants more access waits for this.
+    func reviewExtensionUpdate(_ id: String) {
+        guard #available(macOS 15.4, *) else { return }
+        Task { [weak self] in
+            guard let (info, report) = await ExtensionStore.pendingUpdateReport(id), let self else { return }
+            let content = ExtensionSheet.Content(
+                icon: info.icon(for: NSSize(width: 40, height: 40)),
+                title: info.displayName.map { String(localized: "\($0) wants more access", comment: "Title of the sheet shown when an extension's update asks for more access. The name is the extension's.") }
+                    ?? String(localized: "This extension wants more access", comment: "Title of the sheet shown when an update of an extension with no name asks for more access."),
+                subtitle: info.version.map { String(localized: "Version \($0) is ready. Until you allow it, the current version keeps running.", comment: "Under the title of the sheet shown when an extension's update asks for more access.") }
+                    ?? String(localized: "An update is ready. Until you allow it, the current version keeps running.", comment: "Under the title of the sheet shown when an extension's update asks for more access, when the update has no version."),
+                heading: String(localized: "It would also be able to", comment: "Heading over the list of what an extension's update could also do."),
+                report: report,
+                confirm: String(localized: "Allow and Update", comment: "Button that allows an extension's update its new access."),
+                cancel: String(localized: "Not Now", comment: "Button that leaves an extension's update waiting."))
+            ExtensionSheet.present(content, in: self, onConfirm: {
+                Task { await ExtensionStore.approvePendingUpdate(id) }
+            })
+        }
+    }
+
+    /// Tabs with Now Playing cards, and those the user hid.
+    private var nowPlayingChoice = NowPlayingChoice()
+
+    /// The pane enlarged over the others for a moment, if any (#160).
+    private(set) var paneZoom = PaneZoom()
+    /// The split's pages, shape and zoomed pane as last shown, to tell when the panes move (`showPages`).
+    private var shownPaneLayout = ""
+    private var zoomEscMonitor: Any?
+
+    /// Zooms `tab`'s pane over the rest of its split or group, or puts it back if it's the one zoomed. Zoomed, it's
+    /// the pane you're in.
+    func toggleZoom(_ tab: Tab) {
+        guard let pair = tabManager.split(for: tab) else { return }
+        paneZoom.toggle(tab.id, in: pair.ids, places: pair.shape.regions)
+        if paneZoom.isZoomed, tabManager.selectedTab !== tab { tabManager.select(tab) } else { showPages() }
+        if paneZoom.isZoomed, let webView = tab.webView { window?.makeFirstResponder(webView) }
+    }
+
+    /// Puts the zoomed pane back, if one is.
+    func unzoomPane() {
+        guard paneZoom.isZoomed else { return }
+        paneZoom.clear()
+        showPages()
+    }
+
+    /// While a pane is zoomed, Esc puts it back; other keys go to the page as usual.
+    private func refreshZoomEsc() {
+        if paneZoom.isZoomed, zoomEscMonitor == nil {
+            zoomEscMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+                guard let self, self.paneZoom.isZoomed, event.keyCode == 53, event.window === self.window,
+                      event.modifierFlags.intersection([.command, .option, .control, .shift]).isEmpty,
+                      !(self.window?.firstResponder is NSText) else { return event }
+                self.unzoomPane()
+                return nil
+            }
+        } else if !paneZoom.isZoomed, let monitor = zoomEscMonitor {
+            NSEvent.removeMonitor(monitor)
+            zoomEscMonitor = nil
+        }
+    }
+
+    /// The developer tools' buttons (#141), in the bar above the page of a development tab shown on its own.
+    private lazy var developerBarTools: DeveloperBarTools = {
+        let tools = DeveloperBarTools()
+        // It says the size the page really is, which the card knows.
+        root.card.onPageArea = { [weak tools, weak card = root.card] area in
+            tools?.pageScale = card?.pageScale ?? 1
+            tools?.pageRoom = area
+        }
+        tools.pageScale = root.card.pageScale
+        tools.pageRoom = root.card.pageArea
+        return tools
+    }()
+
+    /// Gives the page you're on its developer tools in the bar above it, or takes them away: a development tab, on
+    /// its own. With the address kept in the sidebar, the bar comes for them alone.
+    private func showDeveloperBarTools() {
+        let tab = tabManager.selectedTab
+        showPageSize()
+        let shows = showsDeveloperBarTools(for: tab)
+        // Never made for a window that has no use for it.
+        let had = root.topBar.accessory != nil
+        guard shows || had else { return }
+        root.topBar.accessory = shows ? developerBarTools : nil
+        developerBarTools.show(shows ? tab : nil, in: self)
+        if shows != had { showTopBar() }
+    }
+
+    /// The bar above the page is there while it holds the address (Settings › Appearance) or a page's own tools.
+    /// The address and the sidebar's rows are where the setting puts them either way: nothing in the sidebar moves
+    /// for a bar that's there for the tools alone.
+    private func showTopBar() {
+        // The Whole Screen owns the bar while it lasts: Autohide stands down, and starts over after.
+        let autohides = root.barHoldsAddress && BrowserRootView.addressBarPlace == .autohide && !root.isImmersive
+        if autohides != root.autohidesBar { autohidePanes.removeAll() }
+        root.autohidesBar = autohides
+        syncScrollReports()
+        root.showsTopBar = root.barHoldsAddress || root.topBar.accessory != nil
+        root.needsLayout = true
+        root.layoutSubtreeIfNeeded()
+        layoutTrafficLights()
+        paintTopBar()
+    }
+
+    /// One pane's Autohide state: each pane's bar follows its own page (#359).
+    private struct AutohidePaneState {
+        var tab: ObjectIdentifier?
+        var lastScrollY: CGFloat = 0
+        var reported = false
+        var locked = false
+        var dragging = false
+        var gestureActive = false
+        var lastWheelAt: TimeInterval = 0
+    }
+    private var autohidePanes: [Int: AutohidePaneState] = [:]
+    /// The pointer monitor that brings an Autohide bar back near the window's top.
+    private var autohidePointerMonitor: Any?
+    /// While the sidebar is sliding: the bar stays as it is, so the lights don't have to cross it.
+    private var sidebarMovingUntil = Date.distantPast
+    /// Settles a bar left part way out once the scroll stops.
+    private var autohideSettleWork: DispatchWorkItem?
+    /// How long a scroll has to stop before the bar settles.
+    static let autohideSettleDelay: TimeInterval = 0.2
+
+    /// The pane a page is in: its place in the selected tab's group, one page with index 0.
+    func paneIndex(of tab: Tab) -> Int? {
+        guard let selected = tabManager.selectedTab else { return nil }
+        return tabManager.panes(of: selected).firstIndex { $0 === tab }
+    }
+
+    /// A new gesture may move the bar again after one took it out.
+    private func beginAutohideGesture(state: inout AutohidePaneState) {
+        state.locked = false
+    }
+
+    /// AppKit's phases tell a new scroll gesture from the rest of one.
+    func noteScrollGesture(_ event: NSEvent, inPane index: Int) {
+        var state = autohidePanes[index] ?? AutohidePaneState()
+        if event.phase == .began {
+            beginAutohideGesture(state: &state)
+            state.gestureActive = true
+        } else if event.phase == .changed, !state.gestureActive {
+            // Some devices send a change without a began; treat it as the gesture's start.
+            beginAutohideGesture(state: &state)
+            state.gestureActive = true
+        } else if event.phase == .ended || event.phase == .cancelled {
+            // The gesture is over. The lock stays until the next gesture begins.
+            state.gestureActive = false
+            settleAutohideSoon()
+        } else if event.phase.isEmpty, event.momentumPhase.isEmpty {
+            // A wheel or a mouse's scroll: a new burst after a pause, one gesture while it keeps coming.
+            if event.timestamp - state.lastWheelAt > 0.25 { beginAutohideGesture(state: &state) }
+            state.lastWheelAt = event.timestamp
+        }
+        autohidePanes[index] = state
+        // A scroll up with the page already at its top: no scroll is left to report, so the bar comes back here.
+        if event.scrollingDeltaY > 0, state.reported, state.lastScrollY <= 0.5, root.autohidesBar, root.barHoldsAddress,
+           root.autohideOffset(at: index) > 0, !autohideHeld(inPane: index) {
+            reveal(pane: index)
+        }
+    }
+
+    /// A page's scroll report; `delta` is its own movement since the last one, when the page sends it.
+    func pageScrolled(to y: CGFloat, by delta: CGFloat? = nil, trusted: Bool, editing: Bool, dragging: Bool = false, key: Bool = false,
+                      inPane index: Int = 0, tab: Tab? = nil) {
+        let pane = max(0, min(index, root.autohidePaneCount - 1))
+        var state = autohidePanes[pane] ?? AutohidePaneState()
+        // A page put into this pane since the last report starts over: its first place is its own.
+        if let tab, state.tab != ObjectIdentifier(tab) {
+            state = AutohidePaneState(tab: ObjectIdentifier(tab))
+            root.setAutohideOffset(0, at: pane)
+        }
+        let delta = state.reported ? delta ?? y - state.lastScrollY : 0
+        state.lastScrollY = y
+        state.reported = true
+        // A scroll-bar drag is one gesture from press to release, as a trackpad swipe is.
+        if dragging, !state.dragging {
+            beginAutohideGesture(state: &state)
+        }
+        state.dragging = dragging
+        autohidePanes[pane] = state
+        guard root.autohidesBar, root.barHoldsAddress, root.showsTopBar, !editing, trusted, !autohideHeld(inPane: pane) else { return }
+        // A key scroll is its own gesture.
+        if key { state.locked = false }
+        // Up to the very top: the bar's place, however it went.
+        if y <= 0.5, delta < 0 {
+            state.locked = false
+            autohidePanes[pane] = state
+            root.setAutohideOffset(0, at: pane)
+            return
+        }
+        let was = root.autohideOffset(at: pane)
+        let step = AddressBarAutohide.step(offset: was, pageDelta: delta, travel: root.autohideTravel(at: pane), locked: state.locked)
+        state.locked = step.locked
+        autohidePanes[pane] = state
+        root.setAutohideOffset(step.offset, at: pane)
+        settleAutohideSoon()
+        // The bar's travel takes that much of the scroll: the page scrolls back by it, so the content moves once.
+        let consumed = step.offset - was
+        if abs(consumed) > 0.5, let webView = tab?.webView {
+            webView.evaluateJavaScript("window.__zigzagScrollBy?.(\(Double(-consumed)))", in: nil, in: .defaultClient, completionHandler: nil)
+        }
+    }
+
+    private func settleAutohideSoon() {
+        autohideSettleWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in MainActor.assumeIsolated { self?.settleAutohide() } }
+        autohideSettleWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.autohideSettleDelay, execute: work)
+    }
+
+    /// A bar left part way out slides to the nearer end, unless a finger, the scroll bar or the pointer still has it.
+    func settleAutohide() {
+        guard root.autohidesBar, root.barHoldsAddress else { return }
+        for index in 0..<root.autohidePaneCount {
+            let state = autohidePanes[index]
+            let offset = root.autohideOffset(at: index), travel = root.autohideTravel(at: index)
+            guard state?.gestureActive != true, state?.dragging != true, offset > 0.5, offset < travel - 0.5,
+                  !autohideHeld(inPane: index) else { continue }
+            let target = Self.settledOffset(offset, travel: travel)
+            if root.tiles == nil { root.setBarOffset(target, animated: true) } else { root.setAutohideOffset(target, at: index) }
+        }
+    }
+
+    /// The nearer end for a bar part way out.
+    nonisolated static func settledOffset(_ offset: CGFloat, travel: CGFloat) -> CGFloat { offset >= travel / 2 ? travel : 0 }
+
+    /// A new page starts at its top, with the bar there (#359).
+    private func resetAutohide(animated: Bool) {
+        autohidePanes.removeAll()
+        root.setBarPutAway(false, animated: animated)
+        syncScrollReports()
+    }
+
+    /// One page starts over; only its own pane's bar comes back.
+    private func resetAutohide(of tab: Tab, animated: Bool) {
+        guard root.tiles != nil, let pane = paneIndex(of: tab) else { resetAutohide(animated: animated); return }
+        autohidePanes[pane] = nil
+        root.setAutohideOffset(0, at: pane)
+        syncScrollReports()
+    }
+
+    /// The pages that send scroll reports: the shown panes', and only while Autohide is on.
+    private let scrollReporters = NSHashTable<WKWebView>.weakObjects()
+
+    /// Turns the page script's reports on for the shown panes with Autohide on, off everywhere else.
+    func syncScrollReports() {
+        let shown = tabManager.selectedTab.map { tabManager.panes(of: $0) } ?? []
+        let wanted: [WKWebView] = root.autohidesBar ? shown.compactMap(\.webView) : []
+        for webView in scrollReporters.allObjects where !wanted.contains(webView) {
+            ScrollMessages.setReporting(false, in: webView)
+            scrollReporters.remove(webView)
+        }
+        // Sent again each time: a new document starts with reports off.
+        for webView in wanted {
+            ScrollMessages.setReporting(true, in: webView)
+            scrollReporters.add(webView)
+        }
+    }
+
+    #if DEBUG
+    var debugScrollReporters: [WKWebView] { scrollReporters.allObjects }
+    #endif
+
+    /// What holds the bar: an editing field, a sheet or command bar, a sliding sidebar, or the pointer on it.
+    private func autohideHeld(inPane index: Int) -> Bool {
+        if root.isSidebarFloatingVisible || isSidebarSliding() { return true }
+        if window?.attachedSheet != nil || commandBar.isVisible { return true }
+        guard root.autohideOffset(at: index) < root.autohideTravel(at: index) - 0.5,
+              let window else { return false }
+        let point = root.convert(window.mouseLocationOutsideOfEventStream, from: nil)
+        return root.autohideBarContains(point, at: index)
+    }
+
+    private func isSidebarSliding() -> Bool { Date() < sidebarMovingUntil }
+
+    private func autohidePointerMoved(_ event: NSEvent) {
+        guard event.window === window else { return }
+        pointerMoved(to: root.convert(event.locationInWindow, from: nil))
+    }
+
+    /// The pointer at the window's top, in the root's coordinates, brings an Autohide bar back.
+    func pointerMoved(to point: NSPoint) {
+        guard root.autohidesBar, root.barHoldsAddress, root.showsTopBar, point.y <= Tokens.Space.x2,
+              Self.topPointerRevealsBar(fullScreen: window?.styleMask.contains(.fullScreen) == true),
+              (0..<root.autohidePaneCount).contains(where: { root.autohideOffset(at: $0) > 0 }) else { return }
+        revealAutohide()
+    }
+
+    /// In full screen the screen's top belongs to the menu bar, not the address bar.
+    nonisolated static func topPointerRevealsBar(fullScreen: Bool) -> Bool { !fullScreen }
+
+    /// A finger where the bar went brings it back, with no pointer on a touch display to reach the top.
+    private func fingerLanded(where point: NSPoint) -> Bool {
+        guard root.autohidesBar, root.barHoldsAddress, root.isWhereBarWent(point) else { return false }
+        revealAutohide()
+        return true
+    }
+
+    /// The bar back in every pane that put its own away, so reaching for one doesn't leave another out of sight.
+    func revealAutohide() {
+        for index in 0..<root.autohidePaneCount { reveal(pane: index) }
+    }
+
+    /// One pane's bar back, sliding in for one page, free to go again with the next scroll down.
+    private func reveal(pane index: Int) {
+        autohidePanes[index]?.locked = false
+        if root.tiles == nil {
+            root.setBarOffset(0, animated: true)
+        } else {
+            root.setAutohideOffset(0, at: index)
+        }
+    }
+
+    /// Gives the page you're on the size chosen for it with the developer tools, or its room back. A page's own
+    /// size is for a page shown on its own: a split's panes share the window as they are.
+    private func showPageSize() {
+        let tab = tabManager.selectedTab
+        let size = tab.flatMap { tabManager.split(for: $0) } == nil ? tab?.developerInEffect.size : nil
+        // Dragging a grip beside the page gives it that size, as choosing one does.
+        if size != nil, root.card.onResizePage == nil { root.card.onResizePage = { [weak self] size in self?.setPageSize(size) } }
+        guard root.card.pageSize != size else { return }
+        root.card.pageSize = size
+        paintTopBar()
+    }
+
+    /// Whether a tab has the tools in the bar above its page: Site Controls shows them where it doesn’t.
+    func showsDeveloperBarTools(for tab: Tab?) -> Bool {
+        DeveloperBarTools.shows(isDevelopment: tab?.isDevelopment == true, showsInBar: DeveloperTools.showsInBar,
+                             inSplit: tab.flatMap { tabManager.split(for: $0) } != nil)
+    }
+
+    /// Puts the selected tab in the page card, or the pages of its split or tile group side by side, each in a card.
+    private func showPages() {
+        // Before the page goes on its card, so it never takes the size of the page that was there.
+        showPageSize()
+        defer { showDeveloperBarTools() }
+        // A link address belongs to the page it was pointed at in: a different page, a different space, it goes.
+        linkStatus.show(nil, in: root.cardFrame)
+        let tab = tabManager.selectedTab
+        let pair = tab.flatMap { tabManager.split(for: $0) }
+        let pages = pair.map { $0.ids.compactMap { tabManager.tab(with: $0) } } ?? []
+        let cards = root.paneCards
+        // The zoom lasts while its group is on screen as it was; anything else (a swap, a move, another layout) puts
+        // the pane back.
+        // Going to another pane of it (a click on its part of the row) puts the zoomed one back too.
+        if paneZoom.isZoomed, paneZoom.tabID != tab?.id { paneZoom.clear() }
+        let zoomed = paneZoom.index(in: pages.count == pair?.count ? pair?.ids : nil, places: pair?.shape.regions)
+        // Site Controls opened from a pane's strip sits under it: when the panes move (the split parts, a pane goes,
+        // swaps or zooms), it would be left over nothing.
+        let layout = pages.count == pair?.count ? "\(pair?.ids ?? []) \(String(describing: pair?.shape)) \(zoomed ?? -1)" : ""
+        if layout != shownPaneLayout {
+            shownPaneLayout = layout
+            autohidePanes.removeAll()
+            syncScrollReports()
+            if SitePanel.isOpen(in: window), SitePanel.shown?.isFromPane == true { SitePanel.closeCurrent() }
+        }
+        defer {
+            refreshZoomEsc()
+            sidebar.list.zoomedTabID = paneZoom.tabID
+        }
+        if let tab, let pair, pages.count == pair.count {
+            root.setTiles(pair.shape, animated: true)
+            root.setZoomedPane(zoomed, animated: true)
+            root.isEmpty = false
+            let first = pages[0]
+            for (i, card) in cards.enumerated() {
+                guard pages.indices.contains(i) else { clear(card); continue }
+                let page = pages[i]
+                // Swap and the layout are a split of two's; a tile group's pages keep the places they were dropped in.
+                card.header.arrangesSplit = !pair.isGroup
+                card.header.resetsLayout = pair.shape.isParted
+                card.header.resetLayout.onClick = { [weak self] _ in self?.resetTileLayout(nil) }
+                card.header.setVertical(pair.vertical)
+                card.header.orientation.onClick = { [weak self] _ in self?.tabManager.toggleSplitOrientation(for: first) }
+                card.header.swap.onClick = { [weak self] _ in self?.tabManager.swapSplit(for: first) }
+                // A page another sharing window shows stays there; the card says so (#162).
+                if tabManager.mayShow(page) {
+                    card.show(pageView(of: page))
+                } else {
+                    card.showElsewhere(page) { [weak self] in self?.showHere(page) }
+                }
+                // Any page may have crashed while out of sight (a space switch brings it back, not only selecting it).
+                page.reloadIfItStopped()
+                card.isFocusedPane = page === tab
+                card.isUnfocusedPane = page !== tab
+                card.showsHeader = true
+                // Each pane's header, line and address are its own page's, whichever of them you're in.
+                card.header.show(page)
+                card.showLoading(of: page)
+                // A split of two ends showing the other page; a tile group's pages part, this one shown.
+                let keep = pair.isGroup ? page : pages[i == 0 ? 1 : 0]
+                card.header.close.onClick = { [weak self] _ in self?.unsplitWithUndo(page, keep: keep) }
+                card.header.closeTab.onClick = { [weak self] _ in self?.closeWithUndo(page) }
+                card.header.isZoomed = i == zoomed
+                card.header.zoom.onClick = { [weak self] _ in self?.toggleZoom(page) }
+                // Pressed and dragged, the strip carries its pane somewhere else (#160).
+                card.header.onDrag = { [weak self] tab, press, moved in self?.dragPane(tab, press: press, moved: moved) ?? false }
+                card.header.onEditAddress = { [weak self, weak card] tab in
+                    guard let self, let card else { return }
+                    self.editAddress(of: tab, from: card.header.address)
+                }
+                card.header.onSiteControls = { [weak self] tab, anchor in self?.showSiteControls(for: tab, from: anchor) }
+            }
+        } else {
+            root.setZoomedPane(nil, animated: false)
+            root.setTiles(nil, animated: true)
+            root.isEmpty = tab == nil
+            if let tab, !tabManager.mayShow(tab) {
+                root.card.showElsewhere(tab) { [weak self] in self?.showHere(tab) }
+            } else {
+                root.card.showElsewhere(nil)
+                root.card.show(tab.flatMap(pageView))
+            }
+            tab?.reloadIfItStopped()
+            root.card.showLoading(of: tab)
+            root.card.isFocusedPane = false
+            root.card.isUnfocusedPane = false
+            root.card.showsHeader = false
+            cards.dropFirst().forEach(clear)
+        }
+        func clear(_ card: PageCardView) {
+            card.showElsewhere(nil)
+            card.show(nil)
+            card.showLoading(of: nil)
+            card.header.show(nil)
+            card.isFocusedPane = false
+            card.isUnfocusedPane = false
+            card.showsHeader = false
+        }
+        updatePageFullScreenForLayout()
+    }
+
+    /// Show Here (#162): moves the loaded page into this window; the other shows a placeholder.
+    func showHere(_ tab: Tab) {
+        guard !tab.isClosed, tabManager.tab(with: tab.id) === tab else { return }
+        tabManager.select(tab)
+        if let webView = tab.webView, window?.isKeyWindow == true { window?.makeFirstResponder(webView) }
+    }
+
+    // MARK: Downloads with the sidebar hidden
+
+    /// With the sidebar hidden, its Downloads button stands in on its own, in the same bottom-left corner: a download
+    /// flies into it and the panel opens above it, exactly as with the sidebar out. It goes once the panel closes.
+    private(set) lazy var floatingDownloads: FloatingPanelView = {
+        // A round glass button, the button filling it so its hover is the same circle.
+        let chip = FloatingPanelView()
+        chip.radius = Tokens.Metric.floatingButton / 2
+        let button = IconButton(symbol: "arrow.down.circle", size: Tokens.Metric.floatingButton, symbolSize: Tokens.Symbol.glyph, toolTip: String(localized: "Downloads", comment: "Tooltip of the floating downloads button, shown while the sidebar is hidden."))
+        button.onClick = { [weak self] _ in self?.showDownloads(nil) }
+        chip.addSubview(button)
+        chip.onLayout = { [weak chip, weak button] in
+            guard let chip, let button else { return }
+            button.frame = chip.bounds
+            button.radius = chip.bounds.height / 2
+        }
+        return chip
+    }()
+
+    var floatingDownloadsButton: NSView { floatingDownloads.subviews.first ?? floatingDownloads }
+
+    /// Shows the stand-in Downloads button where the sidebar's would be, if the sidebar is hidden.
+    func showFloatingDownloads() {
+        guard !(root.chromeSidebarShown || root.isSidebarFloatingVisible) else { return }
+        let side = Tokens.Metric.floatingButton
+        let inset = Tokens.Metric.sidebarPadding
+        // In the sidebar's bottom corner, the left or the right one.
+        let x = root.sidebarOnRight ? root.overlay.bounds.width - side - inset : inset
+        floatingDownloads.frame = NSRect(x: x, y: root.overlay.bounds.height - side - inset, width: side, height: side)
+        // With its shortcut, as the sidebar's Downloads button says it.
+        (floatingDownloadsButton as? IconButton)?.toolTip = Shortcuts.tooltip(String(localized: "Downloads", comment: "Tooltip of the floating downloads button, shown while the sidebar is hidden."),
+                                                                             for: #selector(showDownloads(_:)))
+        guard floatingDownloads.superview == nil else { return }
+        root.overlay.addSubview(floatingDownloads)
+        floatingDownloads.growsFrom = CGPoint(x: 0.5, y: 0.5)
+        floatingDownloads.present(arrival: .pop)
+    }
+
+    /// The panel closed, or the sidebar came back: the stand-in steps away.
+    func hideFloatingDownloads() {
+        guard floatingDownloads.superview != nil, !DownloadsPanel.isOpen(in: window) else { return }
+        floatingDownloads.dismiss()
+    }
+
+    // MARK: The update card with the sidebar hidden
+
+    /// With the sidebar hidden, the update card floats in the sidebar's corner on a small panel, for a requested update
+    /// and once when one is ready (`Updater.cardFloats`). Closed by its button or Restart, and for good once the
+    /// sidebar returns.
+    private lazy var floatingUpdate: (panel: FloatingPanelView, card: UpdateCard) = {
+        let panel = FloatingPanelView()
+        let card = UpdateCard()
+        card.isFloating = true
+        card.onRestart = { Updater.shared.restartToUpdate() }
+        card.onHide = { Updater.shared.dismissCard() }
+        card.onUpdate = { Updater.shared.getUpdate() }
+        card.onSkip = { Updater.shared.skipOffered() }
+        panel.addSubview(card)
+        panel.onLayout = { [weak panel, weak card] in
+            guard let panel, let card else { return }
+            card.frame = panel.bounds
+            // Concentric with the panel it fills.
+            card.layer?.cornerRadius = panel.radius
+        }
+        return (panel, card)
+    }()
+
+    /// Shows, moves or hides the floating update card for the current state.
+    func placeFloatingUpdate(hiding: Bool = false) {
+        let updater = Updater.shared
+        let (panel, card) = floatingUpdate
+        guard let state = updater.cardState, updater.cardFloats, !root.chromeSidebarShown, !root.isSidebarFloatingVisible else {
+            guard panel.superview != nil, !panel.dismissing else { return }
+            panel.growsFrom = CGPoint(x: 0.5, y: 0.5)
+            panel.dismiss(instantly: hiding && Tokens.Motion.isFromKey)
+            return
+        }
+        card.show(state)
+        // Same width and insets as in the sidebar, above the stand-in Downloads button if shown.
+        let pad = Tokens.Metric.sidebarPadding
+        let width = root.sidebarWidth - Tokens.Sidebar.edge * 2
+        let height = UpdateCard.height(for: state)
+        var bottom = root.overlay.bounds.height - pad
+        if floatingDownloads.superview != nil { bottom = floatingDownloads.frame.minY - Tokens.Space.x2 }
+        let x = root.sidebarOnRight ? root.overlay.bounds.width - width - pad : pad
+        let frame = NSRect(x: x, y: bottom - height, width: width, height: height)
+        let isNew = panel.superview == nil || panel.dismissing
+        if panel.superview == nil { root.overlay.addSubview(panel) }
+        if isNew {
+            panel.frame = frame
+            panel.growsFrom = CGPoint(x: 0.5, y: 0.5)
+            panel.present(arrival: .pop)
+        } else if panel.frame != frame {
+            Tokens.Motion.animate(Tokens.Motion.snappy, moves: true) { panel.animator().frame = frame }
+        }
+    }
+
+    /// The bar above the page in the shown page's color (`Tab.pageColor`). None over what covers the page (a PDF,
+    /// Settings, Reader), which has a color of its own: the bar is the plain one then.
+    private func paintTopBar() {
+        Freezes.mark("top bar color")
+        let covered = reader != nil && readerCard === root.card
+        // The card's own word on its page's color: a page at a size of its own stands on plain ground, bar included.
+        root.paintTopBar(covered ? nil : root.card.pageColor)
+    }
+
+    /// Where popovers that belong to the address bar (extension popups) open from: the address bar while the sidebar
+    /// shows, or the top left of the page while it's hidden, so they never open off screen.
+    var addressAnchor: (view: NSView, rect: NSRect) {
+        // In split view the panes' strips stand in for the bar's address: from the address of the pane you're in.
+        if root.stripsInBar {
+            let address = focusedPaneAddress
+            if !address.isHidden { return (address, address.bounds) }
+            let pane = focusedPaneFrame
+            return (root.overlay, NSRect(x: pane.minX + Tokens.Space.x3, y: pane.minY + Tokens.Space.x2, width: 1, height: 1))
+        }
+        // Above the page, from the address's end, where the Site Controls and the extensions are.
+        if root.chromeBarShown {
+            let button = sidebar.address.siteControlsButton
+            return (button, button.bounds)
+        }
+        if root.chromeSidebarShown || root.isSidebarFloatingVisible { return (sidebar.address, sidebar.address.bounds) }
+        let card = root.cardFrame
+        return (root.overlay, NSRect(x: card.minX + Tokens.Space.x3, y: card.minY + Tokens.Space.x2, width: 1, height: 1))
+    }
+
+    /// Where a popup opens from: under its pinned button when it was opened from one still showing, otherwise
+    /// `addressAnchor`. `id` nil for any other popup.
+    func popupAnchor(forPin id: String?) -> (view: NSView, rect: NSRect) {
+        guard let id, root.chromeSidebarShown || root.isSidebarFloatingVisible, sidebar.address.visiblePinIDs.contains(id),
+              let button = sidebar.address.pinButton(for: id) else { return addressAnchor }
+        return (sidebar.address, button.frame)
+    }
+
+    private var popupHoldsSidebar: Bool {
+        guard #available(macOS 15.4, *) else { return false }
+        return ExtensionCenter.holdsSidebar(in: window)
+    }
+
+    /// The address in the strip of the split pane you're in.
+    var focusedPaneAddress: NSView { (root.paneCards.first { $0.isFocusedPane } ?? root.card).header.address }
+
+    /// The page you're working in: the whole page area, or in split view the focused pane.
+    var focusedPaneFrame: NSRect {
+        guard let tab = tabManager.selectedTab, let pair = tabManager.split(for: tab), root.tiles != nil,
+              let index = pair.ids.firstIndex(of: tab.id) else { return root.cardFrame }
+        let frames = root.tileFrames
+        return frames.indices.contains(index) ? frames[index] : frames[0]
+    }
+
+    /// A split pane's address clicked: that pane becomes the one you're in, and its address opens for editing right
+    /// over the pill, as the sidebar's does for the page you're in.
+    func editAddress(of tab: Tab, from anchor: NSView) {
+        if tabManager.selectedTab !== tab { tabManager.select(tab) }
+        commandBar.show(mode: .editCurrent, anchor: anchor)
+    }
+
+    /// Site Controls from a split pane's strip: that pane becomes the one you're in, and the panel is about its page,
+    /// under its address (#160).
+    func showSiteControls(for tab: Tab, from anchor: NSView) {
+        if SitePanel.isOpen(in: window), SitePanel.shown?.describes(tab) == false { SitePanel.closeCurrent() }
+        guard let page = tabManager.siteControlsTab(from: tab), page === tab else { return }
+        SitePanel.toggle(in: self, from: anchor, tab: page)
+    }
+
+    /// In split view, clicking a pane makes its tab the one you're working in.
+    func focusPane(at windowPoint: NSPoint) {
+        guard let tab = tabManager.selectedTab, let pair = tabManager.split(for: tab) else { return }
+        // A pane zoomed over the rest is the one you're in; a click beside it puts it back (the scrim's).
+        guard !paneZoom.isZoomed else { return }
+        // A pane's strip up in the bar above the page is that pane's too.
+        let panes = root.tileTargets
+        let point = root.convert(windowPoint, from: nil)
+        // Clicks on what floats over the page (find, the command bar, a prompt) are for it, not the pane below.
+        if let base = root.overlay.superview, root.overlay.hitTest(base.convert(windowPoint, from: nil)) != nil { return }
+        guard let clickedID = Self.pane(at: point, frames: panes, ids: pair.ids, current: tab.id),
+              let clicked = tabManager.tab(with: clickedID) else { return }
+        tabManager.select(clicked)
+    }
+
+    /// The pane at a point of the page, when it isn't the one you're in already: the one to go to. Nil between panes,
+    /// outside them, or on the pane you're in.
+    nonisolated static func pane(at point: NSPoint, frames: [NSRect], ids: [UUID], current: UUID) -> UUID? {
+        guard let index = frames.firstIndex(where: { $0.contains(point) }), ids.indices.contains(index) else { return nil }
+        return ids[index] == current ? nil : ids[index]
+    }
+
+    /// A card per tab playing audio (or paused from its card) that isn't on screen, unless hidden for that media
+    /// (`NowPlayingChoice`). `hiding`: the tab whose card was just hidden.
+    private func updateNowPlaying(hiding: UUID? = nil) {
+        let selected = tabManager.selectedTab
+        // With shared tabs (#162), only this window's tabs; a tab shown elsewhere has its card there.
+        let tabs = tabManager.recentTabs.filter { holds($0) && !tabManager.isShownElsewhere($0) }
+        let candidates = tabs.map {
+            NowPlayingChoice.Candidate(id: $0.id, page: NowPlayingChoice.page(of: $0.url),
+                                       sounding: NowPlayingChoice.isSounding(playing: $0.isPlayingAudio, pausedFromCard: $0.isPlaybackPaused, inMiniPlayer: miniPlayer.holds($0)),
+                                       isSelected: $0 === selected)
+        }
+        let byID = Dictionary(tabs.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        let shown = nowPlayingChoice.pick(from: candidates).compactMap { byID[$0] }
+        bothSidebars { $0.setNowPlaying(shown.map { (tab: $0, paused: isPausedForNowPlaying($0)) }, hiding: hiding) }
+    }
+
+    /// Paused from its card, or a video stopped in the mini player.
+    private func isPausedForNowPlaying(_ tab: Tab) -> Bool {
+        let playing = NowPlayingChoice.isPlaying(sound: tab.isPlayingAudio, miniPlayerVideo: miniPlayer.holds(tab) ? miniPlayer.isPlaying(tab) : nil)
+        return NowPlayingChoice.isPaused(playing: playing, pausedFromCard: tab.isPlaybackPaused, inMiniPlayer: miniPlayer.holds(tab))
+    }
+
+    /// The mini player took or released a video; Now Playing keeps the card while it holds one.
+    func miniPlayerChanged() { updateNowPlaying() }
+
+    /// The mini player released a tab still on screen (taken when Zigzag went to the background); its card takes the
+    /// page back.
+    func miniPlayerGaveBack(_ webView: WKWebView) {
+        let cards = root.paneCards.filter { $0.webView === webView }
+        guard !cards.isEmpty else { return }
+        cards.forEach { $0.show(nil) }
+        showPages()
+    }
+
+    /// Now Playing's play button and menu item. A mini player video toggles there so the two agree; otherwise via
+    /// WebKit media control.
+    private func toggleNowPlaying(_ tab: Tab) {
+        if !tab.isPlaybackPaused, miniPlayer.togglePlayback(of: tab) { return }
+        tab.setPlaybackPaused(!tab.isPlaybackPaused)
+    }
+
+    /// Hides a tab's Now Playing card for its current media. Audio keeps playing; the card returns when the tab
+    /// navigates.
+    func hideNowPlaying(_ tab: Tab) {
+        nowPlayingChoice.hide(tab.id, page: NowPlayingChoice.page(of: tab.url))
+        updateNowPlaying(hiding: tab.id)
+    }
+
+    /// Context menu for a Now Playing card: its actions by name, and Hide.
+    private func nowPlayingMenu(for tab: Tab) -> NSMenu? {
+        let menu = NSMenu()
+        menu.autoenablesItems = false
+        typealias S = SidebarMenus.Symbol
+        menu.addItem(SidebarMenus.Item(String(localized: "Show Tab", comment: "VoiceOver action on the sidebar's Now Playing control: goes to the tab playing sound."), symbol: S.showTab) { [weak self] in
+            self?.tabManager.select(tab)
+        })
+        menu.addItem(.separator())
+        menu.addItem(SidebarMenus.Item(isPausedForNowPlaying(tab) ? String(localized: "Play", comment: "Tooltip of a button in the sidebar's Now Playing control, for a tab playing sound in the background.")
+                                       : String(localized: "Pause", comment: "Tooltip of a button in the sidebar's Now Playing control, for a tab playing sound in the background."),
+                                       symbol: isPausedForNowPlaying(tab) ? S.play : S.pause) { [weak self] in
+            self?.toggleNowPlaying(tab)
+        })
+        menu.addItem(SidebarMenus.Item(tab.isMuted ? String(localized: "Unmute Tab", comment: "Tooltip of a button in the sidebar's Now Playing control, for a tab playing sound in the background.")
+                                       : String(localized: "Mute Tab", comment: "Tooltip of a button in the sidebar's Now Playing control, for a tab playing sound in the background."),
+                                       symbol: tab.isMuted ? S.unmute : S.mute) {
+            tab.setMuted(!tab.isMuted)
+        })
+        menu.addItem(.separator())
+        menu.addItem(SidebarMenus.Item(String(localized: "Hide", comment: "Tooltip, VoiceOver action and menu item of the close button on the sidebar's Now Playing control: hides the control; the tab keeps playing."), symbol: S.close) { [weak self] in
+
+            self?.hideNowPlaying(tab)
+        })
+        return menu
+    }
+
+    /// One button by the address, for everything about this page: quick actions, extensions, the site's own
+    /// settings, and clearing its data. It shows a dot when an extension needs attention.
+    private let extensionActionRefresh = Coalescer()
+
+    /// Draws the buttons again once for a burst of changes.
+    private func scheduleExtensionActions(after delay: TimeInterval = 0) {
+        extensionActionRefresh.schedule(after: delay) { [weak self] in self?.refreshExtensionActions() }
+    }
+
+    func refreshExtensionActions() {
+        extensionActionRefresh.cancel()
+        let tab = tabManager.selectedTab
+        // Always there, even on a new tab: it's also where your extensions live.
+        _ = tab?.url
+        var attention = false
+        var pins: [AddressView.Pin] = []
+        var animated = false
+        // In a private window, only extensions allowed there (ExtensionHost.pinnedActions).
+        if #available(macOS 15.4, *), let host = tab?.extensionHost ?? tabManager.extensionHost {
+            attention = host.needsAttention(for: tab)
+            pins = host.pinnedActions(for: tab).map { addressPin(for: $0, host: host) }
+            animated = host.finishedLoading
+        }
+        sidebar.address.setSiteControls(needsAttention: attention)
+        sidebar.address.setPins(pins, animated: animated)
+    }
+
+    @available(macOS 15.4, *)
+    private func addressPin(for item: ExtensionHost.ActionItem, host: ExtensionHost) -> AddressView.Pin {
+        AddressView.Pin(id: item.id, image: item.icon, label: item.label, badge: item.badge, needsAttention: item.attention != nil,
+                               isActive: host.isPopupOnScreen(item.id, in: window),
+                               action: { [weak self] button in
+            guard let self else { return }
+            if let press = button.currentPress, host.popupClosed(item.id, in: self.window, since: press) { return }
+            host.performAction(item, tab: self.tabManager.selectedTab, in: self, fromPin: true)
+        }, menu: { [weak self] in self?.extensionMenu(for: item.context) })
+    }
+
+    var isShowingReader: Bool { reader != nil }
+
+    private func extensionsFooterMenu() -> NSMenu {
+        let menu = NSMenu()
+        menu.autoenablesItems = false
+        menu.addItem(SidebarMenus.Item(String(localized: "Manage Extensions…", comment: "Item at the bottom of the extensions menu: opens Settings › Extensions."), symbol: "puzzlepiece.extension") { [weak self] in
+            if let self { SettingsPage.open(.extensions, in: self) }
+        })
+        let get = SidebarMenus.Submenu(String(localized: "Get Extensions", comment: "Item at the bottom of the extensions menu: a submenu of the Chrome Web Store and Firefox Add-ons."),
+                                       ExtensionStore.Shop.allCases.map { shop in
+            SidebarMenus.Item(shop.title) { [weak self] in self?.tabManager.newTab(url: shop.url) }
+        })
+        get.image = Tokens.Symbol.image("bag")
+        menu.addItem(get)
+        return menu
+    }
+
+    /// Pin to Address, or Unpin, dimmed at the limit.
+    static func pinItem(for id: String, installs: ExtensionInstalls) -> NSMenuItem {
+        let pinned = installs.pins.contains(id)
+        let item = SidebarMenus.Item(pinned ? SitePanel.unpinTitle : SitePanel.pinTitle, symbol: pinned ? "pin.slash" : "pin") { installs.togglePin(id) }
+        if !pinned, !installs.canPin(id) {
+            item.isEnabled = false
+            item.toolTip = SitePanel.pinLimitTip
+        }
+        return item
+    }
+
+    private func addPinItems(to menu: NSMenu, id: String) {
+        menu.addItem(Self.pinItem(for: id, installs: installs))
+        let visible = sidebar.address.visiblePinIDs
+        guard visible.count > 1, let index = visible.firstIndex(of: id) else { return }
+        menu.addItem(.separator())
+        let left = SidebarMenus.Item(AddressView.moveLeftTitle, symbol: "arrow.left") { [weak self] in self?.sidebar.address.movePin(id, by: -1) }
+        left.isEnabled = index > 0
+        menu.addItem(left)
+        let right = SidebarMenus.Item(AddressView.moveRightTitle, symbol: "arrow.right") { [weak self] in self?.sidebar.address.movePin(id, by: 1) }
+        right.isEnabled = index < visible.count - 1
+        menu.addItem(right)
+    }
+
+    /// An extension's menu: pinning, its settings, site access for `tab`, turning off, and removing, which asks over
+    /// `overlay`. A browser window's, and an installed app's window's (#356).
+    @available(macOS 15.4, *)
+    static func extensionMenu(for context: WKWebExtensionContext, profile: Profile, tab: Tab?, isPrivate: Bool, over overlay: NSView,
+                              openOptions: @escaping (URL) -> Void, pins: (NSMenu, String) -> Void) -> NSMenu {
+        let menu = NSMenu()
+        menu.autoenablesItems = false
+        let id = context.uniqueIdentifier
+        let installs = profile.installs
+        let title = NSMenuItem(title: context.webExtension.displayName ?? String(localized: "Extension", comment: "Heading of an extension's menu when the extension has no name."), action: nil, keyEquivalent: "")
+        title.isEnabled = false
+        menu.addItem(title)
+        // Pinning first: Site Controls' tiles pin only from here.
+        pins(menu, id)
+        menu.addItem(.separator())
+        if let options = context.optionsPageURL {
+            menu.addItem(SidebarMenus.Item(String(localized: "Settings", comment: "Item in an extension's menu: opens the extension's own settings page."), symbol: "gearshape") { openOptions(options) })
+        }
+        menu.addItem(siteAccessItem(for: id, profile: profile, tab: tab, isPrivate: isPrivate))
+        menu.addItem(SidebarMenus.Item(String(localized: "Turn Off", comment: "Item in an extension's menu: turns the extension off."), symbol: "pause.circle") { installs.setEnabled(id, false) })
+        menu.addItem(SidebarMenus.Item(String(localized: "Remove from Zigzag…", comment: "Item in an extension's menu: removes the extension."), symbol: "trash") { [weak overlay] in
+            guard let overlay else { return }
+            ConfirmSheet.removeExtension(id: id, name: context.webExtension.displayName, from: profile, in: overlay)
+        })
+        return menu
+    }
+
+    @available(macOS 15.4, *)
+    func extensionMenu(for context: WKWebExtensionContext, footer: Bool = true) -> NSMenu {
+        let profile = tabManager.profile
+        let menu = Self.extensionMenu(for: context, profile: profile, tab: tabManager.selectedTab, isPrivate: tabManager.isPrivate, over: root.overlay,
+                                      openOptions: { [weak self] options in
+            guard let self else { return }
+            // From a private window, in an everyday one: the page keeps the extension's own data.
+            guard self.tabManager.isPrivate else { self.tabManager.newTab(url: options, title: context.webExtension.displayName); return }
+            let everyday = WindowManager.shared.controllers.first { !$0.tabManager.isPrivate } ?? WindowManager.shared.newWindow(showCommandBar: false)
+            everyday.tabManager.newTab(url: options, spaceID: everyday.tabManager.space(for: profile), title: context.webExtension.displayName)
+            everyday.window?.makeKeyAndOrderFront(nil)
+        }, pins: { [weak self] menu, id in self?.addPinItems(to: menu, id: id) })
+        guard footer else { return menu }
+        menu.addItem(.separator())
+        extensionsFooterMenu().items.forEach { $0.menu?.removeItem($0); menu.addItem($0) }
+        return menu
+    }
+
+    private func selectedTabChanged(_ change: Tab.Change) {
+        guard let tab = shownTab else { return }
+        // Each card shows its own page's load (`PageCardView.showLoading`); the sidebar follows the page you're in.
+        switch change {
+        case .url, .navigation, .loading:
+            if change == .url {
+                refreshExtensionActions()
+                updateHandoff()
+                // A pinned tab that moved on shows it right away.
+                if tab.bookmarkID != nil { bothSidebars { $0.list.refreshRows() } }
+                // Remove the translation offer for the previous page.
+                withdrawStaleTranslationOffer()
+            }
+            refreshAddress(for: tab)
+            paintTopBar()
+            updateWindowTitle()
+            offerWebStoreExtension()
+        case .title:
+            updateWindowTitle()
+            updateHandoff()
+        case .webView:
+            showPages()
+            paintTopBar()
+        case .pdf, .settings:
+            paintTopBar()
+        case .developer:
+            showDeveloperBarTools()
+        case .capture:
+            sidebar.address.setCapture(camera: tab.isUsingCamera, microphone: tab.isUsingMicrophone)
+        case .reader:
+            updateReaderButton()
+        case .language:
+            updateTranslateButton()
+            offerTranslation()
+        case .document:
+            // A new main-frame document starts at its top; an SPA's pushState is not one (#359).
+            resetAutohide(of: tab, animated: true)
+            updateTranslateButton()
+        case .themeColor, .darkPage:
+            paintTopBar()
+        default:
+            break
+        }
+        // Reader belongs to the page it was opened on.
+        if change == .url, readerTab === tab, tab.url != readerURL { closeReader() }
+    }
+
+    // MARK: Translation
+
+    /// One page's translation, running on its own: its own session with Apple's translation (its own invisible
+    /// host), its own toast, shown only while its page is the one in view.
+    private final class PageTranslation {
+        weak var tab: Tab?
+        weak var webView: WKWebView?
+        /// The page it was asked for: another page in the tab ends it.
+        let page: URL?
+        /// "Chinese", or "Chinese and Japanese" for a page with both.
+        let name: String
+        let site: String?
+        /// The page's main language, assumed for the site's next pages.
+        let source: Locale.Language?
+        let host = TranslationHost()
+        var token: SignalToken?
+        var timeout: DispatchWorkItem?
+        /// When the last batch came back, or it started: the time limit counts from here.
+        var lastProgress = Date()
+        /// How much of it is done, 0 to 1.
+        var fraction: Double = 0
+
+        init(tab: Tab, webView: WKWebView, name: String, site: String?, source: Locale.Language?) {
+            self.tab = tab
+            self.webView = webView
+            self.page = webView.url
+            self.name = name
+            self.site = site
+            self.source = source
+        }
+    }
+
+    /// Each tab's translation while it runs.
+    private var translations = TranslationRuns<ObjectIdentifier, PageTranslation>()
+    /// Tabs whose page is being read to work out what to translate, before their translation starts.
+    private var planningTranslation: Set<ObjectIdentifier> = []
+    /// The tab whose "Translating…" is showing.
+    private weak var translationToastTab: Tab?
+    /// Sites already offered this session, so browsing a site in another language doesn't ask on every page.
+    private var translationDeclined: Set<String> = []
+    /// Sites translated this session and their source language; their other pages auto-translate when in that language.
+    private var translatedSites: [String: Locale.Language] = [:]
+    /// Never Translate This Site chosen in a private window: kept only while the window is open.
+    private var neverTranslatedHere: Set<String> = []
+    /// How long a translation may go without a batch coming back before it says so instead of spinning on: Apple's
+    /// translation can wait on a prompt that never comes up, or not answer at all. A long page that keeps coming
+    /// back keeps going (#465).
+    private static let translationTimeout: TimeInterval = 45
+
+    /// The page in view: a Zigzag Mini's, or the tab you're on.
+    private func translationInView(_ tab: Tab) -> Bool {
+        translationMini(tab) != nil || PageTranslator.isInView(tab, selected: tabManager.selectedTab)
+    }
+
+    /// The Zigzag Mini showing `tab`, which this window translates: that page's toasts go over the Mini.
+    private func translationMini(_ tab: Tab) -> MiniWindowController? {
+        MiniWindowController.all.first { $0.tab === tab && $0.holdsPage }
+    }
+
+    /// A translation toast over the page it's about: a Zigzag Mini's, or this window's.
+    private func translationToast(_ tab: Tab, _ text: String, symbol: String, action: (title: String, run: () -> Void)? = nil,
+                                  duration: TimeInterval, announces: Bool = true) {
+        if let mini = translationMini(tab) {
+            Toast.show(text, symbol: symbol, action: action, duration: duration, over: mini.overlay, area: mini.overlay.bounds, announces: announces)
+        } else {
+            Toast.show(text, symbol: symbol, action: action, duration: duration, announces: announces, in: self)
+        }
+    }
+
+    private func hideTranslationToast(_ tab: Tab) {
+        if let mini = translationMini(tab) { Toast.hide(over: mini.overlay) } else { Toast.hide(in: self) }
+    }
+
+    /// The page the visible translation offer is for; removed when the tab or page changes.
+    private var translationOfferPage: URL?
+
+    /// Removes the translation offer when its page is no longer in view: another tab, a navigation, or the page turned
+    /// out to be in your language.
+    private func withdrawStaleTranslationOffer() {
+        guard let tab = Toast.owner(in: self) as? Tab else { return }
+        if tab !== tabManager.selectedTab || !PageTranslator.offerStands(offeredFor: translationOfferPage, now: tab.url, foreign: tab.foreignLanguage != nil, translated: tab.isTranslated) {
+            Toast.hide(for: tab, in: self)
+        }
+    }
+
+    private func offerTranslation() {
+        withdrawStaleTranslationOffer()
+        guard let tab = tabManager.selectedTab, let language = tab.foreignLanguage, !tab.isTranslated,
+              PageTranslator.readsLanguage(of: tab.url, errorPage: tab.showsErrorPage),
+              let site = ContentBlocker.site(of: tab.url) else { return }
+        switch PageTranslator.Choices().automatic(language: language, site: site, translatedHere: translatedSites[site] != nil,
+                                                  neverHere: neverTranslatedHere, offers: PageTranslator.offers,
+                                                  declined: translationDeclined.contains(site)) {
+        case .translate: translatePage(asked: false)
+        case .offer:
+            showTranslationOffer(tab, language: language)
+        case .nothing: break
+        }
+    }
+
+    private func showTranslationOffer(_ tab: Tab, language: Locale.Language) {
+        let text = String(localized: "This page is in \(PageTranslator.name(of: language))", comment: "Toast offering to translate a page. The language is its name, like French.")
+        let translate = (title: String(localized: "Translate", comment: "Button in the toast that offers to translate a page."), run: { [weak self, weak tab] in
+            if let tab { self?.translatePage(tab: tab) }
+        })
+        let options = { [weak self, weak tab] () -> [MenuPanel.Entry] in
+            guard let self, let tab else { return [] }
+            return self.translateChoices(tab, language: language)
+        }
+        // Closed with its ×, the site stops asking this session.
+        let declined = { [weak self, site = ContentBlocker.site(of: tab.url)] in
+            if let site { self?.translationDeclined.insert(site) }
+        }
+        if let mini = translationMini(tab) {
+            Toast.show(text, symbol: "translate", action: translate, options: options, duration: 6, closes: true, over: mini.overlay, area: mini.overlay.bounds, onClose: declined)
+            return
+        }
+        translationOfferPage = tab.url
+        Toast.show(text, symbol: "translate", action: translate, options: options, duration: 6, closes: true, owner: tab, onClose: declined, in: self)
+    }
+
+    /// The address bar's translate button: on pages in another language, and pressed while translated.
+    private func updateTranslateButton() {
+        guard let tab = tabManager.selectedTab else { sidebar.address.setTranslation(available: false, translated: false); return }
+        let foreign = tab.foreignLanguage != nil && PageTranslator.readsLanguage(of: tab.url, errorPage: tab.showsErrorPage)
+        let choices = PageTranslator.Choices()
+        let site = ContentBlocker.site(of: tab.url)
+        let never = (tab.foreignLanguage.map { choices.neverLanguages.contains(PageTranslator.code(of: $0)) } ?? false)
+            || site.map { choices.neverSites.contains($0) || neverTranslatedHere.contains($0) } ?? false
+        let key = ObjectIdentifier(tab)
+        sidebar.address.setTranslation(available: PageTranslator.offersButton(foreign: foreign, translated: tab.isTranslated, never: never),
+                                       translated: tab.isTranslated,
+                                       translating: translations.run(for: key) != nil || planningTranslation.contains(key))
+    }
+
+    /// The translate button's menu: Translate or Show Original, then the Always and Never choices.
+    func showTranslateMenu() {
+        guard let tab = tabManager.selectedTab else { return }
+        let language = tab.foreignLanguage ?? ContentBlocker.site(of: tab.url).flatMap { translatedSites[$0] }
+        var entries: [MenuPanel.Entry] = [.item(MenuPanel.Item(title: PageTranslator.menuTitle(translated: tab.isTranslated)) { [weak self, weak tab] in
+            if let tab { self?.translatePage(tab: tab) }
+        })]
+        let choices = translateChoices(tab, language: language)
+        if !choices.isEmpty { entries += [.separator] + choices }
+        MenuPanel.show(entries, from: sidebar.address.translateButton, placement: .below)
+    }
+
+    /// Always Translate and Never Translate for the page's language and site, and the way to Settings.
+    private func translateChoices(_ tab: Tab, language: Locale.Language?) -> [MenuPanel.Entry] {
+        let choices = PageTranslator.Choices()
+        var entries: [MenuPanel.Entry] = []
+        if let language {
+            let code = PageTranslator.code(of: language), name = PageTranslator.name(of: language)
+            let always = choices.alwaysLanguages.contains(code), never = choices.neverLanguages.contains(code)
+            entries.append(.item(MenuPanel.Item(title: String(localized: "Always Translate \(name)", comment: "Item in the translate menu: pages in this language are translated as they open. The name is a language's, like French."),
+                                                isChecked: always) { [weak self, weak tab] in
+                choices.setAlways(!always, code)
+                guard !always, let self, let tab, !tab.isTranslated else { return }
+                self.translatePage(tab: tab)
+            }))
+            entries.append(.item(MenuPanel.Item(title: String(localized: "Never Translate \(name)", comment: "Item in the translate menu: pages in this language are never offered or translated on their own. The name is a language's, like French."),
+                                                isChecked: never) { [weak self, weak tab] in
+                choices.setNever(!never, code)
+                defer { self?.updateTranslateButton() }
+                guard !never, let self else { return }
+                self.translatedSites = PageTranslator.translated(self.translatedSites, neverLanguage: code)
+                if let tab { self.stopOffering(tab) }
+            }))
+        }
+        if let site = ContentBlocker.site(of: tab.url) {
+            let never = choices.neverSites.contains(site) || neverTranslatedHere.contains(site)
+            entries.append(.item(MenuPanel.Item(title: String(localized: "Never Translate This Site", comment: "Item in the translate menu: pages on this site are never offered or translated on their own."),
+                                                isChecked: never) { [weak self, weak tab] in
+                guard let self else { return }
+                defer { self.updateTranslateButton() }
+                if never {
+                    choices.setNeverSite(false, site, isPrivate: false)
+                    self.neverTranslatedHere.remove(site)
+                    return
+                }
+                if !choices.setNeverSite(true, site, isPrivate: self.tabManager.isPrivate) { self.neverTranslatedHere.insert(site) }
+                self.translatedSites = PageTranslator.translated(self.translatedSites, neverSite: site)
+                if let tab { self.stopOffering(tab) }
+            }))
+        }
+        entries += [.separator, .item(MenuPanel.Item(title: String(localized: "Translation Settings…", comment: "Item in the translate menu: opens Settings › Translation.")) { [weak self] in
+            if let self { SettingsPage.open(.translation, in: self) }
+        })]
+        return entries
+    }
+
+    /// After a Never choice: the offer goes, and a translated page shows its original.
+    private func stopOffering(_ tab: Tab) {
+        if tab.isTranslated { translatePage(tab: tab); return }
+        if translationInView(tab) {
+            if let mini = translationMini(tab) { Toast.hide(over: mini.overlay) } else { Toast.hide(for: tab, in: self) }
+        }
+    }
+
+    /// Translates the current tab or `chosen` (sidebar tab menu, page menu, Zigzag Mini), or reverts it. Tabs translate
+    /// independently; toasts show only while the page is in view. `asked` is false for automatic translation, which
+    /// never opens macOS's download sheet (#231).
+    func translatePage(tab chosen: Tab? = nil, asked: Bool = true) {
+        guard let tab = chosen ?? tabManager.selectedTab, let webView = tab.webView else { return }
+        let key = ObjectIdentifier(tab)
+        // Already on its way: asked again, it just says so.
+        if let running = translations.run(for: key) {
+            if translationInView(tab) { showTranslating(running) }
+            return
+        }
+        guard !planningTranslation.contains(key) else { return }
+        let site = ContentBlocker.site(of: tab.url)
+        if tab.isTranslated {
+            PageTranslator.restore(in: webView)
+            tab.isTranslated = false
+            if let site { translatedSites[site] = nil }
+            updateTranslateButton()
+            if translationInView(tab) { hideTranslationToast(tab) }
+            return
+        }
+        planningTranslation.insert(key)
+        updateTranslateButton()
+        // Read the page's language again now: what was seen as it loaded can be out of date (a site that changes
+        // its page without loading a new one), and translating from the wrong language never finishes.
+        // Still loading, there's too little text to tell yet: what was seen of it so far stands.
+        // Asked for, every part of the page not in your language is translated, not only a page that's all in
+        // another one (#197): an English page with a paragraph of Chinese has that paragraph translated.
+        // Seen as in your language, or as too little to tell, it's asked for anyway: the whole page is read again
+        // to find what it's in (#218).
+        Task { @MainActor [weak self] in
+            defer {
+                self?.planningTranslation.remove(key)
+                self?.updateTranslateButton()
+            }
+            let target = PageTranslator.readerLanguage
+            let kept = site.flatMap { self?.translatedSites[$0] }
+            let seen = await PageTranslator.pageLanguage(of: webView) ?? (webView.isLoading ? tab.foreignLanguage : nil)
+            let text = await PageTranslator.text(in: webView)
+            let planned = await Task.detached(priority: .userInitiated) {
+                let page = PageTranslator.keeping(kept, over: PageTranslator.sourceLanguage(seen: seen, text: text, into: target))
+                return PageTranslator.plan(text, page: page, into: target)
+            }.value
+            var status: [LanguageAvailability.Status] = []
+            for group in planned { status.append(await PageTranslator.status(from: group.source, to: target)) }
+            let (groups, unsupported, offer) = PageTranslator.runnable(planned, status: status, asked: asked)
+            guard let self, tab.webView === webView, !tab.isClosed else { return }
+            // Language not installed: offer it so the user starts the download.
+            if offer {
+                if self.translationInView(tab), let language = planned.first?.source { self.showTranslationOffer(tab, language: language) }
+                return
+            }
+            guard !groups.isEmpty else {
+                guard self.translationInView(tab) else { return }
+                if let language = unsupported.first {
+                    self.translationToast(tab, String(localized: "Can’t translate \(PageTranslator.name(of: language)) on this Mac", comment: "Toast when the page's text is in a language Apple's translation can't translate on this Mac. The language is its name, like Latin."), symbol: "translate", duration: 3)
+                } else {
+                    self.translationToast(tab, String(localized: "Nothing on this page needed translating", comment: "Toast when Translate finds no text on the page that isn't already in the person's language."), symbol: "translate", duration: 2)
+                }
+                return
+            }
+            self.startTranslating(tab, webView: webView, pieces: text.pieces, shown: Set(text.shown ?? []), groups: groups, into: target, site: site)
+        }
+    }
+
+    private func showTranslating(_ run: PageTranslation, announces: Bool = true) {
+        guard let tab = run.tab else { return }
+        let inMini = translationMini(tab) != nil
+        if !inMini { translationToastTab = tab }
+        let percent = PageTranslator.percent(run.fraction)
+        let text = percent > 0
+            ? String(localized: "Translating from \(run.name)… \(percent)%", comment: "Toast while a page is translated, with how much is done. The language is its name, like French; then a percent, like 40%.")
+            : String(localized: "Translating from \(run.name)…", comment: "Toast while a page is translated. The language is its name, like French.")
+        translationToast(tab, text, symbol: "translate", duration: Self.translationTimeout + 5, announces: announces)
+    }
+
+    /// Another page came into view (another tab chosen): the toast of a translation
+    /// running for the page that left goes, and the one for the page now in view, if it's translating, shows.
+    func translationViewChanged() {
+        withdrawStaleTranslationOffer()
+        if let shown = translationToastTab, !translationInView(shown) || translations.run(for: ObjectIdentifier(shown)) == nil {
+            translationToastTab = nil
+            Toast.hide(in: self)
+        }
+        if translationToastTab == nil, let inView = tabManager.selectedTab, let run = translations.run(for: ObjectIdentifier(inView)) { showTranslating(run) }
+    }
+
+    private func startTranslating(_ tab: Tab, webView: WKWebView, pieces: [String], shown: Set<Int>, groups: [PageTranslator.Group],
+                                  into target: Locale.Language, site: String?) {
+        var names: [String] = []
+        for group in groups where !names.contains(PageTranslator.name(of: group.source)) { names.append(PageTranslator.name(of: group.source)) }
+        let run = PageTranslation(tab: tab, webView: webView, name: Words.list(names), site: site, source: groups.first?.source)
+        let key = ObjectIdentifier(tab)
+        guard translations.begin(run, for: key) else { return }
+        updateTranslateButton()
+        (translationMini(tab)?.overlay ?? root.overlay).addSubview(run.host.view)
+        // Another page in the tab, or this one loaded again: it isn't translated, and there's nothing to say.
+        run.token = tab.changed.observe { [weak self, weak run, weak tab] change in
+            guard let self, let run, change == .document || (change == .url && tab?.webView?.url != run.page) else { return }
+            self.endTranslation(run, for: key)
+        }
+        if translationInView(tab) { showTranslating(run) }
+        watchTranslation(run, for: key)
+        run.host.translate(webView, pieces: pieces, shown: shown, groups: groups, into: target,
+                           memory: tab.isPrivate ? TranslationMemory() : .shared, progress: { [weak self, weak run] fraction in
+            guard let self, let run, self.translations.isCurrent(run, for: key) else { return }
+            run.lastProgress = Date()
+            run.fraction = fraction
+            if let tab = run.tab, self.translationToastTab === tab || self.translationMini(tab) != nil, self.translationInView(tab) { self.showTranslating(run, announces: false) }
+        }, completion: { [weak self, weak run, weak tab] result in
+            guard let self, let run, self.translations.isCurrent(run, for: key) else { return }
+            self.endTranslation(run, for: key)
+            guard let tab, !tab.isClosed, tab.webView?.url == run.page else { return }
+            if case .failure(let error) = result, error is TranslationHost.Cancelled { return }
+            let inView = self.translationInView(tab)
+            switch result {
+            case .success:
+                tab.isTranslated = true
+                if let site = run.site, let source = run.source { self.translatedSites[site] = source }
+                self.updateTranslateButton()
+                guard inView else { return }
+                self.translationToast(tab, String(localized: "Translated from \(run.name)", comment: "Toast after a page is translated. The language is its name, like French."), symbol: "translate",
+                                      action: (title: String(localized: "Show Original", comment: "Button in the toast after a page is translated: shows it untranslated again."), run: { [weak self, weak tab] in
+                                          if let tab { self?.translatePage(tab: tab) }
+                                      }), duration: 4)
+            case .failure:
+                // Half done is no use to read: the page goes back to how it was.
+                if let webView = tab.webView { PageTranslator.restore(in: webView) }
+                guard inView else { return }
+                self.showTranslationFailed(tab, from: groups.map(\.source), into: target)
+            }
+        })
+    }
+
+    /// Shows a translation failure. If macOS's download sheet was closed without downloading, offers Translate again to
+    /// reopen it; otherwise suggests retrying.
+    private func showTranslationFailed(_ tab: Tab, from sources: [Locale.Language], into target: Locale.Language) {
+        Task { @MainActor [weak self, weak tab] in
+            let missing = await PageTranslator.notDownloaded(sources, into: target)
+            guard let self, let tab, !tab.isClosed, self.translationInView(tab) else { return }
+            let message = PageTranslator.failureMessage(notDownloaded: missing)
+            guard missing != nil else {
+                self.translationToast(tab, message, symbol: "exclamationmark.triangle", duration: 3)
+                return
+            }
+            self.translationToast(tab, message, symbol: "translate",
+                                  action: (title: String(localized: "Translate", comment: "Button in the toast that offers to translate a page."), run: { [weak self, weak tab] in
+                                      if let tab { self?.translatePage(tab: tab) }
+                                  }), duration: 6)
+        }
+    }
+
+    /// No answer in time: it stops, the page goes back to how it was, and it says it couldn't. While macOS asks
+    /// to download the language (its sheet on this window), it waits for you, however long that takes.
+    private func watchTranslation(_ run: PageTranslation, for key: ObjectIdentifier, after wait: TimeInterval = translationTimeout) {
+        let work = DispatchWorkItem { [weak self, weak run] in
+            guard let self, let run, self.translations.isCurrent(run, for: key) else { return }
+            guard let tab = run.tab, !tab.isClosed else { self.endTranslation(run, for: key); return }
+            // A batch came back since: the limit runs from that one.
+            if let left = PageTranslator.waitLeft(lastProgress: run.lastProgress, now: Date(), limit: Self.translationTimeout) {
+                self.watchTranslation(run, for: key, after: left)
+                return
+            }
+            if (run.host.view.window ?? self.window)?.attachedSheet != nil {
+                if self.translationInView(tab) { self.showTranslating(run) }
+                self.watchTranslation(run, for: key)
+                return
+            }
+            self.endTranslation(run, for: key)
+            if let webView = run.webView, webView.url == run.page { PageTranslator.restore(in: webView) }
+            guard self.translationInView(tab) else { return }
+            self.showTranslationFailed(tab, from: run.source.map { [$0] } ?? [], into: PageTranslator.readerLanguage)
+        }
+        run.timeout = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + wait, execute: work)
+    }
+
+    /// Done, given up, or its page gone: its session stops and its toast, if showing, goes.
+    private func endTranslation(_ run: PageTranslation, for key: ObjectIdentifier) {
+        guard translations.end(run, for: key) else { return }
+        run.host.cancel()
+        run.host.view.removeFromSuperview()
+        run.token = nil
+        run.timeout?.cancel()
+        if let tab = run.tab, translationMini(tab) != nil { hideTranslationToast(tab) }
+        if let tab = run.tab, translationToastTab === tab {
+            translationToastTab = nil
+            Toast.hide(in: self)
+        }
+        // Failed, timed out or cancelled too: the button leaves the accent.
+        updateTranslateButton()
+    }
+
+    #if DEBUG
+    /// Marks the page translated without Apple's translation, for screenshots.
+    func debugMarkTranslated() {
+        guard let tab = tabManager.selectedTab else { return }
+        tab.isTranslated = true
+        if let site = ContentBlocker.site(of: tab.url), let language = tab.foreignLanguage { translatedSites[site] = language }
+        updateTranslateButton()
+    }
+    #endif
+
+    // MARK: Reader
+
+    private var reader: ReaderView?
+    #if DEBUG
+    var debugReaderWebView: WKWebView? { reader?.webView }
+    #endif
+    private weak var readerTab: Tab?
+    /// The pane the reading page covers: in a split, the one its tab is in.
+    private weak var readerCard: PageCardView?
+    var isReaderOpen: Bool { isShowingReader }
+    /// Reader is on over the page you're in.
+    var isReaderOnHere: Bool { reader != nil && readerTab === tabManager.selectedTab }
+    private var readerURL: URL?
+    private var readerKeyMonitor: Any?
+
+    /// ⌘+, ⌘− and ⌘0 while Reader is up size its text instead of the page underneath. False when it isn't up.
+    func zoomReader(_ delta: Int) -> Bool {
+        guard let reader, readerTab === tabManager.selectedTab else { return false }
+        let percent = reader.stepTextSize(delta).percent
+        Toast.show(String(localized: "Text \(percent)%", comment: "Toast when Reader's text size changes, like Text 120%."), symbol: delta < 0 ? "textformat.size.smaller" : "textformat.size.larger", in: self)
+        return true
+    }
+
+    /// What Find searches: the article while Reader covers the page you're on, otherwise the page.
+    var findableWebView: WKWebView? {
+        if let reader, readerTab === tabManager.selectedTab { return reader.webView }
+        return selectedWebView
+    }
+
+    /// What Print and Export as PDF take: the article Reader shows, or the page.
+    var printableWebView: WKWebView? {
+        if let reader, readerTab === tabManager.selectedTab { return reader.webView }
+        return selectedWebView
+    }
+
+    /// Reader requested while loading: opens when the load finishes (#233).
+    private var readerWait: SignalToken?
+    private var readerWaitLimit: DispatchWorkItem?
+    /// The tab Reader is waiting for.
+    private weak var readerWaitTab: Tab?
+
+    func toggleReader() {
+        if reader != nil { closeReader(); return }
+        // Pressed again on the same tab: cancel. On another tab: the first wait ends and Reader is for this one.
+        if readerWait != nil {
+            let same = Self.readerPressCancelsWait(waitingFor: readerWaitTab, selected: tabManager.selectedTab)
+            endReaderWait()
+            if same { return }
+        }
+        guard let tab = tabManager.selectedTab, let webView = tab.webView, tab.url != nil else { return }
+        // Mid-load the content may be missing or the old page: wait. Pages that never finish loading (a stalled image)
+        // are read anyway.
+        guard !webView.isLoading else {
+            Toast.show(String(localized: "Reader opens once the page loads", comment: "Toast when Reader is pressed while the page is still loading."), symbol: "doc.plaintext", duration: 2, in: self)
+            readerWait = tab.changed.observe { [weak self, weak tab] change in
+                guard case .loading = change, let self, let tab, tab.webView?.isLoading == false else { return }
+                self.endReaderWait()
+                self.openReader(in: tab)
+            }
+            let limit = DispatchWorkItem { [weak self, weak tab] in
+                guard let self, let tab, self.readerWait != nil else { return }
+                self.endReaderWait()
+                self.openReader(in: tab)
+            }
+            readerWaitLimit = limit
+            readerWaitTab = tab
+            DispatchQueue.main.asyncAfter(deadline: .now() + 10, execute: limit)
+            return
+        }
+        openReader(in: tab)
+    }
+
+    /// Only a press on the waiting tab cancels the wait.
+    static func readerPressCancelsWait(waitingFor: Tab?, selected: Tab?) -> Bool {
+        waitingFor != nil && waitingFor === selected
+    }
+
+    private func endReaderWait() {
+        readerWait?.cancel()
+        readerWait = nil
+        readerWaitLimit?.cancel()
+        readerWaitLimit = nil
+        readerWaitTab = nil
+    }
+
+    private func openReader(in tab: Tab) {
+        // The tab changed while waiting: skip.
+        guard reader == nil, tabManager.selectedTab === tab, let webView = tab.webView, let url = tab.url else { return }
+        Task { [weak self] in
+            guard let article = await Reader.article(in: webView), let self else {
+                if let self { Toast.show(String(localized: "This page doesn’t have an article to read", comment: "Toast when Reader can't find an article on the page."), symbol: "doc.plaintext", duration: 2, in: self) }
+                return
+            }
+            guard self.tabManager.selectedTab === tab, self.reader == nil else { return }
+            self.showReader(article, in: tab, from: url, store: webView.configuration.websiteDataStore)
+        }
+    }
+
+    /// Reader over `tab`'s card with `article`, once it's been read from the page.
+    func showReader(_ article: Reader.Article, in tab: Tab, from url: URL, store: WKWebsiteDataStore) {
+        let view = ReaderView(store: store)
+        view.onClose = { [weak self] in self?.closeReader() }
+        view.onOptions = { [weak self] in self?.toggleReaderOptions() }
+        // The article's links are the page's, wherever they open.
+        view.onOpenLink = { [weak self] link in self?.closeReader(); tab.load(link, by: .page) }
+        view.onPeekLink = { [weak self] link in self?.open(link, disposition: .mini, opener: tab, by: .page) }
+        view.onBackgroundLink = { [weak self] link in self?.open(link, disposition: .backgroundTab, opener: tab, by: .page) }
+        view.onForegroundLink = { [weak self] link in self?.open(link, disposition: .foregroundTab, opener: tab, allowSwitch: false, by: .page) }
+        view.currentSpace = { [weak self] in self?.tabManager.currentSpace }
+        view.show(article, from: url, icon: tab.favicon)
+        reader = view
+        readerTab = tab
+        tab.readerWebView = view.webView
+        readerURL = url
+        let index = tabManager.split(for: tab)?.ids.firstIndex(of: tab.id) ?? 0
+        let card = root.paneCards[min(index, root.paneCards.count - 1)]
+        readerCard = card
+        card.setOverlay(view)
+        // Visible from the start (WebKit doesn't paint into a hidden view); the article is local and draws
+        // within a few frames, well inside the fade.
+        Self.readerTransition(view, entering: true)
+        window?.makeFirstResponder(view.webView)
+        // Opened again quickly: one listener, never two.
+        if let old = readerKeyMonitor { NSEvent.removeMonitor(old) }
+        readerKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            // The command bar or a panel over it, and mid-word in an input method, Esc belongs to that.
+            guard let self, event.keyCode == 53, event.window === self.window, self.reader != nil,
+                  !self.hasFloatingPanel, (self.window?.firstResponder as? NSTextInputClient)?.hasMarkedText() != true else { return event }
+            self.closeReader()
+            return nil
+        }
+        updateReaderButton()
+        paintTopBar()
+        // An open Find follows the article in, and back out to the page.
+        findBar.pageChanged()
+    }
+
+    /// The reading page shown now, if Reader is on over the page you're in.
+    var readerHere: ReaderView? { readerTab === tabManager.selectedTab ? reader : nil }
+
+    /// Reader's text and colors, under the Aa button in the reading page's top-right corner, its right edge with
+    /// the button's and always whole inside the page.
+    func toggleReaderOptions() {
+        guard let reader = readerHere else { return }
+        let overlay = root.overlay
+        if !ReaderOptions.isOpen(in: window) { closeFloatingPanels() }
+        ReaderOptions.toggle(for: reader, in: overlay) { [weak reader, weak overlay] size in
+            guard let reader, let overlay else { return .zero }
+            let b = reader.optionsButton.convert(reader.optionsButton.bounds, to: overlay)
+            let page = reader.convert(reader.bounds, to: overlay)
+            return NSPoint(x: max(page.minX + Tokens.Space.x3, b.maxX - size.width), y: b.maxY + Tokens.Space.x1)
+        }
+    }
+
+    private func closeReader() {
+        guard let view = reader else { return }
+        ReaderOptions.close(for: view)
+        reader = nil
+        readerTab?.readerWebView = nil
+        readerTab = nil
+        readerURL = nil
+        let card = readerCard ?? root.card
+        readerCard = nil
+        if let monitor = readerKeyMonitor { NSEvent.removeMonitor(monitor) }
+        readerKeyMonitor = nil
+        Self.readerTransition(view, entering: false) {
+            guard card.overlay === view else { view.removeFromSuperview(); return }
+            card.setOverlay(nil)
+        }
+        if let webView = tabManager.selectedTab?.webView { window?.makeFirstResponder(webView) }
+        updateReaderButton()
+        paintTopBar()
+        findBar.pageChanged()
+    }
+
+    /// Reader stands in for the page in place: its paper fades in over `enter` while the text settles up inside it
+    /// (the page's own CSS), and fades out over `exit`; with Reduce Motion a crossfade. The view itself never moves
+    /// or scales, which stops WebKit drawing into it, nor starts fully transparent (hence 0.01).
+    private static func readerTransition(_ view: NSView, entering: Bool, completion: (@MainActor () -> Void)? = nil) {
+        if entering { view.alphaValue = 0.01 }
+        NSAnimationContext.runAnimationGroup({ ctx in
+            ctx.duration = Tokens.Motion.Role.present.duration(entering: entering) * Tokens.Motion.debugSlowdown
+            ctx.timingFunction = Tokens.Motion.easeOut
+            view.animator().alphaValue = entering ? 1 : 0.01
+        }, completionHandler: Tokens.Motion.completion(completion))
+    }
+
+    private func updateReaderButton() {
+        // Pressed while Reader is up in this split, as the menu and Site Controls say: a press then closes it.
+        sidebar.address.setReader(available: tabManager.selectedTab?.isArticle ?? false, active: isShowingReader)
+    }
+
+    private func updateWindowTitle() {
+        let tab = tabManager.selectedTab
+        // Every title change makes AppKit lay out the title bar again, so skip no-op changes. Setting `representedURL`
+        // does too, even to nil, so it's never set: no document icon.
+        let title = tab?.displayTitle ?? "Zigzag"
+        if window?.title != title { window?.title = title }
+        // Lets accessibility clients (1Password, Raycast, Shortcuts) know which page is showing.
+        window?.setAccessibilityDocument(tab?.url?.absoluteString)
+    }
+
+    private func downloadsChanged() {
+        let manager = DownloadManager.shared
+        let mine = manager.items(isPrivate: tabManager.isPrivate)
+        let active = mine.filter { $0.state == .downloading }
+        let progress = active.isEmpty ? 1 : active.map(\.fractionCompleted).reduce(0, +) / Double(active.count)
+        bothSidebars { $0.updateDownloads(active: active.count, hasAny: !mine.isEmpty, progress: progress) }
+    }
+
+    /// The file's own icon lifts off where you clicked and arcs into the Downloads button, which answers with a
+    /// small pulse: you see where it went without a word. With the sidebar hidden, just the pulse is skipped; with
+    /// Reduce Motion, just the flight.
+    #if DEBUG
+    func debugFlyDownload(_ name: String) {
+        sidebar.updateDownloads(active: 1, hasAny: true, progress: 0.35)
+        flyDownload(DownloadItem(filename: name, sourceURL: nil, isPrivate: false), refresh: false)
+    }
+    #endif
+
+    /// Downloads on their way to the button: one that finishes mid-flight waits for the landing before it's announced.
+    private(set) var flyingDownloads: Set<UUID> = []
+
+    private func flyDownload(_ item: DownloadItem, refresh: Bool = true) {
+        if refresh { downloadsChanged() }
+        sidebar.layoutSubtreeIfNeeded()
+        let overlay = root.overlay
+        guard let host = overlay.layer, let window else { return }
+        let anchor = sidebar.downloadsAnchor
+        let sidebarShown = root.chromeSidebarShown || root.isSidebarFloatingVisible
+        // Sidebar hidden: its Downloads button stands in at the same corner, and the download flies there.
+        if !sidebarShown { showFloatingDownloads() }
+        let target = sidebarShown ? anchor : floatingDownloadsButton
+        // The landing is one moment: the file goes into the button and the panel opens out of it, showing the file
+        // come in, and tidies itself away a while after it's done. The ring on the button says the rest.
+        let land = { [weak self] in
+            guard let self else { return }
+            if refresh, !self.hasFloatingPanel, self.window?.isKeyWindow == true {
+                DownloadsPanel.reveal(from: target, in: self, closingAfter: item)
+            } else if !sidebarShown, !DownloadsPanel.isOpen(in: self.window) {
+                // Nothing opened from it: it stays a moment so you see where the file went, then goes.
+                DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { [weak self] in self?.hideFloatingDownloads() }
+            }
+        }
+        // With Reduce Motion nothing flies: it lands at once.
+        guard !Tokens.Motion.reduceMotion else { land(); return }
+        let card = root.cardFrame
+        // From the pointer if it's over the page, otherwise the middle of the page.
+        let mouse = overlay.convert(window.mouseLocationOutsideOfEventStream, from: nil)
+        let start = card.contains(mouse) ? mouse : NSPoint(x: card.midX, y: card.midY)
+        floatingDownloads.layoutSubtreeIfNeeded()
+        let end: NSPoint = !target.isHiddenOrHasHiddenAncestor
+            ? overlay.convert(NSPoint(x: target.bounds.midX, y: target.bounds.midY), from: target)
+            : NSPoint(x: card.minX + 24, y: card.maxY - 24)
+        let ext = (item.filename as NSString).pathExtension
+        let icon = NSWorkspace.shared.icon(for: UTType(filenameExtension: ext) ?? .data)
+        let size: CGFloat = 56
+        let flyer = CALayer()
+        flyer.contents = icon
+        flyer.contentsGravity = .resizeAspect
+        flyer.bounds = CGRect(x: 0, y: 0, width: size, height: size)
+        flyer.position = end
+        flyer.zPosition = 2000
+        // Carried, like a row picked up: the small carry shadow.
+        flyer.shadowColor = NSColor.black.cgColor
+        flyer.shadowOpacity = 0.14
+        flyer.shadowRadius = Tokens.Shadow.carryRadius
+        flyer.shadowOffset = CGSize(width: 0, height: Tokens.Shadow.carryDrop)
+        flyer.opacity = 0
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        host.addSublayer(flyer)
+        CATransaction.commit()
+        // A throw, like a ball: it slows as it rises, hangs at the top for a beat, and speeds up as it drops into
+        // the button. Sampled from a real parabola in time, so the speed comes from the arc itself.
+        // High enough to read as a throw, never off the top of the page.
+        // Started right at the page's top, it still rises a little, so the arc stays an arc.
+        let topY = min(min(start.y, end.y) - 40, max(card.minY + 40, min(start.y, end.y) - max(200, min(340, abs(end.x - start.x) * 0.4 + 140))))
+        let drop = end.y - start.y, rise = start.y - topY
+        // y(t) = a·t² + b·t + y0 through both ends, with its highest point at topY (y grows downward).
+        let a = ((2 * drop + 4 * rise) + max(0, (2 * drop + 4 * rise) * (2 * drop + 4 * rise) - 4 * drop * drop).squareRoot()) / 2
+        let b = drop - a
+        let samples = 36
+        var points: [NSValue] = []
+        for i in 0...samples {
+            let t = CGFloat(i) / CGFloat(samples)
+            // Sideways it eases a little, so the throw leaves quickly and settles straight down into the button.
+            let side = 1 - pow(1 - t, 1.25)
+            points.append(NSValue(point: NSPoint(x: start.x + (end.x - start.x) * side, y: start.y + b * t + a * t * t)))
+        }
+        // Slow and high, like Arc's: a lob you watch all the way down (`Motion.flight`), the one movement allowed past
+        // `large` because it crosses the whole window. The parabola is sampled evenly in time, so its own shape sets
+        // the speed: slowing as it rises, hanging at the top, quickening as it drops in.
+        let duration = Tokens.Motion.flight * Tokens.Motion.debugSlowdown
+        let move = CAKeyframeAnimation(keyPath: "position")
+        move.values = points
+        move.calculationMode = .linear
+        move.timingFunction = CAMediaTimingFunction(name: .linear)
+        let scale = CAKeyframeAnimation(keyPath: "transform.scale")
+        // Grows to its size as it leaves and shrinks into the button: no overshoot, no tilt.
+        scale.values = [0.6, 1.0, 0.5]
+        scale.keyTimes = [0, 0.3, 1]
+        scale.timingFunctions = [Tokens.Motion.easeOut, CAMediaTimingFunction(name: .linear)]
+        let fade = CAKeyframeAnimation(keyPath: "opacity")
+        fade.values = [0, 1, 1, 1]
+        fade.keyTimes = [0, 0.1, 0.9, 1]
+        let group = CAAnimationGroup()
+        group.animations = [move, scale, fade]
+        group.duration = duration
+        flyingDownloads.insert(item.id)
+        CATransaction.begin()
+        CATransaction.setCompletionBlock { [weak self] in
+            self?.flyingDownloads.remove(item.id)
+            Tokens.Motion.withoutAnimation { flyer.removeFromSuperlayer() }
+            land()
+        }
+        flyer.add(group, forKey: "fly")
+        CATransaction.commit()
+    }
+
+    // MARK: Traffic lights
+
+    private var trafficLightsPicture: NSImage?
+    /// Until this moment the sidebar is visually sliding, and the real traffic lights stay hidden.
+    private var slideEndsAt = Date.distantPast
+    private var isSliding: Bool { Date() < slideEndsAt || sidebarPulled }
+    /// While a finger has the sidebar's card, it moves with the finger: the lights' picture rides in it as in a slide.
+    private var sidebarPulled = false
+    /// Until this moment the sidebar slides under the bar above the page with the lights staying put: its toggle
+    /// stays put with them, in the bar, and the sidebar's own (riding with it) is out of sight.
+    private var toggleHeldUntil = Date.distantPast
+    private var holdsToggle: Bool { Date() < toggleHeldUntil }
+
+    /// While the sidebar slides, the real buttons hide and their picture moves with the sidebar.
+    /// Visibility is recomputed from the clock, so nothing can leave the buttons stuck hidden.
+    private func sidebarSliding(_ duration: TimeInterval) {
+        if !browserWindow.trafficLightsHidden, let image = browserWindow.trafficLightsImage() { trafficLightsPicture = image }
+        sidebarMovingUntil = duration > 0 ? Date().addingTimeInterval(duration) : .distantPast
+        // Docked and in the bar above the page, the lights are in the same spot: they stay put while the sidebar
+        // slides out from under them or back, and go straight back to it as the floating sidebar leaves.
+        // Beside a sidebar on the right they're in the bar holding the address the whole time, slid out or not; with
+        // only a page's tools there, they ride in the sidebar at the window's other edge, and go with it.
+        let barKeepsLights = root.sidebarOnRight && root.barHoldsAddress
+        let stays = root.chromeBarShown && (barKeepsLights || (!root.sidebarOnRight && !root.isSidebarFloatingVisible))
+        // On either side the bar's toggle is where the sidebar's lands (on the right, both at the window's right end).
+        if stays, duration > 0 {
+            toggleHeldUntil = Date().addingTimeInterval(duration)
+            DispatchQueue.main.asyncAfter(deadline: .now() + duration + 0.01) { [weak self] in self?.layoutTrafficLights() }
+        }
+        guard duration > 0, !stays else { slideEndsAt = .distantPast; layoutTrafficLights(); return }
+        slideEndsAt = Date().addingTimeInterval(duration)
+        layoutTrafficLights()
+        DispatchQueue.main.asyncAfter(deadline: .now() + duration + 0.01) { [weak self] in self?.layoutTrafficLights() }
+    }
+
+    func layoutTrafficLights() {
+        let window = browserWindow
+        let floating = root.isSidebarFloatingVisible
+        let docked = root.chromeSidebarShown
+        let sliding = isSliding
+        // The picture shows only mid-slide, and only when the sidebar is (or is becoming) visible.
+        // Not in full screen: the lights live in the title bar that comes down with the menu bar there, so a picture of
+        // them on the sliding sidebar would only flash and vanish.
+        let fullScreen = window.styleMask.contains(.fullScreen)
+        // The page is under the lights only in full screen with neither the bar nor the sidebar there; then they
+        // get a backing so they don't float over it (#462). The bar or sidebar is their backing otherwise.
+        let backing = trafficLightBacking(fullScreen: fullScreen)
+        if (fullScreenBar != nil) != backing, !window.fullScreenPhase.isMoving { showFullScreenBar(backing) }
+        // With the sidebar hidden, the bar above the page keeps them at its leading end, where they'd be docked.
+        // Beside a sidebar on the right, the bar holding the address keeps them there always: the window's top left.
+        // Without it they're in the sidebar's top row on either side, the page running up to the top as on the left
+        // (#166), and a bar there for a page's tools alone leaves them be, as on the left.
+        let onRight = root.sidebarOnRight
+        let barKeepsLights = onRight && root.barHoldsAddress
+        // An Autohide bar takes them with it as it goes (#359).
+        let inBar = root.barOnScreen && (barKeepsLights || (!docked && !floating))
+        let room = Self.trafficLightRoom(fullScreen: fullScreen, barKeepsLights: barKeepsLights, width: window.trafficLightsWidth)
+        // Their room in the sidebar's row comes at once as it slides out, and goes only once it's out of sight, so
+        // nothing in the row moves while it's on screen; until then their picture rides in it.
+        if switchingSides || !(sliding && room < sidebar.trafficLightsWidth) { sidebar.trafficLightsWidth = room }
+        sidebar.showTrafficLightsPicture(sliding && !fullScreen && sidebar.trafficLightsWidth > 0 ? trafficLightsPicture : nil)
+        // A finger in use with the sidebar hidden: they show with its toggle, where the docked sidebar has them.
+        let withGrabber = !root.isImmersive && root.grabberPlace == .lights && !docked && !floating && !inBar
+        window.trafficLightsHidden = sliding || !(docked || floating || inBar || withGrabber)
+        let container = root.sidebarContainer.frame
+        let lightHeight = window.trafficLightHeight
+        // Docked, from where the docked sidebar starts: the window's left edge, or on the right its width in from the
+        // right edge.
+        let dockedMinX = onRight ? root.bounds.width - root.sidebarWidth : 0
+        let x = (inBar ? 0 : docked || withGrabber ? dockedMinX : container.minX) + SidebarView.trafficLightsX
+        // In the bar, on its middle line, wherever the bar starts or Autohide has it: not the sidebar's line, which is
+        // still the docked one while it slides away.
+        let center = inBar ? root.barTop + Tokens.Sidebar.lightsCenter : (docked || withGrabber ? 0 : container.minY) + sidebar.trafficLightCenterY
+        let y = center - lightHeight / 2
+        window.trafficLightOrigin = NSPoint(x: x, y: y)
+        if !sliding, docked || floating || inBar, let image = window.trafficLightsImage() { trafficLightsPicture = image }
+        // The lights' room in the bar stays while the sidebar floats over it, so nothing in the bar moves as it does.
+        // Full screen included: the lights come down with the menu bar, so the bar leaves their space
+        // rather than drawing its controls under them.
+        root.topBar.trafficLightsWidth = root.chromeBarShown && (!docked || barKeepsLights) ? window.trafficLightsWidth : 0
+        // With the sidebar hidden its toggle goes with it, so the bar above the page has one of its own. While the
+        // sidebar slides back in, the bar's stays where the sidebar's lands, and the sidebar's shows once it's there.
+        let held = root.chromeBarShown && holdsToggle
+        root.topBar.showsSidebarButton = root.chromeBarShown && !docked && !root.isImmersive
+        root.topBar.sidebarOnRight = onRight
+        sidebar.isOnRight = onRight
+        // The sidebar's own, where the docked sidebar puts it.
+        root.topBar.heldSidebarButtonOrigin = held && docked
+            ? NSPoint(x: dockedMinX + sidebar.sidebarButton.frame.minX, y: sidebar.trafficLightCenterY - SidebarView.toolbarButton / 2) : nil
+        sidebar.sidebarButton.alphaValue = held ? 0 : 1
+        sidebar.sidebarButton.toolTip = Shortcuts.tooltip(docked ? String(localized: "Hide Sidebar", comment: "Tooltip of the sidebar button while the sidebar shows.")
+                                                                  : String(localized: "Show Sidebar", comment: "Tooltip of the sidebar button while the sidebar is hidden."),
+                                                           for: #selector(toggleBrowserSidebar(_:)))
+        root.topBar.sidebarButton.toolTip = Shortcuts.tooltip(String(localized: "Show Sidebar", comment: "Tooltip of the sidebar button while the sidebar is hidden."),
+                                                              for: #selector(toggleBrowserSidebar(_:)))
+        sidebar.backButton.toolTip = Shortcuts.tooltip(String(localized: "Back", comment: "Tooltip of the sidebar's back button."), for: #selector(goBack(_:)))
+        sidebar.forwardButton.toolTip = Shortcuts.tooltip(String(localized: "Forward", comment: "Tooltip of the sidebar's forward button."), for: #selector(goForward(_:)))
+        sidebar.reloadButton.toolTip = SidebarView.reloadTip(loading: selectedTab?.isLoading ?? false)
+        sidebar.downloadsButton.toolTip = Shortcuts.tooltip(String(localized: "Downloads", comment: "Tooltip of the sidebar's downloads button."), for: #selector(showDownloads(_:)))
+        sidebar.sidebarButton.isSelected = false
+        root.grabber.button.toolTip = root.topBar.sidebarButton.toolTip
+        root.attachTitlebarPull()
+        if root.isGrabberShown { root.placeGrabber() }
+    }
+
+    func windowDidResize(_ notification: Notification) { layoutTrafficLights(); onStateChange?() }
+    func windowDidMove(_ notification: Notification) { onStateChange?() }
+    func windowDidEndLiveResize(_ notification: Notification) { layoutTrafficLights() }
+
+    // MARK: Full screen in the page (#462)
+
+    /// A page's full screen is the browser's: The Page fills the page's area and leaves the window alone; The Whole
+    /// Screen fills that and takes the browser into its own space, with the chrome out of the way. The page never
+    /// takes the screen by itself; only the expand button hands it to WebKit's own full screen.
+    func tab(_ tab: Tab, pageFullScreenChanged on: Bool) {
+        guard on else {
+            if tab === pageFullScreenTab { endWholeScreen() }
+            return
+        }
+        // AI apps' pages only ever fill the page: nothing of theirs takes your screen.
+        guard !tab.profile.isHeadless else { return }
+        let onScreen = tabManager.selectedTab.map { tabManager.panes(of: $0).contains { $0 === tab } } ?? false
+        switch Self.pageFullScreenGoes(fill: PageFullScreen.fills(for: tab.url), onScreen: onScreen, inSplit: tabManager.split(for: tab) != nil) {
+        case .page: break
+        case .browserSpace: beginWholeScreen(tab)
+        case .webKit: PageFullScreen.handToWebKit(tab)
+        }
+    }
+
+    enum PageFullScreenPlace: Equatable { case page, browserSpace, webKit }
+
+    /// Where a page's request goes. The Whole Screen takes the browser's space for a page on its own; a page in a
+    /// split fills its pane; one not on screen here (in the mini player) gets WebKit's own full screen, as before.
+    nonisolated static func pageFullScreenGoes(fill: PageFullScreen.Fill, onScreen: Bool, inSplit: Bool) -> PageFullScreenPlace {
+        guard fill == .screen else { return .page }
+        guard onScreen else { return .webKit }
+        return inSplit ? .page : .browserSpace
+    }
+
+    /// Whether The Whole Screen has to give the browser's space back: the page is no longer the one on screen, or it
+    /// is in a split now. A split keeps the page's fill, in its pane; a page that leaves takes its full screen with it.
+    nonisolated static func wholeScreenEnds(selectedIsFull: Bool, inSplit: Bool) -> Bool {
+        !selectedIsFull || inSplit
+    }
+
+    /// Whether the address belongs in the bar above the page: when Settings › Appearance says so, and always while the
+    /// page has The Whole Screen (#462).
+    nonisolated static func addressBelongsInBar(abovePage: Bool, wholeScreen: Bool) -> Bool {
+        abovePage || wholeScreen
+    }
+
+    /// The page has The Whole Screen: a windowed browser enters its full-screen space for the duration. The chrome
+    /// gets out of the way and comes back from the top. A browser already in a space stays in it.
+    private func beginWholeScreen(_ tab: Tab) {
+        // On its way out of full screen: the page fills the window, as The Page.
+        guard pageFullScreenTab == nil, tab.isInPageFullScreen, browserWindow.fullScreenPhase != .exiting else { return }
+        pageFullScreenTab = tab
+        root.isImmersive = true
+        placeAddress()
+        showTopBar()
+        // The browser's own space, not a second one for the page. The system gives the windowed frame back.
+        if Self.wholeScreenTakesSpace(phase: browserWindow.fullScreenPhase, inFullScreen: browserWindow.styleMask.contains(.fullScreen)) {
+            pageFullScreenAskedForSpace = true
+            browserWindow.toggleFullScreen(nil)
+        }
+        layoutTrafficLights()
+    }
+
+    /// Whether The Whole Screen enters the browser's space: only from a window that isn't in one or on its way.
+    static func wholeScreenTakesSpace(phase: FullScreenPhase, inFullScreen: Bool) -> Bool {
+        phase == .windowed && !inFullScreen
+    }
+
+    /// The page holds the browser's space, as WebKit's full screen would.
+    func hasWholeScreen(_ tab: Tab) -> Bool { pageFullScreenTab === tab }
+
+    /// What a session keeps: a space the page took is the page's, not the window's.
+    var savesFullScreen: Bool { Self.savesFullScreen(inFullScreen: browserWindow.styleMask.contains(.fullScreen), pageTookSpace: pageFullScreenAskedForSpace) }
+
+    nonisolated static func savesFullScreen(inFullScreen: Bool, pageTookSpace: Bool) -> Bool { inFullScreen && !pageTookSpace }
+
+    /// Leaving puts the chrome back. If the page took the browser into its space, leaving the page leaves the space,
+    /// and macOS gives the window back; one already in a space stays there.
+    private func endWholeScreen() {
+        guard pageFullScreenTab != nil else { return }
+        pageFullScreenTab = nil
+        root.isImmersive = false
+        placeAddress()
+        showTopBar()
+        layoutTrafficLights()
+        guard pageFullScreenAskedForSpace else { return }
+        switch browserWindow.fullScreenPhase {
+        case .fullScreen:
+            pageFullScreenAskedForSpace = false
+            browserWindow.toggleFullScreen(nil)
+        case .entering:
+            // The space is still coming: leave it as soon as it has arrived.
+            pageFullScreenAskedForSpace = false
+            pageFullScreenExitAfterEnter = true
+        case .windowed, .exiting:
+            pageFullScreenAskedForSpace = false
+        }
+    }
+
+    /// The expand button: the one explicit hand-off to WebKit's own full screen. From The Page it goes straight
+    /// there; from The Whole Screen the browser's space is given back first, so WebKit does not open a window inside
+    /// a space the browser made for the page.
+    func tabDidAskToExpandFullScreen(_ tab: Tab) {
+        guard tab === tabManager.selectedTab, tab.isInPageFullScreen, !tab.profile.isHeadless else { return }
+        if tab === pageFullScreenTab, pageFullScreenAskedForSpace, browserWindow.fullScreenPhase != .windowed {
+            pageFullScreenNativeAfterSpace = tab
+            endWholeScreen()
+        } else {
+            PageFullScreen.expand(tab)
+        }
+    }
+
+    /// The split ended (or began), the tab changed, or the setting did: a page that was in The Whole Screen and is
+    /// no longer alone leaves the space. Only the page's own request takes it.
+    private func updatePageFullScreenForLayout() {
+        guard let tab = tabManager.selectedTab else { return }
+        if let full = pageFullScreenTab,
+           Self.wholeScreenEnds(selectedIsFull: tab === full, inSplit: tabManager.split(for: tab) != nil) {
+            // A page that leaves the screen takes its full screen with it; a split keeps the fill in its pane.
+            if tab !== full { PageFullScreen.exit(full) }
+            endWholeScreen()
+        }
+        if let full = pageFullScreenTab, full === tab, PageFullScreen.fills(for: tab.url) == .page {
+            // The setting or the site changed under the page: The Whole Screen becomes The Page.
+            endWholeScreen()
+        }
+    }
+
+    /// The bar behind the traffic lights when the page is under them in full screen (#462). AppKit's title bar is
+    /// transparent, so without it the lights float over the page. Uses the title bar material, as Safari's toolbar.
+    private var fullScreenBar: NSVisualEffectView?
+
+    private func showFullScreenBar(_ on: Bool) {
+        fullScreenBar?.removeFromSuperview()
+        fullScreenBar = nil
+        guard on, let titlebar = browserWindow.standardWindowButton(.closeButton)?.superview else { return }
+        let bar = NSVisualEffectView(frame: titlebar.bounds)
+        bar.material = .titlebar
+        bar.blendingMode = .behindWindow
+        bar.state = .followsWindowActiveState
+        bar.autoresizingMask = [.width, .height]
+        titlebar.addSubview(bar, positioned: .below, relativeTo: nil)
+        fullScreenBar = bar
+    }
+
+    /// The backing for this window now: an Autohide bar that's away is no backing (#462).
+    func trafficLightBacking(fullScreen: Bool) -> Bool {
+        Self.needsTrafficLightBacking(fullScreen: fullScreen, barShown: root.barOnScreen, sidebarVisible: root.chromeSidebarShown,
+                                      sidebarFloating: root.isSidebarFloatingVisible)
+    }
+
+    /// Whether the lights need a backing of their own: in full screen, when the page is under them because neither
+    /// the bar nor the sidebar is. With either there, they sit on Zigzag's own chrome (#462).
+    nonisolated static func needsTrafficLightBacking(fullScreen: Bool, barShown: Bool, sidebarVisible: Bool,
+                                                     sidebarFloating: Bool) -> Bool {
+        fullScreen && !barShown && !sidebarVisible && !sidebarFloating
+    }
+
+    /// The room the lights take in the sidebar's top row. In full screen they are in the title bar, not the sidebar,
+    /// so the sidebar keeps none for them (#462).
+    nonisolated static func trafficLightRoom(fullScreen: Bool, barKeepsLights: Bool, width: CGFloat) -> CGFloat {
+        fullScreen || barKeepsLights ? 0 : width
+    }
+
+    /// The window's place before it went full screen: what's saved, so leaving full screen after a relaunch gives
+    /// back the window you had, not one the size of the screen.
+    private(set) var windowedFrame: NSRect?
+
+    /// In full screen the traffic lights come down with the menu bar, in AppKit's title bar. That bar stays
+    /// transparent, so they sit on the bar above the page rather than on a bar of the system's own.
+    func windowWillEnterFullScreen(_ notification: Notification) {
+        windowedFrame = window?.frame
+        fullScreenChanged(.willEnter)
+    }
+
+    func windowDidEnterFullScreen(_ notification: Notification) {
+        fullScreenChanged(.didEnter)
+        // The page left while the space was coming: give the window back now that it has arrived, unless another
+        // page has taken it in the meantime, which then owns the space.
+        if pageFullScreenExitAfterEnter {
+            pageFullScreenExitAfterEnter = false
+            if pageFullScreenTab != nil {
+                pageFullScreenAskedForSpace = true
+            } else {
+                browserWindow.toggleFullScreen(nil)
+            }
+        }
+    }
+
+    /// macOS gave up on full screen: the window is as it was, so its title bar and buttons are too (#401).
+    func windowDidFailToEnterFullScreen(_ window: NSWindow) {
+        Diagnostics.note("Full screen didn't start")
+        windowedFrame = nil
+        pageFullScreenAskedForSpace = false
+        pageFullScreenExitAfterEnter = false
+        // The space never came: the chrome comes back and the page keeps its fill in the window.
+        endWholeScreen()
+        fullScreenChanged(.didFailToEnter)
+        inPageMini.fullScreenTransitionFailed()
+        // The browser's space never came: the page can still go to WebKit's own full screen.
+        if let tab = pageFullScreenNativeAfterSpace {
+            pageFullScreenNativeAfterSpace = nil
+            if tab === tabManager.selectedTab { PageFullScreen.expand(tab) }
+        }
+    }
+
+    func windowWillExitFullScreen(_ notification: Notification) { fullScreenChanged(.willExit) }
+
+    func windowDidExitFullScreen(_ notification: Notification) {
+        windowedFrame = nil
+        // Leaving the space takes the page out of full screen too: the window is back, with its chrome.
+        pageFullScreenAskedForSpace = false
+        pageFullScreenExitAfterEnter = false
+        if let tab = pageFullScreenTab {
+            PageFullScreen.exit(tab)
+            endWholeScreen()
+        }
+        fullScreenChanged(.didExit)
+        // The expand button asked for WebKit's own full screen: the browser's space is back, so the hand-off goes.
+        if let tab = pageFullScreenNativeAfterSpace {
+            pageFullScreenNativeAfterSpace = nil
+            if tab === tabManager.selectedTab { PageFullScreen.expand(tab) }
+        }
+    }
+
+    func windowDidFailToExitFullScreen(_ window: NSWindow) {
+        Diagnostics.note("Full screen didn't end")
+        pageFullScreenNativeAfterSpace = nil
+        fullScreenChanged(.didFailToExit)
+        inPageMini.fullScreenTransitionFailed()
+    }
+
+    /// One place for the title bar through full screen: what each phase wants, and the buttons laid out once AppKit
+    /// is done moving them.
+    private func fullScreenChanged(_ event: FullScreenPhase.Event) {
+        let phase = browserWindow.fullScreenPhase.after(event)
+        browserWindow.fullScreenPhase = phase
+        if browserWindow.titlebarAppearsTransparent != phase.titlebarAppearsTransparent {
+            browserWindow.titlebarAppearsTransparent = phase.titlebarAppearsTransparent
+        }
+        if phase.dropsTrafficLightBacking, fullScreenBar != nil { showFullScreenBar(false) }
+        guard !phase.isMoving else { return }
+        layoutTrafficLights()
+        root.needsLayout = true
+    }
+    func windowDidResignKey(_ notification: Notification) {
+        updateHandoff()
+        switcher.windowResignedKey()
+        spaceSwitcher.windowResignedKey()
+        if root.isImmersive { root.hideTopBar() }
+    }
+
+    func windowDidBecomeKey(_ notification: Notification) {
+        updateHandoff()
+        // Brand moments in other windows (Settings, Passwords) follow the space in front.
+        Brand.themeChanged.send(())
+        layoutTrafficLights()
+        WindowManager.shared.windowBecameKey(self)
+        EdgeSidebar.shared.noteFocused(self)
+    }
+
+    /// Set as the window closes, for what holds on to this controller past that (Zigzag Mini's source).
+    private(set) var windowClosed = false
+
+    /// Whether the window is watching for Esc over a docked Mini, for the off path's sake.
+    var hasInPageMiniEscMonitor: Bool { inPageMiniEscMonitor != nil }
+
+    /// Whether the keys are the page's: a docked Mini takes Esc from the page, but the sidebar's picked rows, its
+    /// fields and the command bar have Esc's own work to do, so it leaves those to them.
+    var inPageMiniPageHasKeyboard: Bool {
+        guard let window, let focused = window.firstResponder as? NSView else { return false }
+        return root.paneCards.contains { card in
+            guard let webView = card.webView else { return false }
+            return focused === webView || focused.isDescendant(of: webView)
+        }
+    }
+
+    private func inPageMiniRecordChanged() {
+        if inPageMini.record == nil { removeInPageMiniEscMonitor() } else { installInPageMiniEscMonitor() }
+    }
+
+    private func installInPageMiniEscMonitor() {
+        guard inPageMiniEscMonitor == nil else { return }
+        inPageMiniEscMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard let self, event.keyCode == 53, !event.isARepeat,
+                  self.window?.isKeyWindow == true, self.inPageMini.record != nil,
+                  self.inPageMiniPageHasKeyboard else { return event }
+            return self.inPageMini.escapePressed(event) ? nil : event
+        }
+    }
+
+    private func removeInPageMiniEscMonitor() {
+        if let monitor = inPageMiniEscMonitor { NSEvent.removeMonitor(monitor) }
+        inPageMiniEscMonitor = nil
+    }
+
+    /// Closing the AI apps' window while they work hides it again instead (Headless).
+    func windowShouldClose(_ sender: NSWindow) -> Bool { !Headless.parksInsteadOfClosing(self) }
+
+    func windowWillClose(_ notification: Notification) {
+        EdgeSidebar.shared.windowClosed(self)
+        windowClosed = true
+        inPageMini.onRecordChanged = nil
+        inPageMini.windowClosing()
+        removeInPageMiniEscMonitor()
+        fadeTimer?.invalidate()
+        numberHints?.stop()
+        Autofill.shared.forget(windowOf: window)
+        // A private window's Zigzag Minis are private too: they go with it.
+        if tabManager.isPrivate { MiniWindowController.all.filter { $0.source === self }.forEach { $0.window?.close() } }
+        capture.cancel()
+        capture.dismissPreview()
+        // The mini player floats in a panel of its own: it goes with the window too.
+        miniPlayer.windowClosing()
+        // So is a folder's icon picker, and the event monitor it holds.
+        iconPicker?.close()
+        // Nor does Reader's key monitor outlive it.
+        closeReader()
+        // Nor the key monitors of the command bar, find and this window's panels, which stay installed until they close.
+        commandBar.dismiss(restoringFocus: false)
+        if findBar.isVisible { findBar.hide() }
+        if SitePanel.isOpen(in: window) { SitePanel.closeCurrent() }
+        if DownloadsPanel.isOpen(in: window) { DownloadsPanel.closeCurrent() }
+        if let editor = SpaceEditorPanel.current, editor.window === window { editor.close() }
+        // Nor the zoomed pane's Esc, or Autohide's pointer reveal.
+        if let monitor = zoomEscMonitor { NSEvent.removeMonitor(monitor) }
+        zoomEscMonitor = nil
+        if let monitor = autohidePointerMonitor { NSEvent.removeMonitor(monitor) }
+        autohidePointerMonitor = nil
+        // Its page is no longer on offer to your other devices.
+        handoff = HandoffPage.update(handoff, to: nil)
+        onClose?(self)
+    }
+
+    // MARK: Opening pages
+
+    /// Opens a URL as requested, switching to an existing tab if the page is open. `sender`: who gave the address; a
+    /// page's link (⌘-click, Reader) is `.page`. `httpFallback`: `url` is https for a scheme-less address, retried over
+    /// http if unreachable (`CommandRanker.Destination`); Zigzag Mini and new windows don't fall back.
+    func open(_ url: URL, disposition: OpenDisposition = .foregroundTab, opener: Tab? = nil, allowSwitch: Bool = true, by sender: Tab.LoadSender = .zigzag,
+              httpFallback: Bool = false) {
+        // A page that comes to the front, say a link from Mail, isn't left under the command bar the empty window opened with.
+        if disposition == .foregroundTab || disposition == .currentTab, commandBar.isVisible { commandBar.dismiss(restoringFocus: false) }
+        if allowSwitch, disposition == .foregroundTab, let existing = tabManager.existingTab(for: url) {
+            tabManager.select(existing)
+            return
+        }
+        switch disposition {
+        case .currentTab:
+            // Use the requesting tab, not the selected one: in a split they differ.
+            if let tab = opener ?? tabManager.selectedTab {
+                tab.load(url, by: sender, httpFallback: httpFallback)
+            } else {
+                tabManager.newTab(url: url, by: sender, httpFallback: httpFallback)
+            }
+        case .foregroundTab:
+            tabManager.newTab(url: url, opener: opener, by: sender, httpFallback: httpFallback)
+        case .backgroundTab:
+            let tab = tabManager.newTab(url: url, select: false, opener: opener, by: sender, httpFallback: httpFallback)
+            // Background link with the sidebar hidden: show a note. Not for tabs Zigzag opened itself (guide, restore).
+            if sender == .page { newTabNote.show(tab) }
+        case .mini:
+            openInMini(url, configuration: nil, opener: opener ?? tabManager.selectedTab, by: sender)
+        case .newWindow:
+            // A private window's links stay private.
+            WindowManager.shared.newWindow(url: url, isPrivate: tabManager.isPrivate)
+        case .privateWindow:
+            WindowManager.shared.newWindow(url: url, showCommandBar: false, isPrivate: true)
+        }
+    }
+
+    /// Whether a Zigzag Mini opened from this window's pages is up, for the getting-started guide.
+    var hasMiniFromPage: Bool { MiniWindowController.all.contains { $0.source === self && $0.holdsPage } }
+
+    /// A link in Zigzag Mini over this window (⇧-click, Open Link in Zigzag Mini), in its page's profile and privacy.
+    @discardableResult
+    func openInMini(_ url: URL?, configuration: WKWebViewConfiguration?, opener: Tab?, by sender: Tab.LoadSender = .zigzag) -> WKWebView? {
+        commandBar.dismiss(restoringFocus: false)
+        return MiniWindowController.open(fromPage: url, configuration: configuration, opener: opener, in: self, by: sender).tab.webView
+    }
+
+    /// A side button over a docked Mini goes to the Mini's own history, not the page underneath. Visible, the Mini is
+    /// a child window and takes the button itself; this covers the moment it is ordered out under the window's chrome.
+    func peekHandlesSideButton(_ side: BrowserWindow.SideButton, at point: NSPoint) -> Bool {
+        guard side != .press, let record = inPageMini.record, record.controller.isDockedInPage,
+              let frame = record.controller.dockedScreenFrame, let window else { return false }
+        let onScreen = window.convertToScreen(NSRect(origin: point, size: .zero)).origin
+        guard frame.contains(onScreen) else { return false }
+        if side == .back { record.controller.goBack(nil) } else { record.controller.goForward(nil) }
+        return true
+    }
+
+    /// A shift-click that should appear in the page, if the setting is on and this window can hold it.
+    @discardableResult
+    func openInPageMini(_ url: URL, configuration: WKWebViewConfiguration?, opener: Tab,
+                        by sender: Tab.LoadSender = .page) -> Bool {
+        // The setting is checked first: with it off, the command bar closes in `openInMini` on the path that opens one,
+        // exactly as it did before.
+        guard inPageMini.openURL(url: url, configuration: configuration, opener: opener, by: sender) else { return false }
+        commandBar.dismiss(restoringFocus: false)
+        return true
+    }
+
+    private func sidebarContains(_ event: NSEvent) -> Bool {
+        let container = root.sidebarContainer
+        guard root.chromeSidebarShown || root.isSidebarFloatingVisible,
+              container.bounds.contains(container.convert(event.locationInWindow, from: nil)) else { return false }
+        // Only where the sidebar is what's under the pointer: a panel over it (Site Controls, a menu) keeps its own
+        // scrolls, which would otherwise switch spaces behind it (#216).
+        return Self.isInSidebar(root.hitTest(root.superview.map { $0.convert(event.locationInWindow, from: nil) } ?? event.locationInWindow), container)
+    }
+
+    /// Whether the view a point hits is the sidebar's, not something floating over it.
+    static func isInSidebar(_ hit: NSView?, _ container: NSView) -> Bool {
+        hit?.isDescendant(of: container) ?? false
+    }
+
+    // MARK: Event interception
+
+    private func intercept(_ event: NSEvent) -> Bool {
+        if (event.type == .keyDown || event.type == .flagsChanged), switcher.handle(event) { return true }
+        if spaceSwitcher.handle(event) { return true }
+        // A mouse's side buttons go back and forward (`BrowserWindow.SideButton`). In a split, the page under the
+        // pointer is the one that goes, made the one you're in first as a click would, not whichever pane you were
+        // last in (#170).
+        if BrowserWindow.SideButton(event.type, button: event.buttonNumber) == .press, root.tiles != nil {
+            focusPane(at: event.locationInWindow)
+        }
+        if event.type == .leftMouseDown, root.tiles != nil { focusPane(at: event.locationInWindow) }
+        // A click anywhere else finishes a name being typed into a sidebar row, as in Finder: rows don't take focus,
+        // so without this the name stays open through drags and ⌘Z keeps going to it.
+        if event.type == .leftMouseDown, let editor = window?.firstResponder as? NSTextView, editor.isFieldEditor,
+           let field = editor.delegate as? NSTextField, field.isDescendant(of: sidebar.list),
+           !field.bounds.contains(field.convert(event.locationInWindow, from: nil)) {
+            window?.makeFirstResponder(nil)
+        }
+        #if DEBUG
+        if event.type == .scrollWheel, sidebarContains(event) { DebugBridge.recordScroll(event) }
+        #endif
+        // Autohide tells a new swipe from the rest of one by its phases.
+        if event.type == .scrollWheel, event.window === window,
+           root.cardFrame.contains(root.convert(event.locationInWindow, from: nil)), !sidebarContains(event) {
+            let point = root.convert(event.locationInWindow, from: nil)
+            noteScrollGesture(event, inPane: root.paneIndex(at: point) ?? 0)
+        }
+        if event.type == .scrollWheel, !desk.isVisible, sidebarContains(event), sidebar.handleSwipe(event) { return true }
+        if event.type == .keyDown, #available(macOS 15.4, *), !event.modifierFlags.intersection([.command, .control, .option]).isEmpty,
+           ExtensionCenter.performCommand(for: event) {
+            return true
+        }
+        return false
+    }
+}
+
+extension BrowserWindowController: SwipeArrowHost {
+    var swipeArrowLayer: NSView { root.overlay }
+}
+
+// MARK: - TabHost
+
+extension BrowserWindowController: TabHost {
+    var hostWindow: NSWindow? { window }
+    var isUnattended: Bool { Headless.window === self }
+    var isOutOfSight: Bool { (window as? BrowserWindow)?.isParked == true }
+
+    /// The page for a pane, woken if it slept; not in an unseen window, where only a tool wakes it.
+    private func pageView(of tab: Tab) -> BrowserWebView? {
+        isOutOfSight && tab.isAsleep ? nil : tab.ensureWebView()
+    }
+
+    func tab(_ tab: Tab, openURL url: URL, disposition: OpenDisposition, by sender: Tab.LoadSender = .page) {
+        // A page's link: the page's doing wherever it opens, never yours (Tab sends only links to the web here).
+        // A result opened from a search page keeps the search one Back away.
+        if disposition == .backgroundTab || disposition == .foregroundTab, let current = tab.url, SearchFolding.isSearchResultsPage(current),
+           let history = tab.interactionStateForSaving {
+            let newTab = tabManager.newTab(url: nil, select: disposition == .foregroundTab, opener: tab, title: url.host(), site: url)
+            newTab.restoreHistory(history, thenLoad: url, by: sender)
+            if disposition == .backgroundTab { newTabNote.show(newTab, site: url) }
+            return
+        }
+        open(url, disposition: disposition, opener: tab, allowSwitch: false, by: sender)
+    }
+
+    func tab(_ tab: Tab, routesLink url: URL, arrival: SiteRoutes.Arrival, inBackground: Bool) -> Bool {
+        openRouted(url, arrival: arrival, from: tab, inBackground: inBackground, by: .page)
+    }
+
+    @discardableResult
+    func tab(_ tab: Tab, openInPageMini url: URL, configuration: WKWebViewConfiguration?, by sender: Tab.LoadSender) -> Bool {
+        openInPageMini(url, configuration: configuration, opener: tab, by: sender)
+    }
+
+    func tab(_ tab: Tab, createWebViewWith configuration: WKWebViewConfiguration, for action: WKNavigationAction, features: WKWindowFeatures) -> WKWebView? {
+        // Pin Link: WebKit named the link the menu was for; it's pinned, and nothing opens.
+        if let shiftHeld = BrowserWebView.takePendingPin(for: tab.webView) {
+            if let url = action.request.url, ["http", "https"].contains(url.scheme?.lowercased() ?? "") {
+                saveLinkToPins(url, title: tab.hoveredLink == url ? tab.hoveredLinkTitle ?? "" : "", shiftHeld: shiftHeld)
+            }
+            return nil
+        }
+        // Site routes (#286) apply to Open Link in New Tab and clicked new-tab links. Sized windows (sign-in pop-ups)
+        // and Zigzag Mini are skipped.
+        if let url = action.request.url, Tab.route(forPageLink: url, from: tab.url) == .load,
+           features.width == nil, features.height == nil {
+            let pending = BrowserWebView.pendingDisposition(for: tab.webView)
+            let clicked = pending == nil && SiteRoutes.newWindowIsClickedLink(
+                linkActivated: action.navigationType == .linkActivated, userInitiated: PopupNotice.isUserInitiated(action),
+                fromMainFrame: action.sourceFrame.isMainFrame, frameHost: action.sourceFrame.securityOrigin.host, pageHost: tab.url?.host())
+            if pending == .foregroundTab || pending == .backgroundTab || clicked {
+                let flags = action.modifierFlags
+                let background = pending == .backgroundTab || (clicked && flags.contains(.command) && !flags.contains(.shift))
+                if openRouted(url, arrival: .linkNewTab, from: tab, inBackground: background, by: .page) {
+                    _ = BrowserWebView.takePendingDisposition(for: tab.webView)
+                    return nil
+                }
+            }
+        }
+        if let pending = BrowserWebView.takePendingDisposition(for: tab.webView) {
+            if pending == .mini { return openInMini(nil, configuration: configuration, opener: tab, by: .page) }
+            // A new window gets its own fresh page, not one tied to this tab (and a private one never shares anything).
+            // From a private window, it is private too. Only a link to the web: an app's asks from the page here.
+            if pending == .newWindow || pending == .privateWindow, let url = action.request.url {
+                if Tab.route(forPageLink: url, from: tab.url) == .load {
+                    WindowManager.shared.newWindow(url: url, showCommandBar: false, isPrivate: tabManager.isPrivate || pending == .privateWindow, by: .page)
+                } else {
+                    tab.openFromPage(url, isClick: true, asker: action.sourceFrame.securityOrigin)
+                }
+                return nil
+            }
+            let newTab = tabManager.newTab(url: nil, select: false, configuration: configuration, opener: tab, site: action.request.url)
+            if pending == .backgroundTab { newTabNote.show(newTab, site: action.request.url) }
+            return newTab.ensureWebView()
+        }
+        // Search folding: a result that wants a new tab replaces the search instead, so Back returns to it.
+        if action.navigationType == .linkActivated, action.modifierFlags.intersection([.command, .shift, .option]).isEmpty,
+           features.width == nil, features.height == nil,
+           let current = tab.url, SearchFolding.isSearchResultsPage(current), let url = action.request.url {
+            tab.openFromPage(url, isClick: PopupNotice.isUserInitiated(action), asker: action.sourceFrame.securityOrigin)
+            return nil
+        }
+        // Sized window.open() calls get a small window; with no one there, a tab.
+        if !isUnattended, features.width != nil || features.height != nil || features.toolbarsVisibility?.boolValue == false {
+            return PopupWindowController.open(configuration: configuration, features: features, parent: window, opener: tab)
+        }
+        let flags = action.modifierFlags
+        let background = flags.contains(.command) && !flags.contains(.shift)
+        let newTab = tabManager.newTab(url: nil, select: !background, configuration: configuration, opener: tab, site: action.request.url)
+        return newTab.ensureWebView()
+    }
+
+    func tabDidRequestClose(_ tab: Tab) {
+        tabManager.close(tab)
+    }
+
+    func tabWantsToReturnToOpener(_ tab: Tab) {
+        guard let opener = tab.opener else { return }
+        tabManager.returnPane(of: tab, to: opener)
+        // The page closed itself: the tabs it opened stay.
+        closeWithUndo(tab, alone: true)
+        if !opener.isClosed { tabManager.select(opener) }
+    }
+
+    func tabWantsToBeShown(_ tab: Tab) {
+        // In AI apps' window only the app picks the tab in front, and the window never comes forward.
+        guard !isOutOfSight else { return }
+        NSApp.activate()
+        window?.makeKeyAndOrderFront(nil)
+        if tabManager.selectedTab !== tab { tabManager.select(tab) }
+    }
+
+    func tabWantsFocus(_ tab: Tab) {
+        // Only another pane of the split on screen, unless one is zoomed over the rest (that one is where you are).
+        guard let selected = tabManager.selectedTab, selected !== tab, !paneZoom.isZoomed,
+              tabManager.partners(of: selected).contains(where: { $0 === tab }) else { return }
+        tabManager.select(tab)
+    }
+
+    func tab(_ tab: Tab, hoveringLink url: URL?) {
+        guard tab === tabManager.selectedTab else { return }
+        // Nothing about the page while a panel is over it.
+        linkStatus.show(hasFloatingPanel ? nil : url, in: root.cardFrame)
+    }
+
+    /// One floating thing at a time: the command bar, site panel, downloads and space editor each close the
+    /// others when they open, and previews and the link bubble stay away while any of them is up.
+    var hasFloatingPanel: Bool {
+        switcher.isActive || commandBar.isVisible || SitePanel.isOpen(in: window) || DownloadsPanel.isOpen(in: window) || ReaderOptions.isOpen(in: window)
+            || SpaceEditorPanel.current != nil || desk.isVisible || iconPicker != nil
+    }
+
+    /// A folder's icon picker, when it's open in this window.
+    private var iconPicker: IconPickerPanel? {
+        IconPickerPanel.current.flatMap { $0.window === window ? $0 : nil }
+    }
+
+    func closeFloatingPanels() {
+        if commandBar.isVisible { commandBar.dismiss(restoringFocus: false) }
+        SitePanel.closeCurrent()
+        DownloadsPanel.closeCurrent()
+        ReaderOptions.closeCurrent()
+        SpaceEditorPanel.current?.close()
+        iconPicker?.close()
+        previews.hide()
+        linkStatus.show(nil, in: root.cardFrame)
+    }
+}
+
+// MARK: - SidebarDelegate
+
+extension BrowserWindowController: SidebarDelegate {
+    // Picking one sends a sidebar held out by touch back, as the pointer leaving sends back a hovered one.
+    func listSelect(_ tab: Tab) {
+        if EdgeSidebar.shared.isShowing { bringForwardForEdge() }
+        tabManager.select(tab)
+        root.endTouchHold()
+    }
+    func listOpenBookmark(_ bookmark: Bookmark) {
+        if EdgeSidebar.shared.isShowing { bringForwardForEdge() }
+        tabManager.openBookmark(bookmark)
+        root.endTouchHold()
+    }
+    func listClose(_ tab: Tab) { closeWithUndo(tab) }
+    func listClose(_ tabs: [Tab]) { closeManyWithUndo(tabs) }
+
+    func listRenameBookmark(_ id: UUID, to name: String) {
+        // Pins and favorites are shared by every window: a private one leaves their names alone.
+        guard !tabManager.isPrivate else { return }
+        libraryChange(String(localized: "Rename Pinned Tab", comment: "Undo action name, shown in the Edit menu as Undo Rename Pinned Tab.")) { Library.shared.updateBookmark(id, title: name) }
+    }
+
+    // MARK: Undo (⌘Z) for sidebar actions
+
+    func windowWillReturnUndoManager(_ window: NSWindow) -> UndoManager? { sidebarUndo }
+
+    /// Settings › Tabs: after closing a pinned tab that went to another page, offer to pin that page instead.
+    static var offersToPinWanderedPage: Bool {
+        get { UserDefaults.standard.object(forKey: "OffersToPinWanderedPage") as? Bool ?? true }
+        set { UserDefaults.standard.set(newValue, forKey: "OffersToPinWanderedPage") }
+    }
+
+    /// Closes a tab; ⌘Z brings it back with its history, ⇧⌘Z closes it again. With the tabs under it folded away they
+    /// close with it, as one step, and a toast says how many (#155); `alone` closes just this one.
+    func closeWithUndo(_ tab: Tab, alone: Bool = false) {
+        if !alone {
+            let closing = tabManager.closing(tab)
+            if closing.count > 1 { closeManyWithUndoToast(closing); return }
+        }
+        let wasBookmark = tab.bookmarkID != nil
+        let id = tab.id
+        // A pinned page you'd wandered away from: the pin keeps its own address, and the note offers to keep where
+        // you were instead, so the page you were reading isn't simply gone.
+        if let bookmarkID = tab.bookmarkID, let here = tab.url, let pin = Library.shared.bookmark(bookmarkID),
+           TabManager.normalize(here) != TabManager.normalize(pin.url) {
+            tabManager.close(tab)
+            // A private window never writes where it's been into your pins, so there's nothing to offer. Nor when you
+            // turned the offer off: on a site like DeepSeek every new chat is a new address.
+            guard !tabManager.isPrivate, Self.offersToPinWanderedPage else { return }
+            // A long page title would stretch the note across the page: the start of it says which pin.
+            let name = pin.title.count > 32 ? String(pin.title.prefix(31)).trimmingCharacters(in: .whitespaces) + "…" : pin.title
+            Toast.show(String(localized: "\(name) stays pinned to its own page", comment: "Toast after closing a pinned tab that had wandered to another page. The title is the pinned tab's."), symbol: "pin",
+                       action: (String(localized: "Pin This Page", comment: "Button in the toast after closing a pinned tab that had wandered: pins the page it was on instead."), { [weak self] in
+                self?.libraryChange(String(localized: "Update Pinned Page", comment: "Undo action name, shown in the Edit menu as Undo Update Pinned Page.")) { Library.shared.updateBookmark(bookmarkID, url: here) }
+            }), duration: 5, in: self)
+            return
+        }
+        tabManager.close(tab)
+        guard !wasBookmark else { return }
+        sidebarUndo.registerUndo(withTarget: self) { controller in
+            guard let reopened = controller.tabManager.reopenClosedTab(id) else { return }
+            controller.sidebarUndo.registerUndo(withTarget: controller) { $0.closeWithUndo(reopened) }
+            controller.sidebarUndo.setActionName(String(localized: "Close Tab", comment: "Undo action name, shown in the Edit menu as Undo Close Tab."))
+        }
+        sidebarUndo.setActionName(String(localized: "Close Tab", comment: "Undo action name, shown in the Edit menu as Undo Close Tab."))
+    }
+
+    /// Moves a tab within or between spaces, undoably. Within its space, the tabs nested under it come along; to
+    /// another space it goes alone, and they move up a level where they are.
+    func moveWithUndo(_ tab: Tab, to index: Int, in spaceID: UUID, nesting: TabManager.Nesting = .fit, grouping: TabManager.Grouping = .fit,
+                      then done: (() -> Void)? = nil) {
+        // To a space on another profile, an open page reloads there: that's asked first, wherever the move began (a
+        // menu, a drag, the command bar).
+        confirmProfileCrossing(tabManager.panes(of: tab), to: spaceID) { [weak self] in
+            self?.moveNow(tab, to: index, in: spaceID, nesting: nesting, grouping: grouping)
+            done?()
+        }
+    }
+
+    /// Asks before pages that are loaded move to a space on another profile, where they're rebuilt with that
+    /// profile's sign-ins and extensions; `move` runs at once when nothing would change profile. Undoing such a
+    /// move doesn't ask: it only puts back what was.
+    func confirmProfileCrossing(_ tabs: [Tab], to spaceID: UUID, then move: @escaping () -> Void) {
+        // Not moved after all: a row dragged there goes back to where it was.
+        ProfileSheets.confirmCrossing(tabs, to: spaceID, in: root.overlay, cancelled: { [weak self] in self?.sidebar.list.reload(animated: true) }, then: move)
+    }
+
+    /// The same question for a pinned page, whose open page goes where it does.
+    private func confirmProfileCrossing(pinned id: UUID, to spaceID: UUID, then move: @escaping () -> Void) {
+        let ids = Library.shared.pinnedSplit(containing: id).map(\.ids) ?? [id]
+        confirmProfileCrossing(ids.compactMap { tabManager.bookmarkTab(for: $0) }, to: spaceID, then: move)
+    }
+
+    private func moveNow(_ tab: Tab, to index: Int, in spaceID: UUID, nesting: TabManager.Nesting, grouping: TabManager.Grouping) {
+        pageChange(spaceID == tab.spaceID ? String(localized: "Move Tab", comment: "Undo action name, shown in the Edit menu as Undo Move Tab.") : String(localized: "Move to Space", comment: "Undo action name, shown in the Edit menu as Undo Move to Space.")) { [weak self] in
+            guard let self else { return }
+            let oldSpace = tab.spaceID
+            if spaceID == oldSpace { tabManager.move(tab, to: index, nesting: nesting, grouping: grouping) } else { tabManager.moveTabToSpace(tab, spaceID: spaceID, at: index, grouping: grouping) }
+            // Dropped into the space a drag opened, with the old page still showing: you're there now, so it's this tab.
+            if spaceID != oldSpace, spaceID == tabManager.currentSpaceID, shownTab !== tabManager.selectedTab { tabManager.select(tab) }
+        }
+    }
+
+    /// Sends a tab to another space. It leaves the screen, so a toast says where it went, with Undo to bring it back.
+    func moveToSpaceWithToast(_ tab: Tab, spaceID: UUID) {
+        guard let name = Library.shared.space(spaceID)?.name, spaceID != tab.spaceID else { return }
+        moveWithUndo(tab, to: 0, in: spaceID) { [weak self] in self?.toastMoved(to: name) }
+    }
+
+    private func toastMoved(to name: String) {
+        // Undo brings back this tab, never whatever else was done since.
+        Toast.show(String(localized: "Moved to \(name)", comment: "Toast after a tab moves to another space. The name is the space's."), symbol: "arrow.right.square", action: (String(localized: "Undo", comment: "Button in a toast: takes back what was just done."), { [weak self] in
+            guard let undo = self?.sidebarUndo, undo.canUndo, undo.undoActionName == String(localized: "Move to Space", comment: "Undo action name, shown in the Edit menu as Undo Move to Space.") else { return }
+            undo.undo()
+        }), duration: Toast.undoDuration, in: self)
+    }
+
+    /// Bookmarks a tab, undoably. A grouped tab pins its group unless `keepingGroup` is false.
+    func bookmarkWithUndo(_ tab: Tab, at index: Int?, in spaceID: UUID, keepingGroup: Bool = true) {
+        guard tabManager.canPin(tab, keepingGroup: keepingGroup) else { return }
+        Tutorial.complete("pin")
+        let name = keepingGroup && tabManager.pinsGroup(tab) ? Self.pinGroupUndoName : String(localized: "Pin Tab", comment: "Undo action name, shown in the Edit menu as Undo Pin Tab.")
+        pageChange(name) { [tabManager] in tabManager.bookmarkTab(tab, at: index, in: spaceID, keepingGroup: keepingGroup) }
+    }
+
+    private static var pinGroupUndoName: String { String(localized: "Pin Group", comment: "Undo action name, shown in the Edit menu as Undo Pin Group.") }
+
+    /// A tab group's row dropped among the pinned pages (#325): the whole group pins there as one folder, undoably.
+    /// `folder`: the folder the gap is in, if any.
+    func listPinGroup(_ id: UUID, at index: Int, in spaceID: UUID, folder parent: UUID?) {
+        guard !tabManager.isPrivate, let first = tabManager.tabs(inGroup: id).first, tabManager.canPin(first) else { return }
+        let tabs = tabManager.tabs(inGroup: id)
+        confirmProfileCrossing(tabs.flatMap(tabManager.panes(of:)), to: spaceID) { [weak self] in
+            guard let self else { return }
+            Tutorial.complete("pin")
+            pageChange(Self.pinGroupUndoName) { [tabManager] in
+                guard let folder = tabManager.pinGroup(id, at: index, in: spaceID), let parent else { return }
+                Library.shared.moveFolder(folder.id, to: index, in: spaceID, parent: .some(parent))
+            }
+        }
+    }
+
+    /// Turns a bookmark back into a tab, undoably. Half of a pinned split unpins the pair.
+    func unbookmarkWithUndo(_ bookmarkID: UUID, to index: Int?) {
+        pageChange(SavePath.unsaveName) { [tabManager] in tabManager.unbookmark(bookmarkID, toIndex: index) }
+    }
+
+    /// A tab dropped on a pinned page: the two become one pinned split where the pinned page is, open side by side.
+    func listPinSplit(_ tab: Tab, onto bookmarkID: UUID, tabOnRight: Bool) {
+        guard !tabManager.isPrivate, tabManager.canPin(tab, keepingGroup: false) else { return }
+        pageChange(String(localized: "Split View", comment: "Undo action name, shown in the Edit menu as Undo Split View.")) { [tabManager] in tabManager.pinSplit(tab, with: bookmarkID, tabOnRight: tabOnRight) }
+    }
+
+    /// A pinned page dropped on another: the two become one pinned split, open side by side.
+    func listJoinPinned(_ bookmarkID: UUID, onto targetID: UUID, onRight: Bool) {
+        guard !tabManager.isPrivate else { return }
+        pageChange(String(localized: "Split View", comment: "Undo action name, shown in the Edit menu as Undo Split View.")) { [tabManager] in tabManager.joinPinned(bookmarkID, onto: targetID, onRight: onRight) }
+    }
+
+    /// A pinned page dropped on a tab: it comes down among the tabs, beside that one, and the two open side by side.
+    func listUnpinSplit(_ bookmarkID: UUID, onto tab: Tab, pinnedOnRight: Bool) {
+        guard !tabManager.isPrivate else { return }
+        pageChange(String(localized: "Split View", comment: "Undo action name, shown in the Edit menu as Undo Split View.")) { [tabManager] in
+            // From another space: into the tab's first, so the two end up side by side where the tab is.
+            if Library.shared.spaceID(ofBookmark: bookmarkID) != tab.spaceID { Library.shared.moveBookmark(bookmarkID, to: Int.max, in: tab.spaceID) }
+            let index = tabManager.tabs(in: tab.spaceID).firstIndex { $0 === tab }.map { $0 + 1 }
+            if let unpinned = tabManager.unbookmark(bookmarkID, toIndex: index) {
+                tabManager.makeSplit(tab, with: unpinned, otherOnRight: pinnedOnRight)
+            }
+        }
+    }
+    func listNewTab() {
+        if EdgeSidebar.shared.isShowing { bringForwardForEdge() }
+        commandBar.show(mode: .newTab)
+    }
+
+    func listClearTabs() {
+        // The tabs you've drifted away from, else every tab but yours (TabManager.tabsToClear).
+        let closing = tabManager.tabsToClear(in: tabManager.currentSpaceID).tabs
+        guard !closing.isEmpty else { return }
+        closeManyWithUndo(closing, leavingSpaceEmpty: true)
+        showClosedToast(closing.count)
+    }
+
+    /// "Closed 3 tabs", with an Undo that brings back these tabs, never whatever else was done since.
+    func showClosedToast(_ count: Int) {
+        Toast.show(String(localized: "Closed \(count) tabs", comment: "Toast after tabs are closed, with Undo."), symbol: "xmark.circle", action: (String(localized: "Undo", comment: "Button in a toast: takes back what was just done."), { [weak self] in
+            guard let undo = self?.sidebarUndo, undo.canUndo, undo.undoActionName == String(localized: "Close Tabs", comment: "Undo action name, shown in the Edit menu as Undo Close Tabs.") else { return }
+            undo.undo()
+        }), duration: Toast.undoDuration, in: self)
+    }
+    func listHover(_ tab: Tab?, row: NSView?, bookmark: Bookmark?) {
+        // The edge panel's rows have no preview: the window's would show behind another app.
+        guard row?.window === window || tab == nil else { return }
+        previews.hover(tab, row: row, bookmark: bookmark)
+    }
+    func listDragHoverSpace(at windowPoint: NSPoint) -> UUID? { sidebar.spaceDot(at: windowPoint) }
+    func listDragEnded() {
+        sidebar.clearDropTargets()
+        sidebar.favorites.isDropTarget = false
+        root.splitDropHint.show(nil)
+    }
+    func listFavoriteTile(for bookmarkID: UUID) -> NSView? { sidebar.favorites.tile(for: bookmarkID) }
+    /// A drag that opened another space kept the page on screen. Dropped in that space, you stay there, with its
+    /// own page, as if you'd switched to it; dropped back home, the page you were on stays in front. Either way the
+    /// selection matches what's showing, so ⌘W closes the page you see.
+    func listDropFinished() {
+        guard shownTab !== tabManager.selectedTab else { return }
+        if let shown = shownTab, tabManager.tab(with: shown.id) != nil, shown.spaceID == tabManager.currentSpaceID {
+            tabManager.select(shown)
+        } else {
+            tabManager.settleInShownSpace()
+            showSelectedTab()
+        }
+    }
+    func listMoveBookmark(_ id: UUID, to index: Int, in spaceID: UUID) {
+        guard !tabManager.isPrivate else { return }
+        confirmProfileCrossing(pinned: id, to: spaceID) { [weak self] in
+            self?.pageChange(String(localized: "Move Pinned Tab", comment: "Undo action name, shown in the Edit menu as Undo Move Pinned Tab.")) { Library.shared.moveBookmark(id, to: index, in: spaceID) }
+        }
+    }
+    /// A pinned page dropped at a place in the list, landing in a folder or out of one.
+    func listMoveBookmark(_ id: UUID, to index: Int, in spaceID: UUID, folder: UUID?) {
+        guard !tabManager.isPrivate else { return }
+        confirmProfileCrossing(pinned: id, to: spaceID) { [weak self] in
+            self?.pageChange(String(localized: "Move Pinned Tab", comment: "Undo action name, shown in the Edit menu as Undo Move Pinned Tab.")) { Library.shared.moveBookmark(id, to: index, in: spaceID, folder: .some(folder)) }
+        }
+    }
+    func listMoveFolder(_ id: UUID, to index: Int, in spaceID: UUID, parent: UUID?) {
+        guard !tabManager.isPrivate else { return }
+        pageChange(parent == nil ? String(localized: "Move Folder", comment: "Undo action name, shown in the Edit menu as Undo Move Folder.") : String(localized: "Move into Folder", comment: "Undo action name, shown in the Edit menu as Undo Move into Folder.")) { Library.shared.moveFolder(id, to: index, in: spaceID, parent: .some(parent)) }
+    }
+    func listSetFolderOpen(_ id: UUID, _ open: Bool) {
+        // Opening and closing isn't an edit to undo. Shut on purpose, it hides its pages that are open now, in any
+        // window, as well as the rest (#154).
+        let folders = Library.shared.spaces.first { $0.folders?.contains { $0.id == id } == true }?.folders ?? []
+        let pages = open ? [] : folders.pages(in: id)
+        let tucking = pages.filter { page in WindowManager.shared.controllers.contains { $0.tabManager.bookmarkTab(for: page) != nil } }
+        Library.shared.setFolderOpen(id, open, tucking: tucking)
+    }
+    /// Expand All / Collapse All for a folder and its subfolders (#343).
+    func setFolderTreeOpen(_ id: UUID, _ open: Bool) {
+        let pages = open ? [] : Library.shared.allBookmarkIDs(inFolder: id)
+        let shown = pages.filter { page in WindowManager.shared.controllers.contains { $0.tabManager.bookmarkTab(for: page) != nil } }
+        Library.shared.setFolderTreeOpen(id, open, shown: Set(shown))
+    }
+    /// Collapse All Folders / Expand All Folders for a space's pinned folders (#343).
+    func setAllFoldersOpen(in spaceID: UUID, _ open: Bool) {
+        let pages = open ? [] : Library.shared.bookmarks(in: spaceID).map(\.id)
+        let shown = pages.filter { page in WindowManager.shared.controllers.contains { $0.tabManager.bookmarkTab(for: page) != nil } }
+        Library.shared.setAllFoldersOpen(in: spaceID, open, shown: Set(shown))
+    }
+    /// Whether any of the space's pinned folders is open (or shut, for `open` false).
+    static func hasFolders(in spaceID: UUID, isOpen open: Bool) -> Bool {
+        Library.shared.folders(in: spaceID).contains { $0.isOpen == open }
+    }
+    /// Open All in Tabs confirms above this many pages.
+    static let openAllAsksPast = 10
+    /// Opens every page in the folder and its subfolders as new tabs, in list order, where new tabs go; the first
+    /// shows (#343). The pinned pages stay as they are. ⌘Z closes the new tabs again.
+    func openAllInTabs(_ folderID: UUID) {
+        guard let folder = Library.shared.folder(folderID) else { return }
+        let pages = Library.shared.allBookmarkIDs(inFolder: folderID).compactMap { Library.shared.bookmark($0) }
+        guard !pages.isEmpty else { return }
+        let open = { [weak self] in
+            guard let self else { return }
+            self.pageChange(String(localized: "Open All in Tabs", comment: "Item in a folder's context menu in the sidebar: opens every page in the folder and the folders inside it as new tabs.")) { [tabManager] in
+                tabManager.newTabs(pages.map { ($0.url, $0.title) })
+            }
+        }
+        guard pages.count > Self.openAllAsksPast else { open(); return }
+        let message = Library.shared.subfolderIDs(of: folderID).isEmpty
+            ? String(localized: "Each page in “\(folder.name)” opens in a new tab.", comment: "Message of the sheet that asks before Open All in Tabs opens many tabs at once, from a folder with no folders inside. The folder's name.")
+            : String(localized: "Each page in “\(folder.name)” and the folders inside it opens in a new tab.", comment: "Message of the sheet that asks before Open All in Tabs opens many tabs at once. The folder's name.")
+        ConfirmSheet.show(in: root.overlay, title: String(localized: "Open \(pages.count) tabs?", comment: "Title of the sheet that asks before Open All in Tabs opens many tabs from a folder at once (more than 10)."),
+                          message: message,
+                          confirmTitle: String(localized: "Open All", comment: "Button in the sheet that asks before Open All in Tabs opens many tabs from a folder at once.")) { confirmed in
+            if confirmed { open() }
+        }
+    }
+    func listSetGroupOpen(_ id: UUID, _ open: Bool) {
+        // Folding isn't undoable, as for folders.
+        tabManager.setGroupOpen(id, open)
+    }
+    func listRenameGroup(_ id: UUID, to name: String) {
+        pageChange(String(localized: "Rename Group", comment: "Undo action name, shown in the Edit menu as Undo Rename Group.")) { [tabManager] in tabManager.renameGroup(id, to: name) }
+    }
+    func listMoveGroup(_ id: UUID, to index: Int, in spaceID: UUID) {
+        let tabs = tabManager.tabs(inGroup: id)
+        confirmProfileCrossing(tabs.flatMap(tabManager.panes(of:)), to: spaceID) { [weak self] in
+            guard let self else { return }
+            pageChange(spaceID == tabs.first?.spaceID ? String(localized: "Move Group", comment: "Undo action name, shown in the Edit menu as Undo Move Group.")
+                       : String(localized: "Move to Space", comment: "Undo action name, shown in the Edit menu as Undo Move to Space.")) { [tabManager] in
+                tabManager.moveGroup(id, to: index, in: spaceID)
+            }
+        }
+    }
+    func listAddToGroup(_ tabs: [Tab], group: UUID) {
+        let space = tabManager.tabs(inGroup: group).first?.spaceID ?? tabManager.currentSpaceID
+        confirmProfileCrossing(tabs.filter { $0.spaceID != space }.flatMap(tabManager.panes(of:)), to: space) { [weak self] in
+            guard let self else { return }
+            pageChange(String(localized: "Add to Group", comment: "Undo action name, shown in Edit › Undo.")) { [tabManager] in
+                for tab in tabs where tab.bookmarkID == nil {
+                    // From another space: move it into the group's first spot.
+                    if tab.spaceID != space { tabManager.moveTabToSpace(tab, spaceID: space, at: 0) }
+                    tabManager.setGroup(of: tab, to: group)
+                }
+            }
+        }
+    }
+    func listRenameFolder(_ id: UUID, to name: String) {
+        guard !tabManager.isPrivate else { return }
+        libraryChange(String(localized: "Rename Folder", comment: "Undo action name, shown in the Edit menu as Undo Rename Folder.")) { Library.shared.renameFolder(id, to: name) }
+    }
+    func listAsOne(_ name: String, _ body: @escaping () -> Void) { pageChange(name, body) }
+    func listSetFolder(of bookmarkID: UUID, to folderID: UUID?) {
+        guard !tabManager.isPrivate else { return }
+        pageChange(folderID == nil ? String(localized: "Remove from Folder", comment: "Undo action name, shown in the Edit menu as Undo Remove from Folder.") : String(localized: "Add to Folder", comment: "Undo action name, shown in the Edit menu as Undo Add to Folder.")) { Library.shared.setFolder(of: bookmarkID, to: folderID) }
+    }
+
+    /// A new folder in the current space, holding these pinned pages (or none), named right away in the sidebar.
+    /// `inside`: the folder it goes in; left out, the folder its pages share, if any.
+    func newFolder(with bookmarkIDs: [UUID] = [], inside: UUID? = nil) {
+        guard !tabManager.isPrivate else { return }
+        var made: BookmarkFolder?
+        libraryChange(String(localized: "New Folder", comment: "Undo action name, shown in the Edit menu as Undo New Folder.")) {
+            made = Library.shared.addFolder(named: String(localized: "New Folder", comment: "Name a new folder of pinned tabs gets, until it's renamed."), with: bookmarkIDs, in: tabManager.currentSpaceID,
+                                            parent: inside.map { .some($0) } ?? .none)
+        }
+        guard let made else { return }
+        revealNewFolder(made.id)
+    }
+
+    /// A folder just made shows, with its name ready to type.
+    func revealNewFolder(_ id: UUID) {
+        if SidebarListView.isCollapsed(tabManager.currentSpaceID) { SidebarListView.setCollapsed(tabManager.currentSpaceID, false) }
+        sidebar.list.reload(animated: true)
+        DispatchQueue.main.async { [weak self] in self?.sidebar.list.renameFolder(id) }
+    }
+    func listMove(_ tab: Tab, to index: Int, in spaceID: UUID, nesting: TabManager.Nesting, grouping: TabManager.Grouping) {
+        moveWithUndo(tab, to: index, in: spaceID, nesting: nesting, grouping: grouping)
+    }
+    func listSetNestedTabsCollapsed(_ tab: Tab, _ collapsed: Bool) { tabManager.setNestedTabsCollapsed(tab, collapsed) }
+    func listBookmark(_ tab: Tab, at index: Int, in spaceID: UUID) {
+        // Pins are shared by every window: a private one's tabs stay out of them.
+        guard !tabManager.isPrivate else { return }
+        confirmProfileCrossing([tab], to: spaceID) { [weak self] in self?.bookmarkWithUndo(tab, at: index, in: spaceID, keepingGroup: false) }
+    }
+    func listUnbookmark(_ bookmarkID: UUID, to index: Int, under parent: UUID?, group: UUID?) {
+        // Pins are shared by every window: a private one doesn't take them away.
+        guard !tabManager.isPrivate else { return }
+        let space = tabManager.currentSpaceID
+        confirmProfileCrossing(pinned: bookmarkID, to: space) { [weak self, tabManager] in
+            self?.pageChange(SavePath.unsaveName) {
+                // Carried here from another space: into this one first, so it comes down among the tabs you're looking at.
+                if Library.shared.spaceID(ofBookmark: bookmarkID) != space { Library.shared.moveBookmark(bookmarkID, to: Int.max, in: space) }
+                tabManager.unbookmark(bookmarkID, toIndex: index, under: parent, group: group)
+            }
+        }
+    }
+    /// A tab in a window of its own, a little down and to the right of this one, so both stay in view.
+    func moveToNewWindow(_ tab: Tab) {
+        guard !tabManager.isPrivate, let frame = window?.frame else { return }
+        let target = WindowManager.shared.newWindow(spaceID: tab.spaceID, showCommandBar: false)
+        target.window?.setFrame(frame.offsetBy(dx: 30, dy: -30), display: true)
+        move([tab], to: target, at: 0)
+    }
+
+    /// Whether a tab's menu offers Open in Zigzag Mini (and a tab ⌥-dragged out of the windows goes there).
+    func canOpenInMini(_ tab: Tab) -> Bool {
+        !tab.isClosed && MiniWindowController.canTake(tab.url, isPinned: tab.bookmarkID != nil, isPrivate: tabManager.isPrivate)
+    }
+
+    /// Open in Zigzag Mini: the tab's page, live, goes into a Zigzag Mini window over this one (or where the tab was
+    /// let go, `point`), and the tab leaves the list, as if the page had been opened there. ⌘O there brings it back
+    /// as a new tab; ⌘Z here puts it back in its place.
+    func openInMini(_ tab: Tab, at point: NSPoint? = nil) {
+        guard canOpenInMini(tab), let place = tabManager.release(tab) else { return }
+        let mini = MiniWindowController.open(moving: tab, from: window, at: point)
+        sidebarUndo.registerUndo(withTarget: self) { [weak mini] controller in
+            guard let tab = mini?.handBack() else { return }
+            controller.tabManager.putBack(tab, at: place)
+            controller.window?.makeKeyAndOrderFront(nil)
+            controller.sidebarUndo.registerUndo(withTarget: controller) { $0.openInMini(tab) }
+            controller.sidebarUndo.setActionName(Self.openInMiniName)
+        }
+        sidebarUndo.setActionName(Self.openInMiniName)
+    }
+
+    private static var openInMiniName: String {
+        String(localized: "Open in Zigzag Mini", comment: "Undo action name, shown in the Edit menu as Undo Open in Zigzag Mini.")
+    }
+
+    /// Tabs into another window's list at `index` (#167), pages and all, as they are: the window they land in shows
+    /// the first and comes forward, and one ⌘Z there sends them back to where they were. A window the move leaves
+    /// with no tabs closes, as in Chrome (`closeIfEmptied`).
+    func move(_ tabs: [Tab], to target: BrowserWindowController, at index: Int) {
+        let moving = tabs.filter { !$0.isClosed && $0.bookmarkID == nil && tabManager.tab(with: $0.id) === $0 }
+        guard target !== self, let first = moving.first else { return }
+        // Sharing windows (#162) already have them; show the first.
+        if target.tabManager.store === tabManager.store {
+            hand(first, to: target)
+            return
+        }
+        let places = moving.map { tab in (tab, tabManager.tabs(in: tab.spaceID).firstIndex { $0 === tab } ?? 0) }
+        let home = moveHome
+        home.window = self
+        home.frame = window?.frame
+        home.space = tabManager.currentSpaceID
+        // Each in at the same place, last first, so they keep their order.
+        for tab in moving.reversed() { transfer(tab, to: target, at: index) }
+        // The first is the one on screen there, whatever came in after it.
+        if target.tabManager.selectedTab !== first { target.tabManager.select(first) }
+        target.window?.makeKeyAndOrderFront(nil)
+        target.sidebarUndo.registerUndo(withTarget: target) { target in
+            let back = places.filter { tab, _ in target.tabManager.tab(with: tab.id) === tab }
+            guard !back.isEmpty else { return }
+            // Its window closed when they left: they come back in a window where it was.
+            // Its window closed when they left: they come back in a window where it was, and so do tabs a later ⌘Z
+            // sends back to it.
+            let source: BrowserWindowController
+            if let open = home.window, WindowManager.shared.controllers.contains(where: { $0 === open }) {
+                source = open
+            } else {
+                source = WindowManager.shared.newWindow(spaceID: home.space, showCommandBar: false)
+                if let frame = home.frame { source.window?.setFrame(frame, display: true) }
+                source.moveHome = home
+                home.window = source
+            }
+            // Lowest first, so each goes back in at the place it left.
+            for (tab, index) in back.sorted(by: { $0.1 < $1.1 }) where target.tabManager.tab(with: tab.id) === tab {
+                target.transfer(tab, to: source, at: index)
+            }
+            source.window?.makeKeyAndOrderFront(nil)
+            target.closeIfEmptied()
+        }
+        target.sidebarUndo.setActionName(String(localized: "Move to Window", comment: "Undo action name, shown in the Edit menu as Undo Move to Window."))
+        closeIfEmptied()
+    }
+
+    /// Shows `tab`'s page in `target`, a sharing window (#162), and brings it forward; this window selects another tab.
+    private func hand(_ tab: Tab, to target: BrowserWindowController) {
+        guard target !== self, target.tabManager.store === tabManager.store, !tab.isClosed else { return }
+        target.tabManager.select(tab)
+        tabManager.moveOn(from: tab)
+        target.window?.makeKeyAndOrderFront(nil)
+    }
+
+    /// A tab into another window's list (`TabManager.take`); extensions hear it left this window for that one.
+    private func transfer(_ tab: Tab, to target: BrowserWindowController, at index: Int) {
+        let moved = target.tabManager.take(tab, from: tabManager, at: index)
+        if #available(macOS 15.4, *) {
+            for (page, place) in moved { ExtensionCenter.tabMoved(page, from: place, in: self) }
+        }
+    }
+
+    /// Left with no tabs in any space by tabs moving out, the window closes, as in Chrome; pinned tabs and favorites
+    /// are every window's, so they don't keep it. Not the only window: that one stays, as an empty window would.
+    private func closeIfEmptied() {
+        guard !tabManager.isPrivate, !tabManager.hasTabs, WindowManager.shared.controllers.contains(where: { $0 !== self }) else { return }
+        // After the drag or menu that moved them is done with this window.
+        DispatchQueue.main.async { [weak self] in
+            guard let self, !self.tabManager.hasTabs else { return }
+            self.window?.close()
+        }
+    }
+
+    func listDropOutside(_ tabs: [Tab], at screenPoint: NSPoint) -> Bool {
+        guard !tabManager.isPrivate, let tab = tabs.first else { return false }
+        let over = SidebarListView.window(at: screenPoint)
+        // Let go with ⌥ held, one tab becomes a Zigzag Mini window there instead of a browser window.
+        if NSEvent.modifierFlags.contains(.option), tabs.count == 1, canOpenInMini(tab),
+           !WindowManager.shared.controllers.contains(where: { $0.window?.frame.contains(screenPoint) == true }) {
+            openInMini(tab, at: screenPoint)
+            return true
+        }
+        // Onto another window's page: the tabs go there, the first on screen.
+        if let over, over !== self {
+            guard !over.tabManager.isPrivate else { return false }
+            over.window?.makeKeyAndOrderFront(nil)
+            over.confirmProfileCrossing(tabs.flatMap(tabManager.panes(of:)), to: over.tabManager.currentSpaceID) { [weak self, weak over] in
+                guard let self, let over else { return }
+                self.move(tabs, to: over, at: 0)
+            }
+            return true
+        }
+        guard over == nil else { return false }
+        // Somewhere that isn't a Zigzag window: a new window, roughly where the tab was let go.
+        let target = WindowManager.shared.newWindow(spaceID: tab.spaceID, showCommandBar: false)
+        if let window = target.window {
+            var frame = window.frame
+            frame.origin = NSPoint(x: screenPoint.x - 120, y: screenPoint.y - frame.height + 40)
+            window.setFrame(frame, display: true)
+        }
+        move(tabs, to: target, at: 0)
+        return true
+    }
+
+    func listDragOverFavorites(at windowPoint: NSPoint?, carrying: TabManager.SplitSide?) -> Bool {
+        let favorites = sidebar.favorites
+        // Favorites are shared by every window: a private one doesn't change them.
+        guard let windowPoint, !tabManager.isPrivate else {
+            favorites.isDropTarget = false
+            return false
+        }
+        // An empty grid still takes drops in the band under the address, or under the top row with the address above
+        // the page.
+        var zone = favorites.convert(favorites.visibleRect, to: nil)
+        if favorites.isHidden {
+            let above: NSView = sidebar.holdsAddress ? sidebar.address : favorites
+            let edge = above.convert(above.bounds, to: nil)
+            zone = NSRect(x: edge.minX, y: edge.minY - Tokens.Space.x10, width: edge.width, height: Tokens.Space.x10)
+        }
+        let over = !tabManager.isPrivate && zone.insetBy(dx: 0, dy: -Tokens.Space.x2).contains(windowPoint)
+        favorites.isDropTarget = over
+        if over { favorites.hoverDrop(at: windowPoint, carrying: carrying) }
+        return over
+    }
+
+    func listDropOnFavorites(_ items: [SidebarItem], dragged: SidebarItem) -> Bool {
+        guard sidebar.favorites.isDropTarget, !tabManager.isPrivate else { return false }
+        let index = sidebar.favorites.dropIndex, split = sidebar.favorites.splitTarget
+        sidebar.favorites.isDropTarget = false
+        if let split {
+            // A pinned page not loaded yet opens as part of the change, so ⌘Z puts it back unloaded.
+            pageChange(String(localized: "Split View", comment: "Undo action name, shown in the Edit menu as Undo Split View.")) { [weak self] in
+                guard let self else { return }
+                let tab: Tab? = switch dragged {
+                case .tab(let id): tabManager.tab(with: id)
+                case .bookmark(let id): Library.shared.bookmark(id).map(tabManager.pageTab(for:))
+                default: nil
+                }
+                if let tab { joinFavoriteWithUndo(tab, onto: split.id, onRight: split.onRight) }
+            }
+            return true
+        }
+        // Each a tile after the one before (a split's two pages make one), in list order.
+        var slot = index
+        for item in items {
+            let tiles = Library.shared.favoriteTiles(in: tabManager.profile.id).count, at = slot
+            switch item {
+            case .tab(let id): if let tab = tabManager.tab(with: id) { favoriteWithUndo(tab, at: at) }
+            case .bookmark(let id): pageChange(String(localized: "Add to Favorites", comment: "Undo action name, shown in the Edit menu as Undo Add to Favorites.")) { [tabManager] in tabManager.favoriteBookmark(id, at: at) }
+            default: break
+            }
+            slot = slot.map { $0 + Library.shared.favoriteTiles(in: tabManager.profile.id).count - tiles }
+        }
+        return true
+    }
+
+    /// The icon grid beside the sidebar, level with the folder's row; each pick shows at once and can be undone.
+    func chooseFolderIcon(_ id: UUID) {
+        guard !tabManager.isPrivate else { return }
+        guard let folder = Library.shared.folder(id), let row = sidebar.list.folderRow(id) else { return }
+        closeFloatingPanels()
+        let panel = IconPickerPanel(noneSymbol: "folder", selected: folder.icon) { [weak self] icon in
+            self?.libraryChange(String(localized: "Change Icon", comment: "Undo action name, shown in the Edit menu as Undo Change Icon.")) { Library.shared.setIcon(icon, forFolder: id) }
+        }
+        panel.show(beside: row, in: root.overlay, x: root.besideSidebar(width: panel.preferredWidth))
+    }
+
+    /// The icon grid beside a tab's row, as for a folder; its plain choice is the site's own icon. A private window's
+    /// tabs take one too: it lasts as long as the tab.
+    func chooseIcon(for tab: Tab) {
+        guard let row = sidebar.list.tabRow(tab.id) else { return }
+        closeFloatingPanels()
+        let id = tab.id
+        // The plain choice is the site's own icon, shown as it is.
+        let siteIcon = tab.favicon ?? tab.url.flatMap { FaviconStore.shared.cachedIcon(for: $0) }
+        let panel = IconPickerPanel(noneSymbol: "globe", noneImage: siteIcon, noneToolTip: SidebarMenus.useSiteIconTitle, selected: tab.customIcon,
+                                    onChooseImage: { [weak self] in if let self, let tab = self.tabManager.tab(with: id) { self.chooseImageIcon(for: tab) } }) { [weak self] icon in
+            guard let self, let tab = self.tabManager.tab(with: id) else { return }
+            self.setIconWithUndo(icon, for: tab)
+        }
+        panel.show(beside: row, in: root.overlay, x: root.besideSidebar(width: panel.preferredWidth))
+    }
+
+    /// The icon grid beside a pinned page's row or a favorite's tile. Kept in the library, so never from a private
+    /// window.
+    func chooseIcon(forBookmark id: UUID) {
+        guard !tabManager.isPrivate, let bookmark = Library.shared.bookmark(id) else { return }
+        let anchor = Library.shared.isFavorite(id) ? sidebar.favorites.tile(for: id) : sidebar.list.bookmarkRow(id)
+        guard let anchor else { return }
+        closeFloatingPanels()
+        let siteIcon = tabManager.bookmarkTab(for: id)?.favicon ?? FaviconStore.shared.cachedIcon(for: bookmark.url)
+        let panel = IconPickerPanel(noneSymbol: "globe", noneImage: siteIcon, noneToolTip: SidebarMenus.useSiteIconTitle, selected: bookmark.icon,
+                                    onChooseImage: { [weak self] in self?.chooseImageIcon(forBookmark: id) }) { [weak self] icon in
+            self?.setIconWithUndo(icon, forBookmark: id)
+        }
+        panel.show(beside: anchor, in: root.overlay, x: root.besideSidebar(width: panel.preferredWidth))
+    }
+
+    /// Choose Image… in the icon grid: uses an image file as the tab's icon (#303), copied into Zigzag's folder.
+    func chooseImageIcon(for tab: Tab) {
+        let id = tab.id
+        pickPageImage { [weak self] icon in
+            guard let self, let tab = self.tabManager.tab(with: id) else { return }
+            self.setIconWithUndo(icon, for: tab)
+        }
+    }
+
+    /// Choose Image… for a pinned page or a favorite.
+    func chooseImageIcon(forBookmark id: UUID) {
+        guard !tabManager.isPrivate, Library.shared.bookmark(id) != nil else { return }
+        pickPageImage { [weak self] icon in self?.setIconWithUndo(icon, forBookmark: id) }
+    }
+
+    /// The icon grid for a site, from Site Controls (#310): every tab, pinned page and favorite on the site uses it
+    /// unless it has its own. Use Site Icon reverts. Private windows keep it only for the window.
+    func chooseSiteIcon(for tab: Tab, at point: NSPoint, besideSidebar: Bool) {
+        guard let site = SiteIcons.site(of: tab.url) else { return }
+        closeFloatingPanels()
+        let store = tabManager.privateStore
+        let siteIcon = tab.favicon ?? tab.url.flatMap { FaviconStore.shared.cachedIcon(for: $0) }
+        let set: (String?) -> Void = { icon in SiteIcons.set(icon, forSite: site, privateStore: store) }
+        let panel = IconPickerPanel(noneSymbol: "globe", noneImage: siteIcon, noneToolTip: SidebarMenus.useSiteIconTitle,
+                                    selected: SiteIcons.icon(forSite: site, privateStore: store),
+                                    onChooseImage: { [weak self] in self?.pickPageImage(forSite: true, set) }, onPick: set)
+        if besideSidebar {
+            let x = root.besideSidebar(width: panel.preferredWidth)
+            panel.show(at: NSPoint(x: x, y: point.y), in: root.overlay, growsFrom: CGPoint(x: root.sidebarOnRight ? 1 : 0, y: 0.1))
+        } else {
+            panel.show(at: point, in: root.overlay, growsFrom: CGPoint(x: 0.5, y: 0))
+        }
+    }
+
+    private func pickPageImage(forSite: Bool = false, _ done: @escaping (String) -> Void) {
+        guard let window else { return }
+        closeFloatingPanels()
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = PageImageIcon.types
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        panel.prompt = String(localized: "Choose", comment: "Button of the panel that picks an image file as a tab's, pinned tab's or favorite's icon.")
+        panel.message = forSite
+            ? String(localized: "Choose an image to use as this site’s icon.", comment: "Message of the panel that picks an image file (SVG, PNG and others) as a whole site's icon, from Choose Image… under the icon choices Site Controls opens.")
+            : String(localized: "Choose an image to use as this page’s icon.", comment: "Message of the panel that picks an image file (SVG, PNG and others) as a tab's, pinned tab's or favorite's icon, from Choose Image… under its icon choices.")
+        panel.beginSheetModal(for: window) { [weak self] response in
+            guard response == .OK, let url = panel.url else { return }
+            self?.usePageImage(url, done)
+        }
+    }
+
+    /// Reads the file into an icon, or shows why it can't.
+    func usePageImage(_ url: URL, _ done: @escaping (String) -> Void) {
+        Task { [weak self] in
+            do throws(PageImageIcon.Failure) {
+                done(try await PageImageIcon.store(url))
+            } catch {
+                guard let host = self?.window?.contentView else { return }
+                ConfirmSheet.notice(in: host, title: String(localized: "Couldn’t use this picture", comment: "Title of the notice when an image file chosen as a page's icon can't be used."),
+                                    message: Self.pageImageFailure(error))
+            }
+        }
+    }
+
+    static func pageImageFailure(_ failure: PageImageIcon.Failure) -> String {
+        switch failure {
+        case .tooLarge:
+            String(localized: "That file is larger than 1 MB. Choose a smaller image.", comment: "Message of the notice when an image file chosen as a page's icon is too big.")
+        case .unreadable:
+            String(localized: "Zigzag can’t read that file as an image. Choose an SVG, PNG, JPEG, HEIC, PDF or ICNS file.", comment: "Message of the notice when an image file chosen as a page's icon can't be read.")
+        }
+    }
+
+    func listSplit(_ tab: Tab, with other: Tab, otherOnRight: Bool) { splitWithUndo(tab, with: other, otherOnRight: otherOnRight) }
+    func listJoinSplit(_ page: TabManager.RowPage, onto target: TabManager.RowPage, onRight: Bool) {
+        guard let kind = tabManager.joining(page, onto: target, onRight: onRight) else { return }
+        pageChange(String(localized: "Split View", comment: "Undo action name, shown in the Edit menu as Undo Split View.")) { [tabManager] in
+            tabManager.join(page, onto: target, kind)
+        }
+    }
+    func listZoomPane(_ tab: Tab) { toggleZoom(tab) }
+
+    func listDragOverPage(at windowPoint: NSPoint?, item: SidebarItem) {
+        guard let windowPoint, canDropBeside(item), let current = shownTab ?? tabManager.selectedTab else { root.splitDropHint.show(nil); return }
+        root.splitDropHint.incoming = carried(item)
+        showDropHint(at: windowPoint, beside: current)
+    }
+
+    /// The icon and title of a row carried over the page, as its row shows them.
+    func carried(_ item: SidebarItem) -> (icon: NSImage?, title: String)? {
+        switch item {
+        case .tab(let id):
+            return tabManager.tab(with: id).map { ($0.displayIcon, $0.displayTitle) }
+        case .bookmark(let id):
+            if let tab = tabManager.bookmarkTab(for: id) { return (tab.displayIcon, tab.displayTitle) }
+            return Library.shared.bookmark(id).map { ($0.displayIcon, $0.title) }
+        default:
+            return nil
+        }
+    }
+
+    /// Where a tab let go at a window point would open beside `current` and the pages with it (#160): the hint over
+    /// that half or quarter, with a tick as it moves to another.
+    func showDropHint(at windowPoint: NSPoint, beside current: Tab) {
+        root.splitDropHint.follow(windowPoint)
+        let drop = root.splitDropHint.drop(at: windowPoint, shape: tabManager.split(for: current)?.shape, gap: root.paneGap)
+        if let drop, drop.kind != root.splitDropHint.drop?.kind { Haptics.snap() }
+        root.splitDropHint.show(drop)
+    }
+
+    func listDropOnPage(_ item: SidebarItem) -> Bool {
+        let drop = root.splitDropHint.drop
+        root.splitDropHint.show(nil)
+        // The page showing, which after a space flip mid-drag isn't that space's selected tab.
+        guard let drop, canDropBeside(item), let current = shownTab ?? tabManager.selectedTab else { return false }
+        // A pinned page not loaded yet opens as part of the change, so ⌘Z puts it back unloaded.
+        pageChange(String(localized: "Split View", comment: "Undo action name, shown in the Edit menu as Undo Split View.")) { [weak self] in
+            guard let self else { return }
+            let tab: Tab? = switch item {
+            case .tab(let id): tabManager.tab(with: id)
+            case .bookmark(let id): Library.shared.bookmark(id).map(tabManager.pageTab(for:))
+            default: nil
+            }
+            guard let tab else { return }
+            // Beside a page alone the two make a split, as they always did; into a split or a group, it's tiled in.
+            if tabManager.split(for: current) == nil, case .place(let region, _) = drop.kind {
+                splitWithUndo(current, with: tab, otherOnRight: region == .right || region == .bottom, vertical: !region.isColumn)
+            } else {
+                tabManager.tile(tab, beside: current, drop.kind)
+            }
+        }
+        return true
+    }
+
+    /// Another tab, or a pinned page beside a tab, opens beside the page you're on; neither may already be half of a
+    /// split. Into a split of two tabs or a tile group of three, another tab of its own (`TabManager.canTile`).
+    private func canDropBeside(_ item: SidebarItem) -> Bool {
+        guard let current = shownTab ?? tabManager.selectedTab else { return false }
+        switch item {
+        case .tab(let id):
+            guard let tab = tabManager.tab(with: id) else { return false }
+            return tabManager.canTile(tab, beside: current)
+        case .bookmark(let id):
+            // Not loaded yet, it opens at its pinned address.
+            guard current.bookmarkID == nil else { return false }
+            return TabManager.canSplit(tabManager.splitSide(ofBookmark: id), onto: tabManager.splitSide(of: current))
+        default:
+            return false
+        }
+    }
+
+    func listMoveToWindow(_ tabs: [Tab], controller: BrowserWindowController, index: Int) -> Bool {
+        guard !tabManager.isPrivate, !controller.tabManager.isPrivate else { return false }
+        controller.window?.makeKeyAndOrderFront(nil)
+        let space = controller.tabManager.currentSpaceID
+        controller.confirmProfileCrossing(tabs.flatMap(tabManager.panes(of:)), to: space) { [weak self, weak controller] in
+            guard let self, let controller else { return }
+            guard controller.tabManager.store === self.tabManager.store, let first = tabs.first else {
+                self.move(tabs, to: controller, at: index)
+                return
+            }
+            // Sharing windows (#162): move to the same list position in that window's space and show the first.
+            controller.pageChange(String(localized: "Move to Window", comment: "Undo action name, shown in the Edit menu as Undo Move to Window.")) {
+                // Insert last first at one index to keep their order.
+                for tab in tabs.reversed() where !tab.isClosed && tab.bookmarkID == nil {
+                    // Index counted with the tab still in the list, as the other window draws it; moves count without.
+                    let at = controller.tabManager.tabs(in: space).firstIndex { $0 === tab } ?? Int.max
+                    if tab.spaceID == space { controller.tabManager.move(tab, to: at < index ? index - 1 : index) } else { controller.tabManager.move(tab, to: index, in: space) }
+                }
+            }
+            self.hand(first, to: controller)
+        }
+        return true
+    }
+
+    func listMovePinnedToWindow(_ bookmarkID: UUID, controller: BrowserWindowController, at screenPoint: NSPoint) -> NSView? {
+        guard !tabManager.isPrivate, !controller.tabManager.isPrivate else { return nil }
+        return controller.takePinned(bookmarkID, from: self, at: screenPoint)
+    }
+
+    func listSwitchSpaceDuringDrag(_ spaceID: UUID) {
+        // Switch without changing the selected tab, so the page doesn't jump while you drag.
+        tabManager.showSpaceKeepingPage(spaceID)
+    }
+
+    func listMenu(forMarked items: [SidebarItem]) -> NSMenu? { SidebarMenus.markedMenu(for: items, controller: self) }
+
+    /// Pinned pages for picked rows, pinning the tabs among them (in order) first.
+    func pinnedIDs(for items: [SidebarItem]) -> [UUID] {
+        items.compactMap { item in
+            switch item {
+            case .bookmark(let id): return id
+            case .tab(let id):
+                guard let tab = tabManager.tab(with: id), tab.url != nil else { return nil }
+                if tab.bookmarkID == nil { bookmarkWithUndo(tab, at: nil, in: tab.spaceID, keepingGroup: false) }
+                return tab.bookmarkID
+            default: return nil
+            }
+        }
+    }
+
+    /// A tab's part of a split row gets its own tab's menu; a pinned page's part, the row's.
+    func listMenu(for item: SidebarItem, page: Tab?) -> NSMenu? {
+        if let page, page.bookmarkID == nil, tabManager.split(for: page) != nil { return SidebarMenus.tabMenu(for: page, controller: self) }
+        return listMenu(for: item)
+    }
+
+    func listMenu(for item: SidebarItem) -> NSMenu? {
+        switch item {
+        case .header: return sidebarSpaceMenu(for: tabManager.currentSpaceID, anchor: sidebar.list.headerView)
+        case .tab(let id): return tabManager.tab(with: id).map { SidebarMenus.tabMenu(for: $0, controller: self) }
+        case .bookmark(let id): return Library.shared.bookmark(id).map { SidebarMenus.bookmarkMenu(for: $0, controller: self) }
+        case .folder(let id): return Library.shared.folder(id).map { SidebarMenus.folderMenu(for: $0, controller: self) }
+        case .tabGroup(let id): return tabManager.group(id).map { SidebarMenus.groupMenu(for: $0, controller: self) }
+        default: return nil
+        }
+    }
+
+    func sidebarOpenCommandBar() {
+        if EdgeSidebar.shared.isShowing { bringForwardForEdge() }
+        commandBar.show(mode: .editCurrent)
+    }
+    func sidebarSwitchSpace(_ id: UUID) { tabManager.switchToSpace(id) }
+    func sidebarAddMenu() -> [MenuPanel.Entry] { SidebarMenus.addPanel(controller: self) }
+    func sidebarBlankMenu() -> [MenuPanel.Entry] { SidebarMenus.blankPanel(controller: self) }
+    /// Same as ⌘T: the new tab command bar, or an extension's new tab page.
+    func sidebarDoubleClickedBlank() {
+        if EdgeSidebar.shared.isShowing { bringForwardForEdge() }
+        if !(commandBar.isVisible && commandBar.mode == .newTab) { newTab(nil) }
+    }
+    func sidebarShowDownloads(from view: NSView) {
+        guard EdgeSidebar.shared.isShowing else { return DownloadsPanel.show(from: view, in: self) }
+        bringForwardForEdge()
+        showDownloads(nil)
+    }
+    /// A space dot's menu: Edit Space… opens at the dot.
+    func sidebarSpaceMenu(for id: UUID) -> NSMenu? { sidebarSpaceMenu(for: id, anchor: sidebar.dot(for: id)) }
+
+    private func sidebarSpaceMenu(for id: UUID, anchor: NSView?) -> NSMenu? {
+        let menu = SidebarMenus.spaceMenu(for: id, controller: self, anchor: anchor)
+        return menu.items.isEmpty ? nil : menu
+    }
+}
+
+// MARK: - Debug hooks
+
+#if DEBUG
+extension BrowserWindowController {
+    func debugHover(index: Int) {
+        let tabs = tabManager.currentTabs
+        guard tabs.indices.contains(index), let row = sidebar.list.row(for: tabs[index]) else { previews.debugRow = nil; return }
+        previews.debugRow = row
+        previews.hover(tabs[index], row: row, bookmark: nil)
+    }
+    func debugSwitcher() {
+        let down = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [.control], timestamp: 0, windowNumber: window?.windowNumber ?? 0,
+                                    context: nil, characters: "\t", charactersIgnoringModifiers: "\t", isARepeat: false, keyCode: 48)!
+        _ = switcher.handle(down)
+    }
+    func debugSpaceSwitcher(_ arg: String) {
+        if arg.hasPrefix("state ") {
+            try? spaceSwitcher.debugState.write(toFile: String(arg.dropFirst(6)), atomically: true, encoding: .utf8)
+            return
+        }
+        // "again" and "back": ⌥⌘S and ⇧⌥⌘S pressed while it's up, as the window hands them over.
+        let keys: [String: (UInt16, String, NSEvent.ModifierFlags)] = [
+            "down": (125, "", []), "up": (126, "", []), "tab": (48, "\t", []), "return": (36, "\r", []), "esc": (53, "\u{1b}", []),
+            "again": (1, "s", [.command, .option]), "back": (1, "S", [.command, .option, .shift]),
+        ]
+        guard let (code, chars, flags) = keys[arg] ?? Int(arg).map({ (UInt16(18), String($0), []) }) else { showSpaceSwitcher(nil); return }
+        let event = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: flags, timestamp: 0, windowNumber: window?.windowNumber ?? 0,
+                                     context: nil, characters: chars, charactersIgnoringModifiers: chars, isARepeat: false, keyCode: code)!
+        _ = spaceSwitcher.handle(event)
+    }
+}
+#endif
+
+// MARK: - The sidebar at the screen's edge (#363)
+
+extension BrowserWindowController {
+    /// Runs a change on the window's sidebar and, once the edge has made it, on the edge's.
+    fileprivate func bothSidebars(_ change: (SidebarView) -> Void) {
+        change(sidebar)
+        if let edgeSidebar { change(edgeSidebar) }
+    }
+
+    /// The sidebar's width now, which the edge's card takes.
+    var edgeSidebarWidth: CGFloat { max(root.sidebarWidth, Tokens.Metric.sidebarMinWidth) }
+    var edgeSidebarOnRight: Bool { root.sidebarOnRight }
+
+    /// The edge's sidebar, up to date with this window's, ready to show.
+    func prepareEdgeSidebar() -> SidebarContainer {
+        let (mirror, container) = edgeSidebarViews()
+        mirror.isPrivate = tabManager.isPrivate
+        mirror.isOnRight = root.sidebarOnRight
+        mirror.currentSpaceID = tabManager.currentSpaceID
+        mirror.reloadSpaces(current: tabManager.currentSpaceID)
+        mirror.list.reload(animated: false)
+        mirror.setUpdateCard(Updater.shared.cardState)
+        reloadFavorites()
+        downloadsChanged()
+        updateNowPlaying()
+        copyEdgeLook()
+        return container
+    }
+
+    /// The setting went off: the edge's sidebar goes rather than taking updates until restart.
+    func discardEdgeSidebar() {
+        edgeContainer?.removeFromSuperview()
+        edgeSidebar = nil
+        edgeContainer = nil
+    }
+
+    /// The edge's card wears the space's look, as the window's floating sidebar does.
+    fileprivate func copyEdgeLook() {
+        guard let edgeContainer else { return }
+        let own = root.sidebarContainer
+        edgeContainer.isFloating = true
+        edgeContainer.tint = own.tint
+        edgeContainer.gradient = own.gradient
+        edgeContainer.grain = own.grain
+        edgeContainer.texture = own.texture
+        edgeContainer.windowGlass = own.windowGlass
+        edgeContainer.appearance = window?.contentView?.effectiveAppearance
+    }
+
+    private func edgeSidebarViews() -> (SidebarView, SidebarContainer) {
+        if let edgeSidebar, let edgeContainer { return (edgeSidebar, edgeContainer) }
+        let mirror = SidebarView(frame: .zero)
+        mirror.delegate = self
+        // A list to pick from: the address row stays in the window, and rows don't drag out of the panel.
+        mirror.showsAddressRow = false
+        mirror.list.allowsDragging = false
+        mirror.hoversWhileInactive = true
+        mirror.onEditSpace = { [weak self] id in self?.openSpaceEditor(id, anchor: self?.sidebar.dot(for: id)) }
+        mirror.onSwipeSpace = { [weak self] offset in
+            guard let self else { return false }
+            let before = self.tabManager.currentSpaceID
+            self.tabManager.switchSpace(by: offset)
+            return before != self.tabManager.currentSpaceID
+        }
+        mirror.onSwipeLook = { [weak self] space, share in self?.swipeLook(toward: space, share: share) }
+        mirror.favorites.onOpen = { [weak self] favorite in
+            self?.bringForwardForEdge()
+            self?.tabManager.openBookmark(favorite)
+        }
+        mirror.favorites.onMenu = { [weak self] favorite in
+            guard let self else { return nil }
+            return SidebarMenus.favoriteMenu(for: favorite, controller: self)
+        }
+        mirror.onNowPlayingShow = { [weak self] tab in
+            self?.bringForwardForEdge()
+            self?.tabManager.select(tab)
+        }
+        // Play and pause stay over the app in front.
+        mirror.onNowPlayingToggle = { [weak self] tab in self?.toggleNowPlaying(tab) }
+        mirror.onNowPlayingHide = { [weak self] tab in self?.hideNowPlaying(tab) }
+        mirror.onNowPlayingMenu = { [weak self] tab in self?.nowPlayingMenu(for: tab) }
+        mirror.updateCard.onRestart = { Updater.shared.restartToUpdate() }
+        mirror.updateCard.onHide = { Updater.shared.dismissCard() }
+        mirror.updateCard.onUpdate = { Updater.shared.getUpdate() }
+        mirror.updateCard.onSkip = { Updater.shared.skipOffered() }
+        let container = SidebarContainer(sidebar: mirror)
+        edgeSidebar = mirror
+        edgeContainer = container
+        return (mirror, container)
+    }
+
+    /// Something picked in the edge's panel: the panel goes and this window comes forward, as from the Dock.
+    func bringForwardForEdge() {
+        EdgeSidebar.shared.hide(animated: false)
+        guard let window else { return }
+        if NSApp.isHidden { NSApp.unhide(nil) }
+        if window.isMiniaturized { window.deminiaturize(nil) }
+        window.makeKeyAndOrderFront(nil)
+        NSApp.activate()
+    }
+
+    /// A menu item from the edge's panel acts on this window's sidebar: rename, a new folder, the space editor.
+    func revealSidebarForEdge() {
+        if !root.chromeSidebarShown && !root.isSidebarFloatingVisible { root.reveal(true) }
+    }
+
+    /// ⌘T in the edge's panel.
+    func newTabFromEdge() {
+        bringForwardForEdge()
+        newTab(nil)
+    }
+}
+
+// MARK: - The command bar in a browser window
+
+extension BrowserWindowController: CommandBarHost {
+    var commandBarOverlay: NSView { root.overlay }
+    var commandBarPageFrame: NSRect { root.cardFrame }
+    /// A split pane's address when asked for; else the address above the page, or the sidebar's while the sidebar
+    /// shows docked.
+    func commandBarAnchor(asked: NSView?) -> NSView? {
+        if let asked { return asked }
+        // In split view under the bar, the bar's address steps aside: the address of the pane you're in, as ⌘L edits
+        // that pane's page.
+        if root.stripsInBar { return focusedPaneAddress.isHidden ? nil : focusedPaneAddress }
+        // With the top bar, the site pill opens in place, as in panes.
+        if root.chromeBarShown, root.topBar.holdsAddress { return root.topBar.pill.isHidden ? nil : root.topBar.pill }
+        if root.chromeBarShown { return sidebar.address }
+        return root.chromeSidebarShown && !root.isSidebarFloatingVisible ? sidebar.address : nil
+    }
+    var commandBarTabs: TabManager? { tabManager }
+    var commandBarIsMovable: Bool { true }
+    var commandBarProfile: Profile { tabManager.profile }
+    var commandBarTab: Tab? { tabManager.selectedTab }
+    var commandBarSpace: SpaceInfo? { tabManager.currentSpace }
+    var commandBarIsPrivate: Bool { tabManager.isPrivate }
+
+    /// One floating thing at a time. Over the tab overview, the overview steps aside: whatever you open or search for
+    /// shows in the window, not behind the overview.
+    func commandBarWillShow() {
+        if desk.isVisible { desk.hide(openingTab: nil) }
+        // Typing goes to the bar, not to Capture's keys.
+        capture.cancel()
+        SitePanel.closeCurrent()
+        DownloadsPanel.closeCurrent()
+        ReaderOptions.closeCurrent()
+        SpaceEditorPanel.current?.close()
+        previews.hide()
+        linkStatus.show(nil, in: root.cardFrame)
+        // The sidebar slid out over the page steps aside too: the bar would open over its edge, and typing is no
+        // time for it. Not while something holds it out (the guide pointing into it).
+        root.reveal(false)
+    }
+
+    func commandBarRestoreFocus() {
+        if let selectedWebView { window?.makeFirstResponder(selectedWebView) }
+    }
+}
+
+/// Which page Handoff offers to your other devices, and the one activity that offers it.
+enum HandoffPage: Equatable {
+    case page(url: URL, title: String)
+
+    /// A web page another device can open: http or https, not private, not an error page, not on this Mac, no
+    /// password in its address. Zigzag Mini and web apps never offer theirs, as Safari's web apps don't.
+    static func advertised(url: URL?, title: String, isPrivate: Bool, errorPage: Bool) -> HandoffPage? {
+        guard !isPrivate, !errorPage, let url, ["http", "https"].contains(url.scheme?.lowercased() ?? ""),
+              let host = url.host(), !host.isEmpty, !LocalReceivers.isLoopback(host: host),
+              url.user() == nil, url.password() == nil else { return nil }
+        let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        return .page(url: url, title: trimmed.isEmpty ? host : trimmed)
+    }
+
+    /// The activity kept current for `page`, reusing `activity`; nil invalidates it.
+    static func update(_ activity: NSUserActivity?, to page: HandoffPage?) -> NSUserActivity? {
+        guard case let .page(url, title)? = page else {
+            activity?.invalidate()
+            return nil
+        }
+        let current = activity ?? NSUserActivity(activityType: NSUserActivityTypeBrowsingWeb)
+        if current.webpageURL != url { current.webpageURL = url }
+        if current.title != title { current.title = title }
+        current.becomeCurrent()
+        return current
+    }
+}

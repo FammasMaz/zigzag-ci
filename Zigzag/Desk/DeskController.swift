@@ -1,0 +1,1625 @@
+import AppKit
+
+/// A space's heading in desk view, as the sidebar names a space: its name, large and light, a quiet count on
+/// its baseline, and, when the same page is open more than once, a quiet way to close the extra copies. Clicking the
+/// name selects every tab in the space.
+final class DeskHeaderView: InteractiveView {
+    let dot = ColorView()
+    let label = Label("", font: Tokens.Font.spaceName(), color: Tokens.Color.textPrimary)
+    let count = Label("", font: Tokens.Font.body(), color: Tokens.Color.textTertiary)
+    var name: String {
+        get { label.stringValue }
+        set {
+            guard newValue != label.stringValue else { return }
+            label.attributedStringValue = Tokens.Font.voiceText(newValue)
+            setAccessibilityLabel(newValue)
+        }
+    }
+    private static let dotSize = Tokens.Space.x2
+    /// "Close 3 Duplicates", when the space has the same page open more than once.
+    let duplicatesButton = PillButton(style: .quiet)
+    var duplicates = 0 {
+        didSet {
+            guard duplicates != oldValue else { return }
+            duplicatesButton.title = String(localized: "Close \(duplicates) Duplicates", comment: "In the tab overview (all spaces' tabs as cards), a button beside a space's name: closes the tabs that show a page already open.")
+            duplicatesButton.isHidden = duplicates == 0
+            needsLayout = true
+        }
+    }
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        layer?.cornerRadius = Tokens.Radius.row
+        layer?.cornerCurve = .continuous
+        dot.wantsLayer = true
+        dot.layer?.cornerRadius = Self.dotSize / 2
+        duplicatesButton.isHidden = true
+        [dot, label, count, duplicatesButton].forEach { addSubview($0) }
+        setAccessibilityRole(.button)
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    override func layout() {
+        super.layout()
+        // No dot: the name alone says which space, as it does in the sidebar.
+        dot.isHidden = true
+        let h = label.lineHeight
+        // A long name gives way to the count and the button after it, ending in "…" rather than running under them.
+        let after = Tokens.Space.x2 + count.textWidth + (duplicates > 0 ? Tokens.Space.x3 + duplicatesButton.fittingWidth : 0)
+        let room = bounds.width - CardRow.inset * 2 + Label.inset - after
+        label.lineBreakMode = .byTruncatingTail
+        label.frame = NSRect(x: CardRow.inset - Label.inset, y: (bounds.height - h) / 2, width: max(0, min(label.textWidth, room)), height: h)
+        // The count sits on the name's baseline, not centered against it.
+        let nameFont = Tokens.Font.spaceName(), countFont = count.font ?? Tokens.Font.body()
+        let baseline = label.frame.minY + (h + nameFont.ascender + nameFont.descender) / 2
+        let ch = count.lineHeight
+        let countTop = baseline - (ch + countFont.ascender + countFont.descender) / 2
+        count.frame = NSRect(x: label.frame.maxX + Tokens.Space.x2, y: countTop, width: count.textWidth, height: ch)
+        // Close duplicates, a quiet word on the count's line.
+        let bw = duplicatesButton.fittingWidth, bh = Tokens.Page.controlHeight
+        duplicatesButton.frame = NSRect(x: count.frame.maxX + Tokens.Space.x3, y: countTop + (ch - bh) / 2, width: bw, height: bh)
+    }
+
+    override var isFlipped: Bool { true }
+
+    var fittingWidth: CGFloat {
+        CardRow.inset * 2 - Label.inset + label.textWidth + Tokens.Space.x2 + count.textWidth
+            + (duplicates > 0 ? Tokens.Space.x3 + duplicatesButton.fittingWidth : 0)
+    }
+
+    /// No fill: the heading is words, not a row. The name fills in a little under the pointer.
+    override func stateDidChange(animated: Bool) { label.alphaValue = isHovered ? 1 : 0.92 }
+}
+
+/// The desk stands on the window's own frame, painted as the window paints it: the frosted desktop for a see-through
+/// space with the space's color washed over it, or the color solid, with its gradient and grain. So the desk reads as
+/// the sidebar opened up to fill the window, not a different surface laid over it.
+final class DeskFrameView: NSView {
+    private let glass: NSVisualEffectView = {
+        let glass = NSVisualEffectView()
+        glass.blendingMode = .behindWindow
+        glass.material = .sidebar
+        glass.state = .followsWindowActiveState
+        return glass
+    }()
+    private let wash = CAGradientLayer()
+    private let grain = CALayer()
+    /// Holds the wash and grain in a view of its own, so AppKit keeps them above the glass.
+    private let paint = NSView()
+    /// Liquid Glass for a clear space, once one asks for it.
+    private var clearGlass: NSView?
+    /// Last paint, repainted on appearance change.
+    private var painted: (space: SpaceInfo, isPrivate: Bool)?
+    /// Called after an appearance change repaint.
+    var appearanceChanged: (() -> Void)?
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        wantsLayer = true
+        glass.autoresizingMask = [.width, .height]
+        addSubview(glass)
+        paint.wantsLayer = true
+        paint.autoresizingMask = [.width, .height]
+        addSubview(paint)
+        // Sized by hand in `layout` and `paint` only: resizing with the layer too would add each change twice, and the
+        // wash would grow past the window, showing only part of the fade.
+        paint.layer?.addSublayer(wash)
+        // The window's own grain, so the overview's color and texture are the frame's exactly.
+        grain.backgroundColor = MaterialImages.grain.cgColor
+        paint.layer?.addSublayer(grain)
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    override func layout() {
+        super.layout()
+        glass.frame = bounds
+        paint.frame = bounds
+        Tokens.Motion.withoutAnimation { wash.frame = bounds; grain.frame = bounds }
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        // Colors were resolved for the old appearance.
+        if let painted { paint(painted.space, isPrivate: painted.isPrivate) }
+        appearanceChanged?()
+    }
+
+    /// The same choices `BrowserWindowController.render` makes for the frame.
+    func paint(_ space: SpaceInfo, isPrivate: Bool) {
+        painted = (space, isPrivate)
+        let clear = !isPrivate && space.isSeeThrough && !NSWorkspace.shared.accessibilityDisplayShouldReduceTransparency
+        let reduced = space.isSeeThrough && !clear
+        let color = isPrivate ? SpaceColor.graphite.background : reduced ? space.background : space.frameColor
+        let end = isPrivate ? nil : reduced ? space.background2 : space.frameColor2
+        glass.isHidden = !clear
+        glass.frame = bounds
+        // Clear glass, as the window has it: Liquid Glass tinted with the space's color, the grain inside it.
+        let liquid = clear && space.usesClearGlass
+        if #available(macOS 26.0, *), liquid {
+            glass.isHidden = true
+            let view = clearGlass as? NSGlassEffectView ?? {
+                let made = NSGlassEffectView()
+                made.style = .regular
+                made.cornerRadius = 0
+                made.autoresizingMask = [.width, .height]
+                let content = NSView()
+                content.wantsLayer = true
+                made.contentView = content
+                addSubview(made, positioned: .above, relativeTo: glass)
+                clearGlass = made
+                return made
+            }()
+            view.isHidden = false
+            view.frame = bounds
+            view.tintColor = color
+            if grain.superlayer !== view.contentView?.layer { view.contentView?.layer?.addSublayer(grain) }
+            // The color is in the glass; no wash on top of it.
+            Tokens.Motion.withoutAnimation { wash.opacity = 0 }
+        } else {
+            clearGlass?.isHidden = true
+            Tokens.Motion.withoutAnimation { wash.opacity = 1 }
+            if grain.superlayer !== paint.layer { paint.layer?.addSublayer(grain) }
+        }
+        paint.frame = bounds
+        Tokens.Motion.withoutAnimation { wash.frame = bounds; grain.frame = bounds }
+        let r = space.gradientAngle * .pi / 180
+        // The window's frame is flipped and this view isn't: y runs the other way here, so the fade goes the same way.
+        let dx = cos(r) / 2, dy = -sin(r) / 2
+        Tokens.Motion.withoutAnimation {
+            wash.startPoint = CGPoint(x: 0.5 - dx, y: 0.5 - dy)
+            wash.endPoint = CGPoint(x: 0.5 + dx, y: 0.5 + dy)
+            effectiveAppearance.performAsCurrentDrawingAppearance {
+                wash.colors = [color.cgColor, (end ?? color).cgColor]
+            }
+            grain.backgroundColor = MaterialImages.texture(space.texture).cgColor
+            grain.opacity = Float(min(max(isPrivate ? 0 : space.grain ?? 0, 0), 1) * 0.18)
+        }
+    }
+}
+
+/// The desk's content: every tab as a card, grouped by space, in sidebar order.
+final class DeskCanvasView: NSView {
+    weak var desk: DeskController?
+    override var isFlipped: Bool { true }
+
+    override func mouseDown(with event: NSEvent) { desk?.backgroundMouseDown(event) }
+    override func keyDown(with event: NSEvent) { if desk?.keyDown(event) != true { super.keyDown(with: event) } }
+    override var acceptsFirstResponder: Bool { true }
+    override var mouseDownCanMoveWindow: Bool { false }
+}
+
+/// Stands in a space with no tabs, where its first card would be: a tile of soft glass that says so, with a way to
+/// start one there.
+final class DeskEmptySpaceView: NSView {
+    let newTab = PillButton(title: String(localized: "New Tab", comment: "In the tab overview (all spaces' tabs as cards), a button in a space with no tabs."), symbol: "plus", style: .plain)
+    private let label = Label(String(localized: "No tabs", comment: "In the tab overview (all spaces' tabs as cards), in a space with no tabs."), font: Tokens.Font.body(), color: Tokens.Color.textSecondary)
+    /// Room left under the box for a title, as a card has, so the two line up.
+    var titleArea: CGFloat = 0 { didSet { needsLayout = true } }
+    private let box = ColorView()
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        // The picture's corners, as a card's picture has, so the empty spot lines up with the cards beside it.
+        box.layer?.cornerRadius = Tokens.Radius.thumbnail
+        box.layer?.cornerCurve = .continuous
+        box.layer?.borderWidth = Tokens.Metric.hairline
+        addSubview(box)
+        box.addSubview(label)
+        box.addSubview(newTab)
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    override var isFlipped: Bool { true }
+
+    override func layout() {
+        super.layout()
+        box.frame = NSRect(x: Tokens.Space.x1, y: Tokens.Space.x1, width: bounds.width - Tokens.Space.x2, height: bounds.height - titleArea - Tokens.Space.x1)
+        let b = box.bounds
+        let h = label.lineHeight, button = newTab.intrinsicContentSize
+        // The label over the button, the two centered together.
+        let top = round((b.height - h - Tokens.Space.x2 - button.height) / 2)
+        label.frame = NSRect(x: round((b.width - label.textWidth) / 2), y: top, width: label.textWidth, height: h)
+        newTab.frame = NSRect(x: round((b.width - button.width) / 2), y: label.frame.maxY + Tokens.Space.x2, width: button.width, height: button.height)
+        refreshColors()
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        refreshColors()
+    }
+
+    private func refreshColors() {
+        box.color = Tokens.Color.glassFill
+        Tokens.Motion.withoutAnimation { box.layer?.borderColor = cgColor(Tokens.Color.glassEdge) }
+    }
+}
+
+/// Holds the page's picture as it flies. Not flipped, so its layer's coordinates are a view's, and never in the
+/// way of a click.
+final class DeskFlightView: NSView {
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        wantsLayer = true
+        autoresizingMask = [.width, .height]
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+}
+
+/// Desk view: zoom out to see every tab in every space at once, go to one by typing or with the arrow keys, and
+/// tidy up.
+final class DeskController {
+    private weak var controller: BrowserWindowController?
+    private let backdrop = ColorView()
+    private let frameView = DeskFrameView()
+    private let scrollView = NSScrollView()
+    private let canvas = DeskCanvasView()
+    private let actionBar = FloatingPanelView()
+    private let closeButton = PillButton(title: String(localized: "Close Tabs", comment: "In the tab overview (all spaces' tabs as cards), a button that closes the picked tabs."), style: .prominent)
+    private let doneButton = PillButton(title: String(localized: "Done", comment: "In the tab overview (all spaces' tabs as cards), a button that leaves the overview."), style: .quiet)
+    private var headers: [UUID: DeskHeaderView] = [:]
+    private var cards: [UUID: TabThumbnailView] = [:]
+    /// Spaces with no tabs, by space.
+    private var empties: [UUID: DeskEmptySpaceView] = [:]
+    private var selection: Set<UUID> = []
+    /// The card the arrow keys are on, and what Return opens: the tab you were on when the desk opens, the best
+    /// match while searching.
+    private var focused: UUID?
+    private(set) var isVisible = false
+    /// The page's picture while it flies between the page area and its card, over the desk.
+    private let flightView = DeskFlightView()
+    private var flight: PagePicture?
+    /// Counts opens and closes, so one that's been taken over doesn't finish what the next one started.
+    private var transition = 0
+    /// Find a tab by typing: the field at the top, and typing anywhere on the desk goes into it.
+    private let searchBox = FilledField.search(String(localized: "Search tabs", comment: "In the tab overview (all spaces' tabs as cards), the search field's placeholder."))
+    private var searchField: NSTextField { searchBox.field }
+    private let searchDelegate = DeskSearchDelegate()
+    private let noMatches = Label("", font: Tokens.Font.body(), color: Tokens.Color.textSecondary)
+    private var query = ""
+    private static let searchHeight = Tokens.Metric.controlHeight
+    private static let actionBarHeight = Tokens.Page.controlHeight + Tokens.Space.x2 + 2
+    private static let searchArea = Tokens.Space.x6 + Tokens.Space.x8 + Tokens.Space.x2
+    private var frameToken: NSObjectProtocol?
+    private var boundsToken: NSObjectProtocol?
+    /// A hairline under the search band, only while cards are scrolled under it.
+    private let scrollEdge = ColorView(color: Tokens.Color.separator)
+
+    /// Cards shrink with more tabs down to this, where a title still reads, and grow with fewer up to the largest.
+    private let minCardWidth = Tokens.Metric.deskCardWidth
+    private let maxCardWidth = Tokens.Metric.deskCardMaxWidth
+    /// Room around a card's picture for its hover and current-tab fill.
+    private let cardInset = Tokens.Space.x1
+    private let gap = Tokens.Space.x6
+    private let spaceGap = Tokens.Space.x8
+    private let margin = Tokens.Space.x10
+
+    init(window: BrowserWindowController) {
+        controller = window
+        canvas.desk = self
+        frameView.appearanceChanged = { [weak self] in self?.appearanceChanged() }
+        scrollView.drawsBackground = false
+        scrollView.hasVerticalScroller = true
+        scrollView.scrollerStyle = .overlay
+        scrollView.autohidesScrollers = true
+        scrollView.documentView = canvas
+        scrollView.useSlimScroller()
+        backdrop.addSubview(scrollView)
+        scrollEdge.isHidden = true
+        backdrop.addSubview(scrollEdge)
+        scrollView.contentView.postsBoundsChangedNotifications = true
+        boundsToken = NotificationCenter.default.addObserver(forName: NSView.boundsDidChangeNotification, object: scrollView.contentView, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.refreshScrollEdge() }
+        }
+        // The window resized, went full screen or the sidebar moved: the cards take the page area's new shape.
+        scrollView.contentView.postsFrameChangedNotifications = true
+        frameToken = NotificationCenter.default.addObserver(forName: NSView.frameDidChangeNotification, object: scrollView.contentView, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self, self.isVisible else { return }
+                self.applyLayout(animated: false)
+            }
+        }
+        // A floating capsule at the bottom, its pills inset evenly so their ends run with its own.
+        actionBar.radius = Self.actionBarHeight / 2
+        // It rises those few points from the bottom it sits on as you pick a card, and sinks back when you've none.
+        actionBar.attachedEdge = .maxY
+        actionBar.addSubview(closeButton)
+        actionBar.addSubview(doneButton)
+        closeButton.onClick = { [weak self] _ in self?.closeSelected() }
+        doneButton.onClick = { [weak self] _ in self?.hide(openingTab: nil) }
+
+        // The sidebar's soft field on the frame, like the address: the desk's search sits on the space's color.
+        searchBox.isPill = true
+        searchBox.isOnFrame = true
+        backdrop.addSubview(searchBox)
+        noMatches.isHidden = true
+        canvas.addSubview(noMatches)
+        searchField.delegate = searchDelegate
+        // A kind AutoFill has nothing for: with none, AppKit makes its one-time-code window each time the field takes
+        // the focus, on the main thread as the desk opens.
+        searchField.contentType = .dateTime
+        searchDelegate.changed = { [weak self] text in self?.search(text) }
+        searchDelegate.command = { [weak self] selector in
+            guard let self else { return false }
+            switch selector {
+            case #selector(NSResponder.insertNewline(_:)):
+                self.openFocused()
+                return true
+            case #selector(NSResponder.moveLeft(_:)): self.moveFocus(.left); return true
+            case #selector(NSResponder.moveRight(_:)): self.moveFocus(.right); return true
+            case #selector(NSResponder.moveUp(_:)): self.moveFocus(.up); return true
+            case #selector(NSResponder.moveDown(_:)): self.moveFocus(.down); return true
+            case #selector(NSResponder.deleteBackward(_:)) where self.searchField.stringValue.isEmpty:
+                // With nothing typed, ⌫ closes the card, as it does in the sidebar.
+                self.closeFocused()
+                return true
+            case #selector(NSResponder.cancelOperation(_:)):
+                // Esc clears the search first, then leaves the desk.
+                if self.query.isEmpty { self.hide(openingTab: nil) } else { self.searchField.stringValue = ""; self.search("") }
+                return true
+            default:
+                return false
+            }
+        }
+        if TouchGestures.isAvailable {
+            let pinch = TouchPinchRecognizer { [weak self] pinch in self?.cardPinched(pinch) }
+            canvas.addGestureRecognizer(pinch)
+        }
+    }
+
+    /// Pinched out on a card, it opens, as on an iPad's tab overview. Once a pinch.
+    private var pinchOpened = false
+
+    private func cardPinched(_ pinch: TouchPinchRecognizer) {
+        switch pinch.state {
+        case .began: pinchOpened = false
+        case .changed:
+            guard !pinchOpened, TouchPinch.opensCard(magnification: pinch.magnification) else { return }
+            pinchOpened = openCard(at: pinch.location(in: canvas))
+        default: break
+        }
+    }
+
+    /// Opens the card at `point` in the canvas; false when there's none.
+    @discardableResult
+    func openCard(at point: NSPoint) -> Bool {
+        guard isVisible, let card = cards.values.first(where: { !$0.isHidden && $0.frame.contains(point) }), let tab = card.tab else { return false }
+        hide(openingTab: tab)
+        return true
+    }
+
+    isolated deinit {
+        if let frameToken { NotificationCenter.default.removeObserver(frameToken) }
+        if let boundsToken { NotificationCenter.default.removeObserver(boundsToken) }
+    }
+
+    private var manager: TabManager? { controller?.tabManager }
+    private var listedSpaces: [SpaceInfo] { manager?.listedSpaces ?? Library.shared.yourSpaces }
+
+    #if DEBUG
+    /// Times an open or close: each step's moment, and every frame's interval while it animates, to debug.log.
+    private let meter = DeskMeter()
+    #endif
+
+    // MARK: Showing
+
+    func toggle() { isVisible ? hide(openingTab: nil) : show() }
+
+    func show() {
+        guard !isVisible, let controller else { return }
+        #if DEBUG
+        meter.begin("open", in: controller.root)
+        #endif
+        isVisible = true
+        transition += 1
+        // Opened again while still closing: the desk is there, and carries on from where it is.
+        let reopening = backdrop.superview != nil && !backdrop.isHidden
+        let zooms = !Tokens.Motion.reduceMotion && !reopening
+        // The page's picture is asked for first, so WebKit takes it while the desk is built.
+        var pageReady = false
+        var onPageReady: (() -> Void)?
+        if zooms {
+            capturePages { [weak self] in
+                let done = { pageReady = true; onPageReady?() }
+                guard let self, let manager = self.manager, let tab = manager.selectedTab else { done(); return }
+                ReadyPictures.prepare(manager.panes(of: tab).compactMap(\.snapshot), for: .full, in: self.controller?.window, completion: done)
+            }
+        }
+        Tutorial.overviewOpened()
+        selection = []
+        controller.previews.hide()
+        // The page's link preview would float over the cards.
+        controller.linkStatus.show(nil, in: controller.root.cardFrame)
+        controller.commandBar.dismiss(restoringFocus: false)
+        let root = controller.root
+        backdrop.color = .clear
+        if frameView.superview == nil {
+            frameView.autoresizingMask = [.width, .height]
+            backdrop.addSubview(frameView, positioned: .below, relativeTo: nil)
+        }
+        // The backdrop first: sizing it resizes the frame along with it, so the frame is fitted after, not grown twice.
+        backdrop.frame = root.bounds
+        backdrop.autoresizingMask = [.width, .height]
+        frameView.frame = backdrop.bounds
+        frameView.paint(controller.tabManager.currentSpace, isPrivate: controller.tabManager.isPrivate)
+        scrollView.autoresizingMask = [.width, .height]
+        if !reopening { Tokens.Motion.withoutAnimation { backdrop.alphaValue = 0 } }
+        // Kept in the window while closed, so it comes back without being drawn again; over anything shown since.
+        backdrop.isHidden = false
+        if root.overlay.subviews.last(where: { $0 !== flightView }) !== backdrop { root.overlay.addSubview(backdrop) }
+        flightView.frame = root.overlay.bounds
+        if root.overlay.subviews.last !== flightView { root.overlay.addSubview(flightView) }
+        query = ""
+        searchField.stringValue = ""
+        layoutSearch()
+        // Zooming out, the cards wait for their pictures to be made ready off the main thread, out of sight until
+        // they settle in, so nothing is decoded on the main thread as the desk first draws.
+        picturesWait = zooms
+        cards.values.forEach { $0.waitsForReadyPictures = zooms }
+        Tokens.Motion.withoutAnimation { scrollView.alphaValue = zooms ? 0 : 1 }
+        reload()
+        #if DEBUG
+        meter.mark("cards")
+        #endif
+        pictureUnseenPages()
+        // The window's own controls would sit on top of the desk; tuck them away.
+        (controller.window as? BrowserWindow)?.trafficLightsHidden = false
+        // Typing filters straight away, and the arrow keys move between cards from the field too.
+        controller.window?.makeFirstResponder(searchField)
+        backdrop.layoutSubtreeIfNeeded()
+        setFocus(currentCardID, scroll: false)
+        if !reopening, let card = currentCard { canvas.scrollToVisible(card.frame.insetBy(dx: 0, dy: -margin)) }
+        #if DEBUG
+        meter.mark("laid out")
+        #endif
+
+        guard !Tokens.Motion.reduceMotion else {
+            Tokens.Motion.animate(Tokens.Motion.crossfading, evenFromKeyboard: true, { self.backdrop.animator().alphaValue = 1 }) {
+                if self.isVisible { controller.root.glassCovered = true }
+            }
+            return
+        }
+        if reopening {
+            zoomOut(settle: false)
+            return
+        }
+        // The desk fades in at once, before the page's picture is ready, so the first thing you see is the answer.
+        fade(backdrop, to: 1, duration: Tokens.Motion.standard)
+        // The page's picture is taken fresh, so what shrinks is exactly what was on screen, and the pictures of the
+        // cards in sight are made ready meanwhile. That's quick; if it isn't, the pictures as they are will do.
+        let id = transition
+        var started = false
+        var waiting = 2
+        let start = { [weak self] in
+            guard let self, !started, self.isVisible, self.transition == id else { return }
+            started = true
+            #if DEBUG
+            self.meter.mark("ready")
+            #endif
+            self.picturesWait = false
+            let inSight = self.cards.values.filter { $0.frame.intersects(self.canvas.visibleRect) }
+            inSight.forEach { $0.waitsForReadyPictures = false; $0.refreshImage() }
+            Tokens.Motion.withoutAnimation { self.scrollView.alphaValue = 1 }
+            self.zoomOut(settle: true)
+            #if DEBUG
+            self.meter.mark("zoom started")
+            #endif
+        }
+        let ready = { waiting -= 1; if waiting == 0 { start() } }
+        let inSight = cards.values.filter { $0.frame.intersects(canvas.visibleRect) }
+        preparePictures(of: inSight, then: ready)
+        if pageReady { ready() } else { onPageReady = ready }
+        // The rest, out of sight, after: they show when they're ready, never decoded on the main thread.
+        let rest = cards.values.filter { !$0.frame.intersects(canvas.visibleRect) }
+        if !rest.isEmpty { preparePictures(of: rest) { [weak self] in self?.showPictures(of: rest) } }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { MainActor.assumeIsolated { start() } }
+    }
+
+    /// Whether cards made now wait for their pictures to be made ready, while the desk is opening.
+    private var picturesWait = false
+
+    /// Makes the pictures of `cards` ready for the screen, off the main thread, then calls `completion`.
+    private func preparePictures(of cards: [TabThumbnailView], then completion: @escaping () -> Void) {
+        ReadyPictures.prepare(cards.flatMap(\.pages).compactMap(\.snapshot), for: .card, in: controller?.window, completion: completion)
+    }
+
+    /// Cards whose pictures are ready show them.
+    private func showPictures(of cards: [TabThumbnailView]) {
+        for card in cards where card.waitsForReadyPictures {
+            card.waitsForReadyPictures = false
+            card.refreshImage()
+        }
+    }
+
+    /// Pages loaded out of sight (opened in the background) with no picture yet get one now, so their cards show the
+    /// page, not just its icon. Each is drawn for a moment under the desk, then let go.
+    private func pictureUnseenPages() {
+        guard let controller, let manager else { return }
+        let root = controller.root
+        let size = root.cardFrame.size
+        // A snapshot from the other appearance is stale.
+        let dark = root.effectiveAppearance.isDark
+        let pages = listedSpaces.flatMap { manager.tabs(in: $0.id) }.filter {
+            Tab.needsPictureOutOfSight(hasWebView: $0.webView != nil, onScreen: $0.webView?.window != nil, loaded: $0.hasLoadedOnce,
+                                       hasPicture: $0.snapshot != nil && TabThumbnailView.knownBlank($0.snapshot) != true
+                                           && !$0.snapshotIsStale(windowDark: dark))
+        }
+        guard !pages.isEmpty, size.width > 0 else { return }
+        // Beneath everything in the window, where the page is: drawn, but never seen.
+        let host = NSView(frame: root.cardFrame)
+        root.addSubview(host, positioned: .below, relativeTo: nil)
+        var waiting = pages.count
+        for page in pages {
+            page.captureSnapshotOutOfSight(in: host, size: size) { [weak self, weak host] in
+                if let self, self.isVisible {
+                    let shown = self.cards.values.filter { $0.pages.contains { $0 === page } }
+                    self.preparePictures(of: shown) { [weak self] in
+                        guard let self, self.isVisible else { return }
+                        shown.forEach { $0.waitsForReadyPictures = false; $0.refreshImage() }
+                    }
+                }
+                waiting -= 1
+                if waiting == 0 { host?.removeFromSuperview() }
+            }
+        }
+    }
+
+    /// Appearance changed while the desk is up: retake every page's snapshot.
+    private func appearanceChanged() {
+        guard isVisible else { return }
+        pictureUnseenPages()
+        // Give the page a moment to redraw first.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { MainActor.assumeIsolated { [weak self] in self?.recaptureCurrentPage() } }
+    }
+
+    private func recaptureCurrentPage() {
+        guard isVisible else { return }
+        capturePages { [weak self] in
+            guard let self, self.isVisible, let tab = self.manager?.selectedTab else { return }
+            let shown = self.cards.values.filter { $0.pages.contains { $0 === tab } }
+            self.preparePictures(of: shown) { [weak self] in
+                guard let self, self.isVisible else { return }
+                shown.forEach { $0.waitsForReadyPictures = false; $0.refreshImage() }
+            }
+        }
+    }
+
+    /// Takes new pictures of the page on screen, both pages with a split, then calls `completion` once.
+    private func capturePages(_ completion: @escaping () -> Void) {
+        guard let manager, let tab = manager.selectedTab else { completion(); return }
+        let pages = manager.panes(of: tab)
+        var waiting = pages.count
+        for page in pages {
+            page.captureSnapshot {
+                waiting -= 1
+                if waiting == 0 { completion() }
+            }
+        }
+    }
+
+    /// Opening: the page shrinks from where it is on screen into its card, in one continuous move, while the desk
+    /// fades in behind it and the other cards settle in around it. `settle` is false when a close is turned around
+    /// mid-way, with the cards still in place.
+    private func zoomOut(settle: Bool) {
+        guard let controller else { return }
+        let id = transition
+        let current = currentCard
+        if backdrop.alphaValue < 1 { fade(backdrop, to: 1, duration: Tokens.Motion.standard) }
+        if settle { settleIn(except: current) }
+        guard let current, let tab = current.tab else { return }
+        let target = current.imageClip.convert(current.imageClip.bounds, to: flightView)
+        // From the page as it is on screen.
+        let flight = self.flight ?? makeFlight(at: flightView.convert(controller.root.cardFrame, from: controller.root), radius: pageRadius)
+        // Only its picture flies; the title arrives with the other cards.
+        Tokens.Motion.withoutAnimation { current.imageClip.alphaValue = 0 }
+        flight.show([Self.picture(of: tab)] + current.partners.map(\.snapshot), shape: current.shape)
+        fly(flight, to: target, radius: Tokens.Radius.thumbnail) { [weak self] in
+            guard let self, self.transition == id else { return }
+            // Landed: the card takes over in the same frame, so nothing moves.
+            Tokens.Motion.withoutAnimation {
+                self.cards.values.forEach { $0.imageClip.alphaValue = 1 }
+                self.endFlight()
+            }
+        }
+    }
+
+    /// The flying picture, page-sized so it stays sharp, scaled to show over `frame` (in the flight view) with
+    /// `radius` corners. The live pages under it are hidden so the two never show at once; they keep drawing, so
+    /// they're ready the moment it lands.
+    private func makeFlight(at frame: NSRect, radius: CGFloat) -> PagePicture {
+        let picture = PagePicture()
+        picture.readyCopies = .full
+        let layer = picture.layer
+        let page = controller?.root.cardFrame.size ?? frame.size
+        let scale = (x: frame.width / max(page.width, 1), y: frame.height / max(page.height, 1))
+        layer.anchorPoint = .zero
+        layer.masksToBounds = true
+        layer.cornerCurve = .continuous
+        Tokens.Motion.withoutAnimation {
+            layer.backgroundColor = flightView.cgColor(Tokens.Color.cardBackground)
+            picture.dividerColor = flightView.cgColor(Tokens.Color.cardEdge)
+            picture.layout(size: page)
+            layer.position = frame.origin
+            layer.transform = CATransform3DMakeScale(scale.x, scale.y, 1)
+            layer.cornerRadius = radius / max(min(scale.x, scale.y), 0.01)
+            flightView.layer?.addSublayer(layer)
+        }
+        controller?.root.pagesHidden = true
+        flight = picture
+        return picture
+    }
+
+    /// The corners of the page on screen: square when it runs to the window's edges.
+    private var pageRadius: CGFloat { controller?.root.isEdgeToEdge == true ? 0 : Tokens.Radius.card }
+
+    /// Moves the flying picture onto `target` (in the flight view), its corners ending at `radius`, on a critically
+    /// damped spring. It starts from wherever it is on screen right now, so a move taken over mid-way turns around
+    /// without a jump.
+    private func fly(_ flight: PagePicture, to target: NSRect, radius: CGFloat, completion: @escaping () -> Void) {
+        let layer = flight.layer
+        let size = layer.bounds.size
+        guard size.width > 0, size.height > 0 else { completion(); return }
+        let sx = target.width / size.width, sy = target.height / size.height
+        let shown = layer.presentation() ?? layer
+        let from: [String: Any] = ["position": shown.position, "transform": shown.transform, "cornerRadius": shown.cornerRadius]
+        let to: [String: Any] = ["position": target.origin, "transform": CATransform3DMakeScale(sx, sy, 1),
+                                 "cornerRadius": radius / max(min(sx, sy), 0.01)]
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        CATransaction.setCompletionBlock(completion)
+        for key in ["position", "transform", "cornerRadius"] {
+            let spring = Tokens.Motion.easeAnimation(keyPath: key, duration: Tokens.Motion.zoom, timing: Tokens.Motion.Role.large.timing)
+            spring.fromValue = from[key]
+            spring.toValue = to[key]
+            layer.setValue(to[key], forKeyPath: key)
+            layer.add(spring, forKey: key)
+        }
+        CATransaction.commit()
+    }
+
+    /// The picture is done with: it goes, and the live pages show again.
+    private func endFlight() {
+        flight?.layer.removeFromSuperlayer()
+        flight = nil
+        controller?.root.pagesHidden = false
+        // Open and settled: the window under the desk rests.
+        if isVisible { controller?.root.glassCovered = true }
+    }
+
+    /// The picture a card's first page shows, or none for one that hasn't drawn.
+    private static func picture(of tab: Tab) -> NSImage? { TabThumbnailView.isBlank(tab.snapshot) ? nil : tab.snapshot }
+
+    /// Fades a view to `value`, eased out, from wherever it is now; `completion` runs when it's done, not later.
+    private func fade(_ view: NSView, to value: CGFloat, duration: TimeInterval, completion: (() -> Void)? = nil) {
+        guard let layer = view.layer else { completion?(); return }
+        let spring = Tokens.Motion.easeAnimation(keyPath: "opacity", duration: duration)
+        spring.fromValue = layer.presentation()?.opacity ?? layer.opacity
+        spring.toValue = Float(value)
+        CATransaction.begin()
+        CATransaction.setCompletionBlock(completion)
+        Tokens.Motion.withoutAnimation { view.alphaValue = value }
+        layer.add(spring, forKey: "deskFade")
+        CATransaction.commit()
+    }
+
+    /// The other cards come in around the page: each fades in while growing the last few percent from its own
+    /// middle, a beat after the one before it in reading order, all landing with the page.
+    private func settleIn(except current: NSView?) {
+        let ordered = cards.values.filter { $0.frame.intersects(canvas.visibleRect) }.sorted {
+            $0.frame.minY != $1.frame.minY ? $0.frame.minY < $1.frame.minY : $0.frame.minX < $1.frame.minX
+        }
+        let now = CACurrentMediaTime()
+        for (i, card) in ordered.enumerated() {
+            guard let layer = card.layer else { continue }
+            let fade = Tokens.Motion.easeAnimation(keyPath: "opacity", duration: Tokens.Motion.zoom)
+            fade.fromValue = 0
+            fade.toValue = 1
+            let group = CAAnimationGroup()
+            if card === current {
+                // Its picture is the page flying in; only its title fades in.
+                group.animations = [fade]
+            } else {
+                let k: CGFloat = 0.96, size = card.bounds.size
+                let small = CATransform3DConcat(CATransform3DMakeScale(k, k, 1),
+                                                CATransform3DMakeTranslation(size.width * (1 - k) / 2, size.height * (1 - k) / 2, 0))
+                let grow = Tokens.Motion.easeAnimation(keyPath: "transform", duration: Tokens.Motion.zoom, timing: Tokens.Motion.Role.large.timing)
+                grow.fromValue = NSValue(caTransform3D: small)
+                grow.toValue = NSValue(caTransform3D: CATransform3DIdentity)
+                group.animations = [grow, fade]
+            }
+            group.duration = fade.duration
+            group.beginTime = now + min(Double(i) * 0.01, 0.06) * Tokens.Motion.debugSlowdown
+            group.fillMode = .backwards
+            layer.add(group, forKey: "settle")
+        }
+    }
+
+    func hide(openingTab tab: Tab?) {
+        guard isVisible, let controller else { return }
+        #if DEBUG
+        meter.begin("close", in: controller.root)
+        #endif
+        isVisible = false
+        // A toast from the desk goes back over the page.
+        Toast.reposition(in: controller)
+        transition += 1
+        let id = transition
+        // The window wakes under the desk before it goes, so the page is live where it lands.
+        controller.root.glassCovered = false
+        actionBar.removeFromSuperview()
+        let root = controller.root
+        let target = tab ?? controller.tabManager.selectedTab
+        let card = target.flatMap { target in cards[cardID(for: target)] ?? cards[target.id] }
+        // Switching tabs can keep the main thread busy for a while (the page coming forward, the sidebar and the
+        // address bar following), so the close starts first and the switch runs after, under the flying page.
+        let switchTab: @MainActor () -> Void = { [weak self, weak controller] in
+            guard let controller else { return }
+            // The window's controls go back to how the sidebar has them, after the move has started.
+            if self?.transition == id { controller.layoutTrafficLights() }
+            if let tab { controller.tabManager.select(tab) }
+            #if DEBUG
+            self?.meter.mark("tab selected")
+            #endif
+            // Opened again in the meantime: the desk keeps the keyboard.
+            guard self?.transition == id else { return }
+            if let webView = controller.selectedWebView { controller.window?.makeFirstResponder(webView) }
+        }
+        // Back on a tab: the guide's overview step is done.
+        Tutorial.overviewClosed()
+        let finish: @MainActor () -> Void = { [weak self] in
+            // Opened again before this finished: it stays.
+            guard let self, self.transition == id else { return }
+            // The search field gives up the keyboard as the desk goes out of sight.
+            if let window = self.backdrop.window, let responder = window.firstResponder as? NSView, responder.isDescendant(of: self.backdrop) {
+                window.makeFirstResponder(nil)
+            }
+            Tokens.Motion.withoutAnimation {
+                self.backdrop.isHidden = true
+                self.backdrop.alphaValue = 1
+                self.scrollView.alphaValue = 1
+                self.cards.values.forEach { $0.imageClip.alphaValue = 1 }
+            }
+        }
+        // Closed before the desk ever showed (pressed twice quickly): nothing to take back.
+        let shown = backdrop.layer?.presentation()?.opacity ?? Float(backdrop.alphaValue)
+        guard !Tokens.Motion.reduceMotion, shown > 0.01 || flight != nil, let card, let page = card.tab else {
+            // Nothing to grow, or Reduce Motion: the desk simply fades away.
+            switchTab()
+            endFlight()
+            Tokens.Motion.animate(Tokens.Motion.crossfading, evenFromKeyboard: true, { self.backdrop.animator().alphaValue = 0 }, completion: finish)
+            return
+        }
+        // Closing: the chosen card grows to fill the page area, exactly where its page is, and hands over to it.
+        let flight = self.flight ?? makeFlight(at: card.imageClip.convert(card.imageClip.bounds, to: flightView), radius: Tokens.Radius.thumbnail)
+        root.pagesHidden = true
+        Tokens.Motion.withoutAnimation { card.imageClip.alphaValue = 0 }
+        let pictures = [Self.picture(of: page)] + card.partners.map(\.snapshot)
+        flight.show(pictures, shape: card.shape)
+        // It starts from the card's copy of the picture; the whole picture takes over as it grows, once it's ready.
+        let whole = pictures.compactMap { $0 }.filter { !ReadyPictures.isReady($0, for: .full) }
+        if !whole.isEmpty {
+            ReadyPictures.prepare(whole, for: .full, in: controller.window) { [weak self, weak flight] in
+                guard let self, let flight, self.flight === flight else { return }
+                flight.show(pictures, shape: card.shape)
+            }
+        }
+        // The desk is gone, and out of the way of clicks, a moment before the page lands.
+        fade(backdrop, to: 0, duration: Tokens.Motion.standard, completion: finish)
+        fly(flight, to: flightView.convert(root.cardFrame, from: root), radius: pageRadius) { [weak self] in
+            guard let self, self.transition == id else { return }
+            self.handOff(flight)
+        }
+        #if DEBUG
+        meter.mark("zoom started")
+        #endif
+        // The render server has the move before the switch can hold the main thread, so the move doesn't wait on
+        // it. The pages stay hidden until the hand-off, which comes after the switch.
+        CATransaction.flush()
+        DispatchQueue.main.async { MainActor.assumeIsolated(switchTab) }
+    }
+
+    /// The picture has grown into the page area: the live pages show under it, and it fades off them quickly. When
+    /// the picture is current that's invisible; when the page has changed since, it reads as the page refreshing.
+    private func handOff(_ flight: PagePicture) {
+        controller?.root.pagesHidden = false
+        self.flight = nil
+        let layer = flight.layer
+        CATransaction.begin()
+        CATransaction.setCompletionBlock { layer.removeFromSuperlayer() }
+        let fade = CABasicAnimation(keyPath: "opacity")
+        fade.fromValue = 1
+        fade.toValue = 0
+        fade.duration = Tokens.Motion.quick * Tokens.Motion.debugSlowdown
+        Tokens.Motion.withoutAnimation { layer.opacity = 0 }
+        layer.add(fade, forKey: "handOff")
+        CATransaction.commit()
+    }
+
+    // MARK: Layout
+
+    /// The page area's shape. Every card is the page area in small, so the page can fly into its card and back
+    /// without stretching.
+    var pageAspect: CGFloat {
+        guard let card = controller?.root.cardFrame, card.width > 0, card.height > 0 else { return 0.625 }
+        return min(max(card.height / card.width, 0.3), 1.5)
+    }
+
+    private func cardHeight(width: CGFloat) -> CGFloat {
+        round((width - cardInset * 2) * pageAspect) + TabThumbnailView.titleHeight + cardInset
+    }
+
+    /// Lays out every space and its cards. Positions follow sidebar order, so they never move on their own.
+    /// Cards are as big as they can be while every tab still fits on screen: a few tabs get big cards, many get
+    /// smaller ones, down to a size whose titles still read, and then the desk scrolls.
+    private func layoutFrames(dragging: (id: UUID, space: UUID, index: Int)? = nil)
+        -> (headers: [UUID: NSRect], cards: [UUID: NSRect], cardSize: NSSize, height: CGFloat) {
+        guard manager != nil else { return ([:], [:], .zero, 0) }
+        let width = max(scrollView.contentSize.width, minCardWidth + margin * 2)
+        let visible = scrollView.contentSize.height
+        var groups: [(space: UUID, ids: [UUID])] = []
+        for space in listedSpaces {
+            var ids = cardTabs(in: space.id).map(\.id)
+            if let dragging {
+                ids.removeAll { $0 == dragging.id }
+                if dragging.space == space.id { ids.insert(dragging.id, at: min(dragging.index, ids.count)) }
+            }
+            // Every space shows, an empty one with a way to start a tab there. While searching, the headings of
+            // spaces with no matches would stand over "No tabs match".
+            if ids.isEmpty && dragging == nil && !query.isEmpty { continue }
+            groups.append((space.id, ids))
+        }
+        let heading = Tokens.Space.x12 + Tokens.Space.x2
+        func widthOfCards(_ columns: Int) -> CGFloat {
+            let fit = floor((width - margin * 2 - CGFloat(columns - 1) * gap) / CGFloat(columns))
+            // One card on its own is never taller than the desk.
+            let tallest = (visible - margin * 2 - heading - TabThumbnailView.titleHeight - cardInset) / pageAspect + cardInset * 2
+            return max(minCardWidth, min(fit, maxCardWidth, floor(tallest)))
+        }
+        func contentHeight(columns: Int) -> CGFloat {
+            let rowHeight = self.cardHeight(width: widthOfCards(columns)) + gap
+            let spaces = groups.map { heading + CGFloat(max(1, Int(ceil(Double($0.ids.count) / Double(columns))))) * rowHeight - gap }
+            return spaces.reduce(0, +) + CGFloat(max(0, spaces.count - 1)) * spaceGap
+        }
+        // The fewest columns, so the biggest cards, that show every tab at once; with too many for that, as many
+        // columns as fit.
+        let most = max(1, Int((width - margin * 2 + gap) / (minCardWidth + gap)))
+        let widest = max(1, min(most, groups.map(\.ids.count).max() ?? 1))
+        let columns = (1...widest).first { contentHeight(columns: $0) <= visible - margin * 2 } ?? widest
+        let cardWidth = widthOfCards(columns)
+        let cardHeight = self.cardHeight(width: cardWidth)
+        let rowWidth = CGFloat(columns) * cardWidth + CGFloat(columns - 1) * gap
+        let left = floor((width - rowWidth) / 2)
+        // A desk that fits sits in the middle of the window, like Mission Control.
+        let total = contentHeight(columns: columns)
+        var y = max(margin, floor((visible - total) / 2))
+        var headerFrames: [UUID: NSRect] = [:]
+        var cardFrames: [UUID: NSRect] = [:]
+        for group in groups {
+            // As wide as it may run, to the desk's margin; the header is only as wide as its words within that.
+            headerFrames[group.space] = NSRect(x: left - Tokens.Space.x2, y: y, width: width - margin - left + Tokens.Space.x2, height: Tokens.Space.x8)
+            y += heading
+            for (i, id) in group.ids.enumerated() {
+                let col = i % columns, row = i / columns
+                cardFrames[id] = NSRect(x: left + CGFloat(col) * (cardWidth + gap), y: y + CGFloat(row) * (cardHeight + gap), width: cardWidth, height: cardHeight)
+            }
+            let rows = max(1, Int(ceil(Double(group.ids.count) / Double(columns))))
+            y += CGFloat(rows) * (cardHeight + gap) - gap + spaceGap
+        }
+        return (headerFrames, cardFrames, NSSize(width: cardWidth, height: cardHeight), y - spaceGap + margin)
+    }
+
+    /// The tabs that get a card: a split's second page shares the first one's card, as it shares its sidebar row.
+    /// While searching, only the ones whose title or address match (either page, for a split).
+    private func cardTabs(in space: UUID) -> [Tab] {
+        guard let manager else { return [] }
+        let tabs = manager.tabs(in: space)
+        // The first page of a split or tile group in this list has the card.
+        let cards = tabs.filter { cardID(for: $0) == $0.id }
+        guard !query.isEmpty else { return cards }
+        return cards.filter { matches($0) || partners(of: $0).contains(where: matches) }
+    }
+
+    private func matches(_ tab: Tab) -> Bool {
+        tab.displayTitle.localizedCaseInsensitiveContains(query) || (tab.url?.absoluteString.localizedCaseInsensitiveContains(query) ?? false)
+    }
+
+    private func search(_ text: String) {
+        query = text.trimmingCharacters(in: .whitespaces)
+        selection = []
+        reload(animated: true)
+        // Return opens the best match; with the search cleared, it's back on the tab you were on.
+        setFocus(query.isEmpty ? currentCardID : orderedCardIDs.first)
+    }
+
+    /// Where a toast goes while the desk is open: across the window, under the search field rather than over it.
+    var toastArea: NSRect? {
+        guard isVisible, let overlay = backdrop.superview else { return nil }
+        let search = overlay.convert(searchBox.bounds, from: searchBox)
+        return NSRect(x: overlay.bounds.minX, y: search.maxY, width: overlay.bounds.width, height: max(0, overlay.bounds.maxY - search.maxY))
+    }
+
+    /// The search field, centered at the top, clear of the window's buttons.
+    private func layoutSearch() {
+        let b = backdrop.bounds
+        let width = min(360, b.width - Tokens.Space.x10 * 4)
+        let h = Self.searchHeight
+        let top = backdrop.isFlipped ? Tokens.Space.x6 : b.height - Tokens.Space.x6 - h
+        searchBox.frame = NSRect(x: round((b.width - width) / 2), y: top, width: width, height: h)
+        searchBox.autoresizingMask = [.minXMargin, .maxXMargin, backdrop.isFlipped ? .maxYMargin : .minYMargin]
+        scrollView.frame = NSRect(x: 0, y: backdrop.isFlipped ? Self.searchArea : 0, width: b.width, height: b.height - Self.searchArea)
+        let line = Tokens.Metric.hairline
+        scrollEdge.frame = NSRect(x: 0, y: backdrop.isFlipped ? Self.searchArea - line : b.height - Self.searchArea, width: b.width, height: line)
+        scrollEdge.autoresizingMask = [.width, backdrop.isFlipped ? .maxYMargin : .minYMargin]
+        refreshScrollEdge()
+    }
+
+    private func refreshScrollEdge() {
+        scrollEdge.isHidden = scrollView.contentView.bounds.minY <= 0
+    }
+
+    /// The page whose card a page shows on: the first of its split or tile group among the space's tabs (a pinned
+    /// page in a split isn't one of them, so the tab beside it has the card), or itself.
+    private func cardID(for tab: Tab) -> UUID {
+        guard let manager, let pair = manager.split(for: tab) else { return tab.id }
+        let tabs = manager.tabs(in: tab.spaceID)
+        return pair.ids.first { id in tabs.contains { $0.id == id } } ?? tab.id
+    }
+
+    /// The pages sharing a split's or tile group's card with the one that has it, in the group's order; none for any
+    /// other.
+    private func partners(of tab: Tab) -> [Tab] {
+        guard let manager, manager.split(for: tab) != nil, cardID(for: tab) == tab.id else { return [] }
+        return manager.partners(of: tab)
+    }
+
+    /// How a split card's pages share it, as they share the page area: the card's own page first, as the card draws.
+    private func shape(of tab: Tab) -> TileShape? {
+        guard let shape = manager?.split(for: tab)?.shape else { return nil }
+        return Self.shape(shape, first: manager?.split(for: tab)?.ids.firstIndex(of: tab.id) ?? 0)
+    }
+
+    /// A group's shape with the region of its page at `index` first and the rest in order after it.
+    nonisolated static func shape(_ shape: TileShape, first index: Int) -> TileShape {
+        guard index > 0, shape.regions.indices.contains(index) else { return shape }
+        var moved = shape
+        let region = moved.regions.remove(at: index)
+        moved.regions.insert(region, at: 0)
+        return moved
+    }
+
+    /// The card for the tab you're on, which with a split is the one both pages share.
+    private var currentCard: TabThumbnailView? {
+        guard let manager, let tab = manager.selectedTab else { return nil }
+        return cards[cardID(for: tab)] ?? cards[tab.id]
+    }
+
+    private var currentCardID: UUID? { cards.first { $0.value === currentCard }?.key }
+
+    /// Tabs opened or closed while the desk is up (⌘W, a link opening a tab): the cards follow.
+    func tabsChanged() { if isVisible { reload(animated: true) } }
+
+    /// Another space came forward while the desk is open (a shortcut): its color, and its tab as the current card.
+    func spaceChanged() {
+        guard isVisible, let controller else { return }
+        backdrop.color = .clear
+        if frameView.superview == nil {
+            frameView.autoresizingMask = [.width, .height]
+            backdrop.addSubview(frameView, positioned: .below, relativeTo: nil)
+        }
+        frameView.frame = backdrop.bounds
+        frameView.paint(controller.tabManager.currentSpace, isPrivate: controller.tabManager.isPrivate)
+        reload(animated: true)
+    }
+
+    private func reload(animated: Bool = false) {
+        guard manager != nil else { return }
+        let allTabs = listedSpaces.flatMap { cardTabs(in: $0.id) }
+        let ids = Set(allTabs.map(\.id))
+        for (id, view) in cards where !ids.contains(id) {
+            cards[id] = nil
+            if animated { collapse(view) } else { view.removeFromSuperview() }
+        }
+        var fresh: [TabThumbnailView] = []
+        selection = selection.intersection(ids)
+        // Cards kept from last time show what each tab is now.
+        for tab in allTabs { cards[tab.id]?.configure(tab, partners: partners(of: tab), shape: shape(of: tab)) }
+        for tab in allTabs where cards[tab.id] == nil {
+            let card = TabThumbnailView()
+            card.inset = cardInset
+            card.showsRing = true
+            card.picture.readyCopies = .card
+            card.waitsForReadyPictures = picturesWait
+            card.configure(tab, partners: partners(of: tab), shape: shape(of: tab))
+            card.onClick = { [weak self, weak tab, weak card] event in
+                guard let self, let tab else { return }
+                self.cardClicked(card?.tab(at: event) ?? tab, event: event)
+            }
+            // The ×, or a middle-click anywhere on the card, as on a tab in the sidebar.
+            card.onClose = { [weak self, weak tab] in
+                guard let self, let tab else { return }
+                self.close([tab.id])
+            }
+            card.onMiddleClick = card.onClose
+            card.onDragStart = { [weak self, weak tab] event in
+                // While searching, the cards in between are hidden, so where a drop lands in the list is a guess:
+                // no reordering until the search is cleared.
+                guard let self, let tab, self.query.isEmpty else { return false }
+                return self.beginDrag(tab, event: event)
+            }
+            card.onRightClick = { [weak self, weak tab] _ in
+                guard let self, let tab else { return nil }
+                if !self.selection.contains(tab.id) { self.selection = [tab.id]; self.updateSelection() }
+                let menu = NSMenu()
+                menu.addItem(SidebarMenus.Item(String(localized: "Close \(self.selection.count) Tabs", comment: "In the tab overview (all spaces' tabs as cards), an item in a card's context menu: closes the picked tabs.")) { self.closeSelected() })
+                return menu
+            }
+            cards[tab.id] = card
+            canvas.addSubview(card)
+            fresh.append(card)
+        }
+        for space in listedSpaces where headers[space.id] == nil {
+            let header = DeskHeaderView()
+            header.onClick = { [weak self] _ in self?.selectSpace(space.id) }
+            header.duplicatesButton.onClick = { [weak self] _ in self?.previewClosing([]); self?.closeDuplicates(in: space.id) }
+            // Pointing at it, the cards it would close fade back, as Clear's rows do in the sidebar.
+            header.duplicatesButton.hoverChanged = { [weak self] on in
+                guard let self else { return }
+                self.previewClosing(on ? Set(self.duplicateTabs(in: space.id).map(\.id)) : [])
+            }
+            headers[space.id] = header
+            canvas.addSubview(header)
+        }
+        for (id, header) in headers where Library.shared.space(id) == nil { header.removeFromSuperview(); headers[id] = nil }
+        for space in listedSpaces where empties[space.id] == nil {
+            let empty = DeskEmptySpaceView()
+            empty.newTab.onClick = { [weak self] _ in self?.newTab(in: space.id) }
+            empties[space.id] = empty
+            canvas.addSubview(empty)
+        }
+        for (id, empty) in empties where Library.shared.space(id) == nil { empty.removeFromSuperview(); empties[id] = nil }
+        let current = currentCard
+        for card in cards.values { card.isCurrent = card === current }
+        // New cards (a search cleared, a tab opened) start where they belong and grow in there, rather than flying
+        // in from a corner.
+        if animated {
+            let frames = layoutFrames().cards
+            for card in fresh { card.frame = frames[cards.first { $0.value === card }?.key ?? UUID()] ?? .zero }
+            appear(fresh)
+        }
+        applyLayout(animated: animated)
+        updateSelection()
+        if let focused, cards[focused] == nil { self.focused = nil }
+        for (id, card) in cards { card.isFocused = id == focused }
+    }
+
+    private func applyLayout(animated: Bool, dragging: (id: UUID, space: UUID, index: Int)? = nil) {
+        let layout = layoutFrames(dragging: dragging)
+        canvas.frame = NSRect(x: 0, y: 0, width: scrollView.contentSize.width, height: max(layout.height, scrollView.contentSize.height))
+        for (id, header) in headers {
+            guard let space = Library.shared.space(id) else { continue }
+            header.name = space.name
+            let count = manager?.tabs(in: id).count ?? 0
+            // While searching, how many of them match: a split that matches is both its tabs.
+            let shown = query.isEmpty ? count : cardTabs(in: id).reduce(0) { $0 + 1 + partners(of: $1).count }
+            let tabs = String(localized: "\(count) tabs", comment: "In the tab overview (all spaces' tabs as cards), beside a space's name: how many tabs it has.")
+            let counted = count == 0 ? "" : shown == count ? tabs
+                : String(localized: "\(shown) of \(tabs)", comment: "In the tab overview (all spaces' tabs as cards), beside a space's name while searching: how many of its tabs match, then how many it has, like “2 of 5 tabs”.")
+            if header.count.stringValue != counted { header.count.stringValue = counted }
+            header.duplicates = query.isEmpty ? duplicateTabs(in: id).count : 0
+            if let empty = empties[id] {
+                // Where its first card would be, as long as there's none and nothing is being dragged in.
+                let slot = layout.headers[id].map { NSRect(x: $0.minX + Tokens.Space.x2, y: $0.maxY + Tokens.Space.x3, width: layout.cardSize.width, height: layout.cardSize.height) }
+                empty.isHidden = slot == nil || count > 0 || dragging?.space == id || !query.isEmpty
+                if let slot, !empty.isHidden {
+                    empty.titleArea = TabThumbnailView.titleHeight
+                    empty.frame = slot
+                }
+            }
+            header.dot.color = space.swatch
+            if let frame = layout.headers[id] {
+                header.isHidden = false
+                var f = frame
+                f.size.width = min(header.fittingWidth, frame.width)
+                if animated && !header.isHidden && header.frame != .zero { move(header, to: f) } else { header.frame = f }
+            } else {
+                header.isHidden = true
+            }
+        }
+        noMatches.isHidden = query.isEmpty || !layout.cards.isEmpty
+        if !noMatches.isHidden {
+            noMatches.stringValue = String(localized: "No tabs match “\(query)”.", comment: "In the tab overview (all spaces' tabs as cards), when no tab matches the search; what was typed.")
+            // Where the first card would be, in what you can see.
+            let w = noMatches.textWidth + 4, visible = scrollView.documentVisibleRect
+            noMatches.frame = NSRect(x: round((canvas.bounds.width - w) / 2), y: Tokens.EmptyState.noMatchY(in: visible, lineHeight: noMatches.lineHeight),
+                                     width: w, height: noMatches.lineHeight)
+        }
+        for (id, card) in cards {
+            guard let frame = layout.cards[id], id != dragging?.id else { continue }
+            if animated { move(card, to: frame) } else { card.frame = frame }
+        }
+    }
+
+    // MARK: Reflow
+
+    /// Moves a card or heading to `frame` on a spring. The view is there at once, for clicks and layout; what's
+    /// drawn slides over from wherever it is on screen, growing or shrinking to fit, so a move that's taken over
+    /// mid-way carries on from there.
+    private func move(_ view: NSView, to frame: NSRect) {
+        guard let layer = view.layer else { view.frame = frame; return }
+        let shown = layer.presentation()?.frame ?? view.frame
+        view.frame = frame
+        guard !Tokens.Motion.reduceMotion, frame.width > 0, frame.height > 0, shown.width > 0,
+              abs(shown.minX - frame.minX) + abs(shown.minY - frame.minY) + abs(shown.width - frame.width) > 0.5 else { return }
+        // A view's layer is anchored at its corner: scale from there, then move.
+        let from = CATransform3DConcat(CATransform3DMakeScale(shown.width / frame.width, shown.height / frame.height, 1),
+                                       CATransform3DMakeTranslation(shown.minX - frame.minX, shown.minY - frame.minY, 0))
+        let spring = Tokens.Motion.easeAnimation(keyPath: "transform", duration: Tokens.Motion.standard, timing: Tokens.Motion.drawer)
+        spring.fromValue = NSValue(caTransform3D: from)
+        spring.toValue = NSValue(caTransform3D: CATransform3DIdentity)
+        layer.add(spring, forKey: "reflow")
+    }
+
+    /// A closed (or filtered out) card folds away into its own middle while it fades, and the others close the gap.
+    private func collapse(_ view: NSView) {
+        guard let layer = view.layer, !Tokens.Motion.reduceMotion else { view.removeFromSuperview(); return }
+        let size = view.bounds.size, k: CGFloat = 0.9
+        let shrink = Tokens.Motion.easeAnimation(keyPath: "transform", duration: Tokens.Motion.standard, timing: Tokens.Motion.drawer)
+        shrink.fromValue = NSValue(caTransform3D: layer.presentation()?.transform ?? CATransform3DIdentity)
+        shrink.toValue = NSValue(caTransform3D: CATransform3DConcat(CATransform3DMakeScale(k, k, 1),
+                                                                    CATransform3DMakeTranslation(size.width * (1 - k) / 2, size.height * (1 - k) / 2, 0)))
+        let fade = Tokens.Motion.easeAnimation(keyPath: "opacity", duration: Tokens.Motion.exit)
+        fade.fromValue = layer.presentation()?.opacity ?? 1
+        fade.toValue = 0
+        let group = CAAnimationGroup()
+        group.animations = [shrink, fade]
+        group.duration = shrink.duration
+        CATransaction.begin()
+        CATransaction.setCompletionBlock { view.removeFromSuperview() }
+        Tokens.Motion.withoutAnimation { view.alphaValue = 0 }
+        layer.add(group, forKey: "collapse")
+        CATransaction.commit()
+    }
+
+    /// Cards that come back as a search clears grow in where they belong, as they do when the desk opens.
+    private func appear(_ cards: [TabThumbnailView]) {
+        guard !Tokens.Motion.reduceMotion else { return }
+        for card in cards {
+            guard let layer = card.layer else { continue }
+            let k: CGFloat = 0.96, size = card.bounds.size
+            let grow = Tokens.Motion.easeAnimation(keyPath: "transform", duration: Tokens.Motion.standard, timing: Tokens.Motion.drawer)
+            grow.fromValue = NSValue(caTransform3D: CATransform3DConcat(CATransform3DMakeScale(k, k, 1),
+                                                                        CATransform3DMakeTranslation(size.width * (1 - k) / 2, size.height * (1 - k) / 2, 0)))
+            grow.toValue = NSValue(caTransform3D: CATransform3DIdentity)
+            let fade = Tokens.Motion.easeAnimation(keyPath: "opacity", duration: Tokens.Motion.enter)
+            fade.fromValue = 0
+            fade.toValue = 1
+            let group = CAAnimationGroup()
+            group.animations = [grow, fade]
+            group.duration = grow.duration
+            group.fillMode = .backwards
+            layer.add(group, forKey: "settle")
+        }
+    }
+
+    /// An empty space's New Tab: the space comes forward, the desk steps away, and the new tab's field opens.
+    private func newTab(in space: UUID) {
+        guard let controller else { return }
+        controller.tabManager.switchToSpace(space)
+        hide(openingTab: nil)
+        controller.newTab(nil)
+    }
+
+    // MARK: Selection
+
+    private func cardClicked(_ tab: Tab, event: NSEvent) {
+        let anchor = focused
+        if let id = cards.first(where: { $0.value.pages.contains { $0 === tab } })?.key { setFocus(id, scroll: false) }
+        // ⇧-click picks every card from the one you were on to here, as in the sidebar and Finder; ⌘-click one.
+        let order = orderedCardIDs
+        if event.modifierFlags.contains(.shift), let anchor, let a = order.firstIndex(of: anchor), let b = order.firstIndex(of: tab.id) {
+            selection.formUnion(order[min(a, b)...max(a, b)])
+            updateSelection()
+        } else if event.modifierFlags.contains(.command) || event.modifierFlags.contains(.shift) {
+            if selection.contains(tab.id) { selection.remove(tab.id) } else { selection.insert(tab.id) }
+            updateSelection()
+        } else if !selection.isEmpty {
+            selection = [tab.id]
+            updateSelection()
+        } else {
+            hide(openingTab: tab)
+        }
+    }
+
+    /// A space's name picks its cards: the ones the search shows, a split's as one.
+    private func selectSpace(_ id: UUID) {
+        let ids = Set(cardTabs(in: id).map(\.id))
+        selection = ids.isSubset(of: selection) ? selection.subtracting(ids) : selection.union(ids)
+        updateSelection()
+    }
+
+    private func updateSelection() {
+        for (id, card) in cards { card.isSelected = selection.contains(id) }
+        guard let controller else { return }
+        if selection.isEmpty {
+            if actionBar.superview != nil { actionBar.dismiss() }
+            return
+        }
+        closeButton.title = String(localized: "Close \(selection.count) Tabs", comment: "In the tab overview (all spaces' tabs as cards), a button that closes the picked tabs.")
+        doneButton.title = String(localized: "Done", comment: "In the tab overview (all spaces' tabs as cards), a button that leaves the overview.")
+        let cw = closeButton.fittingWidth, dw = doneButton.fittingWidth
+        let height = Self.actionBarHeight
+        let control = Tokens.Page.controlHeight
+        let pad = (height - control) / 2
+        let width = pad * 2 + Tokens.Space.x1 + cw + dw
+        let root = controller.root.bounds
+        actionBar.frame = NSRect(x: round(root.midX - width / 2), y: root.maxY - height - Tokens.Space.x6, width: width, height: height)
+        doneButton.frame = NSRect(x: pad, y: pad, width: dw, height: control)
+        closeButton.frame = NSRect(x: doneButton.frame.maxX + Tokens.Space.x1, y: pad, width: cw, height: control)
+        if actionBar.superview == nil {
+            controller.root.overlay.addSubview(actionBar)
+            actionBar.present()
+        }
+    }
+
+    private func closeSelected() {
+        guard !selection.isEmpty else { return }
+        let ids = selection
+        selection = []
+        close(ids)
+    }
+
+    /// ⌫ or ⌘W on the desk: the selected cards if there are any, otherwise the one the arrow keys are on.
+    func closeFocused() {
+        if !selection.isEmpty { closeSelected() } else if let focused { close([focused]) }
+    }
+
+    /// Closes the tabs behind these cards, a split's two pages together. ⌘Z brings them back, like closing them
+    /// from the sidebar. The arrow keys move on to the next card, or the one before at the end.
+    // MARK: Duplicates
+
+    /// Tabs in a space showing a page another tab there already shows: all but the one used last (or the one
+    /// you're on). Split views are left alone.
+    private func duplicateTabs(in space: UUID) -> [Tab] {
+        guard let manager else { return [] }
+        let current = manager.selectedTab
+        var groups: [String: [Tab]] = [:]
+        for tab in manager.tabs(in: space) where manager.split(for: tab) == nil {
+            guard let url = tab.url else { continue }
+            groups[TabManager.normalize(url), default: []].append(tab)
+        }
+        return groups.values.filter { $0.count > 1 }.flatMap { group -> [Tab] in
+            let keep = group.first { $0 === current } ?? group.max { $0.lastActivated < $1.lastActivated }
+            return group.filter { $0 !== keep }
+        }
+    }
+
+    /// Fades the cards of these tabs, or brings every card back with none.
+    private func previewClosing(_ ids: Set<UUID>) {
+        Tokens.Motion.animate(Tokens.Motion.feedback) {
+            for (id, card) in self.cards { card.animator().alphaValue = ids.contains(id) ? 0.2 : 1 }
+        }
+    }
+
+    private func closeDuplicates(in space: UUID) {
+        guard let manager else { return }
+        let extra = duplicateTabs(in: space)
+        guard !extra.isEmpty else { return }
+        if let controller { controller.closeManyWithUndo(extra) } else { manager.close(extra) }
+        reload(animated: true)
+    }
+
+    private func close(_ ids: Set<UUID>) {
+        guard let manager else { return }
+        let tabs = ids.compactMap { id in cards[id]?.tab ?? manager.tab(with: id) }
+        // A pinned page sharing a card stays pinned, and open: only the tabs on the card close.
+        let pages = tabs + tabs.flatMap { partners(of: $0).filter { $0.bookmarkID == nil } }
+        guard !pages.isEmpty else { return }
+        if let focused, ids.contains(focused) {
+            let order = orderedCardIDs
+            let index = order.firstIndex(of: focused) ?? 0
+            let after = order[index...].first { !ids.contains($0) } ?? order[..<index].last { !ids.contains($0) }
+            setFocus(after, scroll: false)
+        }
+        // Several cards at once say how many, with Undo, as closing several from the sidebar does; one goes quietly.
+        if let controller {
+            if ids.count > 1 { controller.closeManyWithUndoToast(pages) } else { controller.closeManyWithUndo(pages) }
+        } else {
+            manager.close(pages)
+        }
+        reload(animated: true)
+    }
+
+    // MARK: Keyboard focus
+
+    /// Every card, space by space, in the order they read.
+    private var orderedCardIDs: [UUID] {
+        listedSpaces.flatMap { cardTabs(in: $0.id).map(\.id) }.filter { cards[$0] != nil }
+    }
+
+    private func setFocus(_ id: UUID?, scroll: Bool = true) {
+        focused = id
+        for (key, card) in cards { card.isFocused = key == id }
+        if scroll, let id, let card = cards[id] { canvas.scrollToVisible(card.frame.insetBy(dx: 0, dy: -gap)) }
+    }
+
+    private enum Direction { case left, right, up, down }
+
+    /// Left and right step through the cards in reading order, on from one space into the next. Up and down go to
+    /// the row above or below, to the card most nearly in line.
+    private func moveFocus(_ direction: Direction) {
+        let order = orderedCardIDs
+        guard let focused, let from = cards[focused]?.frame, let index = order.firstIndex(of: focused) else {
+            setFocus(order.first)
+            return
+        }
+        switch direction {
+        case .left: setFocus(order[max(0, index - 1)])
+        case .right: setFocus(order[min(order.count - 1, index + 1)])
+        case .up, .down:
+            let frames = order.compactMap { id in cards[id].map { (id: id, frame: $0.frame) } }
+            let rows = frames.filter { direction == .down ? $0.frame.minY > from.minY + 1 : $0.frame.minY < from.minY - 1 }
+            guard let row = direction == .down ? rows.map(\.frame.minY).min() : rows.map(\.frame.minY).max() else { return }
+            let next = rows.filter { abs($0.frame.minY - row) < 1 }.min { abs($0.frame.midX - from.midX) < abs($1.frame.midX - from.midX) }
+            setFocus(next?.id)
+        }
+    }
+
+    /// Return: the card the arrow keys are on, or the first match.
+    /// ⌘1 to ⌘8 open the card in that place, ⌘9 the last, as tabs do in the window.
+    func openCard(number: Int) {
+        let order = orderedCardIDs
+        guard !order.isEmpty else { return }
+        let id = number == 9 ? order[order.count - 1] : order.indices.contains(number - 1) ? order[number - 1] : nil
+        guard let id, let tab = cards[id]?.tab else { return }
+        hide(openingTab: tab)
+    }
+
+    private func openFocused() {
+        guard let id = focused ?? orderedCardIDs.first, let tab = cards[id]?.tab else { return }
+        hide(openingTab: tab)
+    }
+
+    // MARK: Marquee selection
+
+    func backgroundMouseDown(_ event: NSEvent) {
+        guard let window = canvas.window else { return }
+        let start = canvas.convert(event.locationInWindow, from: nil)
+        let additive = event.modifierFlags.contains(.command) || event.modifierFlags.contains(.shift)
+        let base = additive ? selection : []
+        if !additive { selection = []; updateSelection() }
+        var moved = false
+        let layer = CAShapeLayer()
+        // The marquee is a selection being drawn: the accent at the selection's strength, edged like a drop target.
+        layer.fillColor = canvas.cgColor(Tokens.Color.accent.withAlphaComponent(Tokens.Color.selectionAlpha))
+        layer.strokeColor = canvas.cgColor(Tokens.Color.accent.withAlphaComponent(Tokens.Color.dropEdgeAlpha))
+        layer.lineWidth = Tokens.Metric.hairline
+        canvas.wantsLayer = true
+        window.trackEvents(matching: [.leftMouseDragged, .leftMouseUp], timeout: .infinity, mode: .eventTracking) { event, stop in
+            guard let event else { return }
+            if event.type == .leftMouseUp { stop.pointee = true; return }
+            let point = self.canvas.convert(event.locationInWindow, from: nil)
+            let rect = NSRect(x: min(start.x, point.x), y: min(start.y, point.y), width: abs(point.x - start.x), height: abs(point.y - start.y))
+            if !moved, rect.width + rect.height > 4 {
+                moved = true
+                self.canvas.layer?.addSublayer(layer)
+            }
+            guard moved else { return }
+            Tokens.Motion.withoutAnimation { layer.path = CGPath(rect: rect, transform: nil) }
+            self.selection = base.union(self.cards.filter { $0.value.frame.intersects(rect) }.map(\.key))
+            self.updateSelection()
+        }
+        layer.removeFromSuperlayer()
+        if !moved && !additive { hide(openingTab: nil) }
+    }
+
+    // MARK: Dragging cards
+
+    private func beginDrag(_ tab: Tab, event: NSEvent) -> Bool {
+        guard let window = canvas.window, let card = cards[tab.id], manager != nil else { return false }
+        let start = canvas.convert(event.locationInWindow, from: nil)
+        let offset = NSPoint(x: start.x - card.frame.minX, y: start.y - card.frame.minY)
+        card.removeFromSuperview()
+        canvas.addSubview(card)
+        // Carried, as a row picked up in the sidebar: the small carry shadow.
+        card.layer?.shadowOpacity = 1
+        card.layer?.shadowRadius = Tokens.Shadow.carryRadius
+        card.layer?.shadowOffset = CGSize(width: 0, height: canvas.isFlipped ? Tokens.Shadow.carryDrop : -Tokens.Shadow.carryDrop)
+        card.layer?.shadowColor = canvas.cgColor(Tokens.Color.panelShadow)
+        var target = (id: tab.id, space: tab.spaceID, index: cardTabs(in: tab.spaceID).firstIndex { $0 === tab } ?? 0)
+        let origin = target
+        window.trackEvents(matching: [.leftMouseDragged, .leftMouseUp], timeout: .infinity, mode: .eventTracking) { event, stop in
+            guard let event else { return }
+            if event.type == .leftMouseUp { stop.pointee = true; return }
+            let point = self.canvas.convert(event.locationInWindow, from: nil)
+            Tokens.Motion.withoutAnimation { card.frame.origin = NSPoint(x: point.x - offset.x, y: point.y - offset.y) }
+            self.canvas.autoscroll(with: event)
+            if let slot = self.slot(at: NSPoint(x: card.frame.midX, y: card.frame.midY), excluding: tab.id), slot.space != target.space || slot.index != target.index {
+                target = (tab.id, slot.space, slot.index)
+                self.applyLayout(animated: true, dragging: target)
+            }
+        }
+        card.layer?.shadowOpacity = 0
+        // Through the window, so the selection moves on with it and ⌘Z puts it back.
+        if target != origin { controller?.moveWithUndo(tab, to: listIndex(ofCard: target.index, in: target.space, moving: tab), in: target.space) }
+        applyLayout(animated: true)
+        return true
+    }
+
+    /// Where a card's position puts the tab in the space's list, which also holds a split's second pages.
+    private func listIndex(ofCard index: Int, in space: UUID, moving tab: Tab) -> Int {
+        guard let manager else { return index }
+        let list = manager.tabs(in: space).filter { $0 !== tab }
+        let cards = cardTabs(in: space).filter { $0 !== tab }
+        guard index < cards.count else { return list.count }
+        return list.firstIndex { $0 === cards[index] } ?? index
+    }
+
+    /// The space and position a dragged card would land in.
+    private func slot(at point: NSPoint, excluding id: UUID) -> (space: UUID, index: Int)? {
+        let layout = layoutFrames()
+        let ordered = layout.headers.sorted { $0.value.minY < $1.value.minY }
+        guard let space = ordered.last(where: { $0.value.minY <= point.y })?.key ?? ordered.first?.key else { return nil }
+        let ids = cardTabs(in: space).map(\.id).filter { $0 != id }
+        var index = 0
+        for (i, cardID) in ids.enumerated() {
+            guard let frame = layout.cards[cardID] else { continue }
+            if point.y > frame.maxY || (point.y >= frame.minY && point.x > frame.midX) { index = i + 1 }
+        }
+        return (space, index)
+    }
+
+    // MARK: Keyboard
+
+    func keyDown(_ event: NSEvent) -> Bool {
+        switch event.keyCode {
+        case 53: // esc
+            if !selection.isEmpty { selection = []; updateSelection() } else { hide(openingTab: nil) }
+            return true
+        case 51, 117: // delete, forward delete
+            closeFocused()
+            return true
+        case 36, 76: // return, enter
+            openFocused()
+            return true
+        case 123: moveFocus(.left); return true
+        case 124: moveFocus(.right); return true
+        case 125: moveFocus(.down); return true
+        case 126: moveFocus(.up); return true
+        case 0 where event.modifierFlags.contains(.command): // cmd-A
+            selection = Set(cards.keys)
+            updateSelection()
+            return true
+        default:
+            // Typing anywhere searches. The key goes to the field itself rather than being appended, so input
+            // methods (Chinese, Japanese) compose there as usual.
+            guard event.modifierFlags.intersection([.command, .control, .option]).isEmpty, let chars = event.characters,
+                  let scalar = chars.unicodeScalars.first, !CharacterSet.controlCharacters.contains(scalar),
+                  scalar.value < 0xF700, canvas.window?.makeFirstResponder(searchField) == true,
+                  let editor = searchField.currentEditor() as? NSTextView else { return false }
+            editor.selectedRange = NSRange(location: (editor.string as NSString).length, length: 0)
+            editor.keyDown(with: event)
+            return true
+        }
+    }
+
+    #if DEBUG
+    /// Debug bridge: a key as the search field gets it (left, right, up, down, return, delete, esc), or text typed.
+    func debugKey(_ name: String) {
+        let selectors = ["left": #selector(NSResponder.moveLeft(_:)), "right": #selector(NSResponder.moveRight(_:)),
+                         "up": #selector(NSResponder.moveUp(_:)), "down": #selector(NSResponder.moveDown(_:)),
+                         "return": #selector(NSResponder.insertNewline(_:)), "delete": #selector(NSResponder.deleteBackward(_:)),
+                         "esc": #selector(NSResponder.cancelOperation(_:))]
+        if let selector = selectors[name] {
+            _ = searchDelegate.command?(selector)
+        } else {
+            searchField.stringValue = name == "-" ? "" : name
+            search(searchField.stringValue)
+        }
+    }
+    #endif
+}
+
+/// The desk's search field reports here: each change, and Return and Esc.
+private final class DeskSearchDelegate: NSObject, NSTextFieldDelegate {
+    var changed: ((String) -> Void)?
+    var command: ((Selector) -> Bool)?
+
+    func controlTextDidChange(_ obj: Notification) {
+        guard let field = obj.object as? NSTextField else { return }
+        changed?(field.stringValue)
+    }
+
+    func control(_ control: NSControl, textView: NSTextView, doCommandBy selector: Selector) -> Bool {
+        command?(selector) ?? false
+    }
+}
+
+#if DEBUG
+/// Debug timing for the desk's open and close: when each step happened, how evenly the frames came while it
+/// animated, and how long the main thread was busy at a stretch (a stretch past a frame is a frame missed), written
+/// to debug.log.
+final class DeskMeter: NSObject {
+    /// What it times, first in each line it logs: the desk, or the sidebar sliding out from the window's edge.
+    private let kind: String
+    private var name = ""
+    private var start: CFTimeInterval = 0
+    private var last: CFTimeInterval = 0
+    private var marks: [String] = []
+    private var frames: [Double] = []
+    private var busy: [Double] = []
+    /// Main thread time spent before the first frame came.
+    private var busyBeforeFirstFrame: Double?
+    private var awake: CFTimeInterval?
+    private var link: CADisplayLink?
+    private var observer: CFRunLoopObserver?
+    private var count = 0
+
+    init(_ kind: String = "desk") {
+        self.kind = kind
+    }
+
+    func begin(_ name: String, in view: NSView) {
+        if link != nil { finish() }
+        count += 1
+        self.name = "\(name) #\(count)"
+        start = CACurrentMediaTime()
+        last = start
+        awake = start
+        marks = []
+        frames = []
+        busy = []
+        busyBeforeFirstFrame = nil
+        let link = view.displayLink(target: self, selector: #selector(tick(_:)))
+        link.add(to: .main, forMode: .common)
+        self.link = link
+        // Last of everything before the run loop sleeps, so a stretch counts Core Animation's commit too.
+        let activities = CFRunLoopActivity.afterWaiting.rawValue | CFRunLoopActivity.beforeWaiting.rawValue
+        let observer = CFRunLoopObserverCreateWithHandler(nil, activities, true, CFIndex.max) { [weak self] _, activity in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                let now = CACurrentMediaTime()
+                if activity == .afterWaiting {
+                    self.awake = now
+                } else if let awake = self.awake {
+                    self.busy.append((now - awake) * 1000)
+                    self.awake = nil
+                }
+            }
+        }
+        CFRunLoopAddObserver(CFRunLoopGetMain(), observer, .commonModes)
+        self.observer = observer
+    }
+
+    func mark(_ step: String) {
+        guard link != nil else { return }
+        marks.append(String(format: "%@ %.1f", step, (CACurrentMediaTime() - start) * 1000))
+    }
+
+    @objc private func tick(_ link: CADisplayLink) {
+        let now = CACurrentMediaTime()
+        if frames.isEmpty { busyBeforeFirstFrame = busy.reduce(0, +) + (awake.map { (now - $0) * 1000 } ?? 0) }
+        frames.append((now - last) * 1000)
+        last = now
+        if now - start > 0.6 { finish() }
+    }
+
+    private func finish() {
+        link?.invalidate()
+        link = nil
+        if let observer { CFRunLoopRemoveObserver(CFRunLoopGetMain(), observer, .commonModes) }
+        observer = nil
+        let sorted = frames.dropFirst().sorted()
+        let typical = sorted.isEmpty ? 0 : sorted[sorted.count / 2]
+        let long = sorted.filter { $0 > typical * 1.5 }.count
+        let stretches = busy.filter { $0 >= 4 }.map { String(format: "%.0f", $0) }.joined(separator: " ")
+        debugLog(String(format: "%@ %@: %@; main busy %.0f ms, longest %.1f ms [%@], %.1f ms before first frame; first frame %.1f ms, %d frames, median %.1f ms, max %.1f ms, %d long [%@]",
+                        kind, name, marks.joined(separator: ", "), busy.reduce(0, +), busy.max() ?? 0, stretches, busyBeforeFirstFrame ?? 0, frames.first ?? 0, frames.count,
+                        typical, sorted.last ?? 0, long, frames.map { String(format: "%.0f", $0) }.joined(separator: " ")))
+    }
+}
+#endif

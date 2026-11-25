@@ -1,0 +1,260 @@
+name: Zigzag
+options:
+  bundleIdPrefix: wang.zigao
+  deploymentTarget:
+    macOS: "15.4"
+  createIntermediateGroups: true
+packages:
+  Sparkle:
+    url: https://github.com/sparkle-project/Sparkle
+    # The version releases are tested with, never a newer one picked up by surprise.
+    exactVersion: 2.10.0
+settings:
+  base:
+    SWIFT_VERSION: "6.0"
+    SWIFT_DEFAULT_ACTOR_ISOLATION: MainActor
+    SWIFT_APPROACHABLE_CONCURRENCY: YES
+    MACOSX_DEPLOYMENT_TARGET: "15.4"
+    MARKETING_VERSION: "0.10.0"
+    ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+    SPARKLE_PUBLIC_KEY: ""
+    CURRENT_PROJECT_VERSION: "165"
+    ENABLE_HARDENED_RUNTIME: YES
+    DEAD_CODE_STRIPPING: YES
+    CODE_SIGN_STYLE: Manual
+    DEVELOPMENT_TEAM: 432GL3WKY2
+    # Every word Zigzag says is in Resources/Localizable.xcstrings (and the permission prompts in InfoPlist.xcstrings):
+    # the compiler lists each String(localized:) it finds, so the catalog can be kept in step with the code.
+    SWIFT_EMIT_LOC_STRINGS: YES
+    LOCALIZATION_PREFERS_STRING_CATALOGS: YES
+  configs:
+    Debug:
+      # The dev build is its own app, "Zigzag Dev", with its own settings, data and website logins, so it never
+      # touches the Zigzag you use day to day.
+      PRODUCT_BUNDLE_IDENTIFIER: wang.zigao.zigzag.dev
+      APP_DISPLAY_NAME: Zigzag Dev
+      # A real identity, so the signature stays the same across builds and apps that check who they're
+      # talking to (1Password's browser integration) keep trusting it.
+      CODE_SIGN_IDENTITY: "Apple Development"
+      # Xcode registers the App ID and makes the development profile the Keychain access group needs.
+      CODE_SIGN_STYLE: Automatic
+      SWIFT_OPTIMIZATION_LEVEL: "-O"
+      ENABLE_HARDENED_RUNTIME: NO
+    Release:
+      PRODUCT_BUNDLE_IDENTIFIER: wang.zigao.zigzag
+      APP_DISPLAY_NAME: Zigzag
+      # Archived with development signing; scripts/release.sh exports it signed with Developer ID, and Xcode makes
+      # the Developer ID profile the Keychain access group needs.
+      CODE_SIGN_IDENTITY: "Apple Development"
+      CODE_SIGN_STYLE: Automatic
+      SPARKLE_PUBLIC_KEY: fcLCAtuyhCGTC62F2cDfj/vAMXgFvrpQSyF3540+hq0=
+      # Keep Zigzag's own function names in the shipped app (only local symbols are stripped), so a freeze note in
+      # Help › Report a Problem says what was running instead of "Zigzag+0x…" (#89). Costs a little size, no speed.
+      STRIP_STYLE: non-global
+      CODE_SIGN_INJECT_BASE_ENTITLEMENTS: NO
+      OTHER_CODE_SIGN_FLAGS: "--timestamp"
+targets:
+  Zigzag:
+    type: application
+    platform: macOS
+    sources:
+      - path: Zigzag
+        # Notes for whoever works on the design, not for the app.
+        excludes: [Design/DESIGN.md]
+      # The release notes the app shows after an update: this version's section of the changelog in the app's language.
+      - path: CHANGELOG.md
+        buildPhase: resources
+      - path: CHANGELOG.zh-Hans.md
+        buildPhase: resources
+      - path: CHANGELOG.zh-Hant.md
+        buildPhase: resources
+      # The licenses About Zigzag › Acknowledgments shows: the same files as the repository's, never a copy.
+      - path: LICENSE
+        buildPhase: resources
+      - path: THIRD_PARTY_NOTICES.md
+        buildPhase: resources
+      # Zigzag's own site fixes, as the website publishes them: the copy used until the first download (AdFilters.swift).
+      - path: site/filters/zigzag-fixes.txt
+        buildPhase: resources
+      # What Zigzag and its picture helper say to each other.
+      - path: ZigzagImageDecoder/PictureService.swift
+      # What Zigzag and its PDF helper say to each other.
+      - path: ZigzagPDFRenderer/PDFService.swift
+    dependencies:
+      - package: Sparkle
+      # Reads the pictures websites send (site icons and the like) in a sandbox of its own: Contents/XPCServices.
+      - target: ZigzagImageDecoder
+        embed: true
+        codeSign: true
+      # Opens the PDFs the viewer shows, from the web or your Mac, in a sandbox of its own: Contents/XPCServices.
+      - target: ZigzagPDFRenderer
+        embed: true
+        codeSign: true
+      # The small app each site installed as an app runs (File › Install as App…): copied out of here into the
+      # app Zigzag makes, which is then signed on this Mac.
+      - target: ZigzagWebApp
+        embed: true
+        codeSign: true
+        copy:
+          destination: executables
+    info:
+      path: Zigzag/Info.plist
+      properties:
+        # The languages Zigzag speaks, so macOS offers them in Language & Region and the frameworks' own words
+        # (Sparkle's update windows) follow. XcodeGen adds known regions from the catalogs themselves.
+        CFBundleLocalizations: [en, de, es, fr, it, ja, ko, nl, pl, pt-BR, ru, tr, zh-Hans, zh-Hant]
+        CFBundleDisplayName: $(APP_DISPLAY_NAME)
+        CFBundleIconName: AppIcon
+        CFBundleName: $(APP_DISPLAY_NAME)
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        LSApplicationCategoryType: public.app-category.productivity
+        NSHumanReadableCopyright: © 2026 Zigao Wang
+        SUFeedURL: https://zigzagbrowser.com/updates/appcast.xml
+        SUPublicEDKey: $(SPARKLE_PUBLIC_KEY)
+        # The passwords' Keychain group, with the signing team's prefix, so a build signed by anyone finds it.
+        ZigzagKeychainGroup: $(AppIdentifierPrefix)app.zigzag.passwords
+        SUEnableAutomaticChecks: true
+        SUAutomaticallyUpdate: true
+        # Every four hours while Zigzag runs (Updater adds a look on waking from sleep).
+        SUScheduledCheckInterval: 14400
+        LSMinimumSystemVersion: $(MACOSX_DEPLOYMENT_TARGET)
+        NSPrincipalClass: $(PRODUCT_MODULE_NAME).ZigzagApplication
+        NSHighResolutionCapable: true
+        NSSupportsAutomaticTermination: false
+        NSSupportsSuddenTermination: false
+        # Handoff of the page you're on, to and from your other devices.
+        NSUserActivityTypes: [NSUserActivityTypeBrowsingWeb]
+        # AppleScript, Shortcuts and osascript: what they can do is in Resources/Zigzag.sdef.
+        NSAppleScriptEnabled: true
+        OSAScriptingDefinition: Zigzag.sdef
+        # What macOS shows when it asks for each permission. Translations go in Resources/InfoPlist.xcstrings, keyed
+        # by these names; keep its English the same as here.
+        NSCameraUsageDescription: Websites you visit can ask to use your camera.
+        NSContactsUsageDescription: Zigzag fills your name, email, phone and address into forms from your own card in Contacts.
+        NSMicrophoneUsageDescription: Websites you visit can ask to use your microphone.
+        NSAudioCaptureUsageDescription: Extensions you use, like Shazam, can hear what a tab plays, only while they listen.
+        NSDownloadsFolderUsageDescription: Zigzag saves the files you download here.
+        NSLocalNetworkUsageDescription: Websites you visit can ask to connect to devices on your local network.
+        NSLocationUsageDescription: Websites you visit can ask for your location.
+        NSLocationWhenInUseUsageDescription: Websites you visit can ask for your location.
+        NSAppTransportSecurity:
+          NSAllowsArbitraryLoads: true
+          NSAllowsArbitraryLoadsInWebContent: true
+        CFBundleURLTypes:
+          - CFBundleURLName: Web site URL
+            CFBundleURLSchemes: [http, https]
+            CFBundleTypeRole: Viewer
+          # What a site installed as an app (#165) sends when it's opened or quit: only that app's small app asks.
+          - CFBundleURLName: Zigzag web app
+            CFBundleURLSchemes: [zigzag-webapp]
+            CFBundleTypeRole: Viewer
+        CFBundleDocumentTypes:
+          - CFBundleTypeName: HTML document
+            CFBundleTypeRole: Viewer
+            LSHandlerRank: Default
+            LSItemContentTypes: [public.html, public.xhtml]
+          - CFBundleTypeName: Web archive
+            CFBundleTypeRole: Viewer
+            LSHandlerRank: Default
+            LSItemContentTypes: [com.apple.webarchive]
+          - CFBundleTypeName: PDF document
+            CFBundleTypeRole: Viewer
+            LSHandlerRank: Alternate
+            LSItemContentTypes: [com.adobe.pdf]
+          # Opened from Finder: the Import window asks before restoring it.
+          - CFBundleTypeName: Zigzag Backup
+            CFBundleTypeRole: Viewer
+            LSHandlerRank: Owner
+            LSItemContentTypes: [wang.zigao.zigzag.backup]
+        # File › Export Your Data…'s backup, which File › Import restores.
+        UTExportedTypeDeclarations:
+          - UTTypeIdentifier: wang.zigao.zigzag.backup
+            UTTypeDescription: Zigzag Backup
+            UTTypeConformsTo: [public.json]
+            UTTypeTagSpecification:
+              public.filename-extension: [zigzagbackup]
+    settings:
+      base:
+        CODE_SIGN_ENTITLEMENTS: Zigzag/Zigzag.entitlements
+      configs:
+        # Releases add passkeys: Apple granted the browser passkey entitlement to wang.zigao.zigzag only, so the dev
+        # build (its own bundle id) can't carry it. The two files are the same apart from that key.
+        Release:
+          CODE_SIGN_ENTITLEMENTS: Zigzag/ZigzagRelease.entitlements
+  ZigzagWebApp:
+    type: tool
+    platform: macOS
+    sources:
+      - path: ZigzagWebApp
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: wang.zigao.zigzag.webapp
+        SKIP_INSTALL: YES
+  # Zigzag's picture helper (ZigzagImageDecoder/main.swift): the App Sandbox with no network and no files.
+  ZigzagImageDecoder:
+    type: xpc-service
+    platform: macOS
+    sources:
+      - path: ZigzagImageDecoder
+        excludes: ["*.entitlements"]
+    info:
+      path: ZigzagImageDecoder/Info.plist
+      properties:
+        CFBundleDisplayName: Zigzag Image Decoder
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        LSMinimumSystemVersion: $(MACOSX_DEPLOYMENT_TARGET)
+        XPCService:
+          ServiceType: Application
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: wang.zigao.zigzag.imagedecoder
+        CODE_SIGN_ENTITLEMENTS: ZigzagImageDecoder/ZigzagImageDecoder.entitlements
+        SWIFT_DEFAULT_ACTOR_ISOLATION: nonisolated
+        SKIP_INSTALL: YES
+  # Zigzag's PDF helper (ZigzagPDFRenderer/main.swift): the App Sandbox with no network and no files.
+  ZigzagPDFRenderer:
+    type: xpc-service
+    platform: macOS
+    sources:
+      - path: ZigzagPDFRenderer
+        excludes: ["*.entitlements"]
+    info:
+      path: ZigzagPDFRenderer/Info.plist
+      properties:
+        CFBundleDisplayName: Zigzag PDF Renderer
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        LSMinimumSystemVersion: $(MACOSX_DEPLOYMENT_TARGET)
+        XPCService:
+          ServiceType: Application
+          # A helper of its own for each document (PDFService's _setUUID); without it every PDF shares one.
+          _MultipleInstances: true
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: wang.zigao.zigzag.pdfrenderer
+        CODE_SIGN_ENTITLEMENTS: ZigzagPDFRenderer/ZigzagPDFRenderer.entitlements
+        SWIFT_DEFAULT_ACTOR_ISOLATION: nonisolated
+        SKIP_INSTALL: YES
+  ZigzagTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - path: ZigzagTests
+    dependencies:
+      - target: Zigzag
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: wang.zigao.zigzag.tests
+        GENERATE_INFOPLIST_FILE: YES
+        TEST_HOST: $(BUILT_PRODUCTS_DIR)/Zigzag.app/Contents/MacOS/Zigzag
+        BUNDLE_LOADER: $(TEST_HOST)
+schemes:
+  Zigzag:
+    build:
+      targets:
+        Zigzag: all
+        ZigzagTests: [test]
+    test:
+      targets: [ZigzagTests]
